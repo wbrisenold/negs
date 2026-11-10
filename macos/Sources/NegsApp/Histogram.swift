@@ -1,6 +1,8 @@
 import Foundation
+import CoreImage
 import IOSurface
 import SwiftUI
+import Vision
 
 /// The developed photograph's tones: 256 bins per channel of the cropped
 /// photograph. The border is drawn on the canvas, never in the preview, so
@@ -69,6 +71,8 @@ struct Waveform: Equatable, Sendable {
 struct ImageScopes: Equatable, Sendable {
     var histogram = Histogram()
     var waveform = Waveform()
+    var vectorscope = Vectorscope()
+    var skinAnalysis = SkinAnalysis()
 
     static func of(_ surface: IOSurface, crop: CropSettings, rotation: Int = 0, maxSamples: Int = 1 << 20) -> ImageScopes {
         let size = CGSize(width: surface.width, height: surface.height)
@@ -85,6 +89,20 @@ struct ImageScopes: Equatable, Sendable {
         var red = [UInt32](repeating: 0, count: waveWidth * 256)
         var green = red, blue = red
         var histogram = Histogram()
+        let vectorSize = 128
+        var vectorBins = [UInt16](repeating: 0, count: vectorSize * vectorSize)
+        var skinBins = vectorBins
+        var skinAngles: Double = 0
+        var skinSamples = 0
+        var onTarget = 0, tooMagenta = 0, tooGreen = 0
+        let sampleCount = columns * rows
+        let faceBoxes: [CGRect] = autoreleasepool {
+            let request = VNDetectFaceRectanglesRequest()
+            do {
+                try VNImageRequestHandler(ciImage: CIImage(ioSurface: surface), options: [:]).perform([request])
+                return (request.results ?? []).map(\.boundingBox)
+            } catch { return [] }
+        }
         surface.lock(options: .readOnly, seed: nil)
         defer { surface.unlock(options: .readOnly, seed: nil) }
         let base = surface.baseAddress.assumingMemoryBound(to: UInt8.self)
@@ -103,6 +121,29 @@ struct ImageScopes: Equatable, Sendable {
                 let pixel = base + y * rowBytes + x * 4
                 let (r, g, b) = (Int(pixel[2]), Int(pixel[1]), Int(pixel[0]))
                 histogram.red[r] += 1; histogram.green[g] += 1; histogram.blue[b] += 1
+                let rf = Double(r) / 255, gf = Double(g) / 255, bf = Double(b) / 255
+                let luma = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf
+                let cb = (bf - luma) / (2 * (1 - 0.0722))
+                let cr = (rf - luma) / (2 * (1 - 0.2126))
+                let vx = min(vectorSize - 1, max(0, Int(((cb + 0.5) * Double(vectorSize - 1)).rounded())))
+                let vy = min(vectorSize - 1, max(0, Int(((0.5 - cr) * Double(vectorSize - 1)).rounded())))
+                vectorBins[vy * vectorSize + vx] = min(UInt16.max, vectorBins[vy * vectorSize + vx] &+ 1)
+                // Skin estimate follows the studio vectorscope's hue analysis,
+                // limited to a broad chroma envelope. It is not a semantic mask.
+                let point = CGPoint(x: Double(x) / Double(surface.width), y: 1 - Double(y) / Double(surface.height))
+                let withinFace = faceBoxes.contains { $0.insetBy(dx: -0.025, dy: -0.025).contains(point) }
+                let looksLikeSkin = withinFace && luma > 0.08 && cr > 0.025 && cr < 0.28 && cb > -0.18 && cb < 0.12
+                    && rf > gf && gf > bf * 0.72
+                if looksLikeSkin {
+                    skinSamples += 1
+                    let angle = atan2(cr, cb) * 180 / .pi
+                    let delta = wrappedDegrees(angle - 123)
+                    skinAngles += delta
+                    if abs(delta) <= 12 { onTarget += 1 }
+                    else if delta < 0 { tooMagenta += 1 }
+                    else { tooGreen += 1 }
+                    skinBins[vy * vectorSize + vx] = min(UInt16.max, skinBins[vy * vectorSize + vx] &+ 1)
+                }
                 let shownColumn: Int
                 switch turn {
                 case 1: shownColumn = rows - 1 - row
@@ -114,8 +155,54 @@ struct ImageScopes: Equatable, Sendable {
                 red[r * waveWidth + waveX] += 1; green[g * waveWidth + waveX] += 1; blue[b * waveWidth + waveX] += 1
             }
         }
-        return ImageScopes(histogram: histogram, waveform: Waveform(width: waveWidth, red: red, green: green, blue: blue))
+        let analysis = SkinAnalysis(sampledPixels: sampleCount, candidatePixels: skinSamples,
+            meanDeviationDegrees: skinSamples > 0 ? skinAngles / Double(skinSamples) : nil,
+            withinTolerancePercent: skinSamples > 0 ? 100 * Double(onTarget) / Double(skinSamples) : 0,
+            tooMagentaPercent: skinSamples > 0 ? 100 * Double(tooMagenta) / Double(skinSamples) : 0,
+            tooGreenPercent: skinSamples > 0 ? 100 * Double(tooGreen) / Double(skinSamples) : 0)
+        return ImageScopes(histogram: histogram,
+            waveform: Waveform(width: waveWidth, red: red, green: green, blue: blue),
+            vectorscope: Vectorscope(size: vectorSize, bins: vectorBins, skinBins: skinBins), skinAnalysis: analysis)
     }
+}
+
+private func wrappedDegrees(_ angle: Double) -> Double {
+    var value = angle
+    while value > 180 { value -= 360 }
+    while value < -180 { value += 360 }
+    return value
+}
+
+struct SkinAnalysis: Equatable, Sendable {
+    var sampledPixels = 0
+    var candidatePixels = 0
+    var meanDeviationDegrees: Double?
+    var withinTolerancePercent = 0.0
+    var tooMagentaPercent = 0.0
+    var tooGreenPercent = 0.0
+    var candidatePercent: Double { sampledPixels > 0 ? 100 * Double(candidatePixels) / Double(sampledPixels) : 0 }
+    var coveragePercent: Double { min(100, candidatePercent / 6 * 100) }
+    var status: String {
+        guard let meanDeviationDegrees, coveragePercent > 4 else { return "No reliable skin sample" }
+        if meanDeviationDegrees < -12 { return "Too magenta" }
+        if meanDeviationDegrees > 12 { return "Too green" }
+        return "Near skin-tone line"
+    }
+}
+
+struct Vectorscope: Equatable, Sendable {
+    let size: Int
+    let bins: [UInt16]
+    let skinBins: [UInt16]
+
+    init(size: Int = 128, bins: [UInt16] = [], skinBins: [UInt16] = []) {
+        self.size = size
+        self.bins = bins
+        self.skinBins = skinBins
+    }
+
+    var sampleCount: Int { bins.reduce(0) { $0 + Int($1) } }
+    var skinSampleCount: Int { skinBins.reduce(0) { $0 + Int($1) } }
 }
 
 /// Filled channels and fine outlines echo Sawmill's histogram.
@@ -190,12 +277,14 @@ private func scopeGrid(context: inout GraphicsContext, size: CGSize) {
 }
 
 enum ScopeMode: String, CaseIterable {
-    case histogram = "Histogram", waveform = "Waveform"
+    case histogram = "Histogram", waveform = "Waveform", vectorscope = "Vectorscope", skin = "Skin Analysis"
 }
 
 struct ScopePanelView: View {
     let histogram: Histogram?
     let waveform: Waveform?
+    let vectorscope: Vectorscope?
+    let skinAnalysis: SkinAnalysis?
     @AppStorage("scopeMode") private var mode = ScopeMode.histogram
     /// Dragged with the handle below the scope; remembered.
     @AppStorage("scopeHeight") private var height = ScopePanelView.defaultHeight
@@ -219,6 +308,8 @@ struct ScopePanelView: View {
                 switch mode {
                 case .histogram: HistogramView(histogram: histogram)
                 case .waveform: WaveformView(waveform: waveform)
+                case .vectorscope: VectorscopeView(vectorscope: vectorscope, skinOnly: false)
+                case .skin: VectorscopeView(vectorscope: vectorscope, skinOnly: true, skinAnalysis: skinAnalysis)
                 }
             }
             .frame(height: Self.clamped(dragHeight ?? height))
@@ -259,5 +350,69 @@ struct ScopePanelView: View {
     /// Whole points keep the grid lines and plot edges from shimmering mid-drag.
     private static func clamped(_ height: Double) -> Double {
         min(max(height.rounded(), heights.lowerBound), heights.upperBound)
+    }
+}
+
+private struct VectorscopeView: View {
+    let vectorscope: Vectorscope?
+    let skinOnly: Bool
+    var skinAnalysis: SkinAnalysis? = nil
+
+    var body: some View {
+        VStack(spacing: 5) {
+            Canvas { context, size in
+                let side = min(size.width, size.height)
+                let origin = CGPoint(x: (size.width - side) / 2, y: (size.height - side) / 2)
+                let center = CGPoint(x: origin.x + side / 2, y: origin.y + side / 2)
+                let radius = side * 0.43
+                for fraction in [0.33, 0.66, 1.0] {
+                    let rect = CGRect(x: center.x - radius * fraction, y: center.y - radius * fraction,
+                                      width: radius * fraction * 2, height: radius * fraction * 2)
+                    context.stroke(Path(ellipseIn: rect), with: .color(.white.opacity(fraction == 1 ? 0.24 : 0.10)), lineWidth: 0.6)
+                }
+                var cross = Path()
+                cross.move(to: CGPoint(x: center.x - radius, y: center.y)); cross.addLine(to: CGPoint(x: center.x + radius, y: center.y))
+                cross.move(to: CGPoint(x: center.x, y: center.y - radius)); cross.addLine(to: CGPoint(x: center.x, y: center.y + radius))
+                context.stroke(cross, with: .color(.white.opacity(0.14)), lineWidth: 0.6)
+                guard let vectorscope else { return }
+                let counts = skinOnly ? vectorscope.skinBins : vectorscope.bins
+                let peak = Double(max(1, counts.max() ?? 1))
+                for y in 0..<vectorscope.size {
+                    for x in 0..<vectorscope.size {
+                        let count = counts[y * vectorscope.size + x]
+                        guard count > 0 else { continue }
+                        let nx = Double(x) / Double(vectorscope.size - 1) * 2 - 1
+                        let ny = Double(y) / Double(vectorscope.size - 1) * 2 - 1
+                        guard nx * nx + ny * ny <= 1.05 else { continue }
+                        let point = CGPoint(x: center.x + nx * radius, y: center.y + ny * radius)
+                        let rect = CGRect(x: point.x, y: point.y, width: 1.5, height: 1.5)
+                        let strength = min(0.95, 0.25 + log1p(Double(count)) / log1p(peak) * 0.7)
+                        context.fill(Path(ellipseIn: rect), with: .color(skinOnly ? .orange.opacity(strength) : .cyan.opacity(strength)))
+                    }
+                }
+                if skinOnly {
+                    let angle = 123 * Double.pi / 180
+                    var reference = Path()
+                    reference.move(to: center)
+                    reference.addLine(to: CGPoint(x: center.x + cos(angle) * radius, y: center.y - sin(angle) * radius))
+                    context.stroke(reference, with: .color(.yellow.opacity(0.9)), style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                }
+            }
+            if skinOnly, let skinAnalysis {
+                HStack(spacing: 6) {
+                    Text(skinAnalysis.status).font(.caption2.weight(.semibold))
+                    Spacer()
+                    Text(skinAnalysis.meanDeviationDegrees.map { String(format: "%+.1f°", $0) } ?? "—")
+                    Text(String(format: "%.0f%% coverage", skinAnalysis.coveragePercent))
+                }
+                .font(.system(.caption2, design: .monospaced)).foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                Text("Face-box chroma estimate against the skin-tone reference line")
+                    .font(.system(size: 9)).foregroundStyle(.tertiary).padding(.horizontal, 8)
+            }
+        }
+        .padding(6).background(Color(white: 0.075), in: RoundedRectangle(cornerRadius: 6))
+        .accessibilityElement().accessibilityLabel(skinOnly ? "Skin tone vectorscope" : "Vectorscope")
+        .accessibilityValue(skinOnly ? skinAnalysis?.status ?? "No developed photograph" : "Chroma distribution of the developed photograph")
     }
 }

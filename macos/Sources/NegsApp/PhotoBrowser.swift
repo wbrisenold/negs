@@ -4,7 +4,7 @@ import SwiftUI
 
 /// Metadata lets live refreshes keep unchanged thumbnails, including when a
 /// session sidecar is written in the same folder. No image pixels are read here.
-struct PhotoFile: Hashable, Sendable {
+struct PhotoFile: Codable, Hashable, Sendable {
     let url: URL
     let name: String
     let modified: Date?

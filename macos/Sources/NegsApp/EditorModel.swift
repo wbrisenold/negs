@@ -10,6 +10,8 @@ import UniformTypeIdentifiers
 /// Observation tracks each property separately, so a finished render only
 /// updates the canvas and status bar, and an edit doesn't redraw the canvas.
 @MainActor @Observable final class EditorModel {
+    var workspace: EditorWorkspace = .library
+    @ObservationIgnored let photoLibrary = PhotoLibrary()
     /// The whole edit, for rendering, undo, and export. Views read the
     /// per-parameter accessors below, so an edit only invalidates its own row.
     private(set) var state = EditState() {
@@ -58,6 +60,8 @@ import UniformTypeIdentifiers
     /// The photograph's film exposure, from the last render.
     private(set) var filmHistogram: FilmHistogram?
     private(set) var waveform: Waveform?
+    private(set) var vectorscope: Vectorscope?
+    private(set) var skinAnalysis: SkinAnalysis?
     /// The developed preview's frame, uncropped, which the canvas lays out:
     /// the working frame, or less with the 12 MP limit.
     private(set) var imageSize = CGSize.zero
@@ -728,6 +732,7 @@ import UniformTypeIdentifiers
 
     private func open(_ url: URL, restoring session: EditorSession?) {
         guard !closing, url.isFileURL else { return }
+        workspace = .editor
         guard FileManager.default.isReadableFile(atPath: url.path) else {
             recentFiles.removeAll { $0 == url }; saveRecents()
             error = "“\(url.lastPathComponent)” can’t be opened. It may have been moved or deleted."
@@ -843,6 +848,7 @@ import UniformTypeIdentifiers
         // Counted with the frame for the crop it was read with.
         if crop == cached.scopesCrop, imageRotation == cached.scopesRotation {
             histogramRequest += 1; histogram = cached.scopes.histogram; waveform = cached.scopes.waveform
+            vectorscope = cached.scopes.vectorscope; skinAnalysis = cached.scopes.skinAnalysis
         } else { updateHistogram() }
         updateFilmStrip()
         return true
@@ -1172,7 +1178,7 @@ import UniformTypeIdentifiers
     /// crop supersedes a count still running.
     private func updateHistogram() {
         histogramRequest += 1
-        guard let image else { histogram = nil; waveform = nil; return }
+        guard let image else { histogram = nil; waveform = nil; vectorscope = nil; skinAnalysis = nil; return }
         let request = histogramRequest, crop = crop, rotation = imageRotation
         Task.detached(priority: .userInitiated) { [weak self] in
             let counted = ImageScopes.of(image, crop: crop, rotation: rotation)
@@ -1183,6 +1189,8 @@ import UniformTypeIdentifiers
         guard request == histogramRequest else { return }
         histogram = counted.histogram
         waveform = counted.waveform
+        vectorscope = counted.vectorscope
+        skinAnalysis = counted.skinAnalysis
     }
 
     // MARK: Tone graph
@@ -1449,6 +1457,36 @@ import UniformTypeIdentifiers
     }
     var exposureOffsetModified: Bool { abs(value("prep.exposure_ev").double - matchedEV) > 1e-6 }
     func resetExposureOffset() { set("prep.exposure_ev", .number(matchedEV)) }
+
+    /// Estimate one custom WB from the source's embedded preview. The estimate
+    /// is local and reversible; photographers can refine it with Kelvin/tint.
+    func autoWhiteBalance() {
+        guard isRaw, let source else { return }
+        Task { [weak self] in
+            guard let self, let preview = await PhotoThumbnails.shared.image(for: source),
+                  self.source == source,
+                  let estimate = WhiteBalanceEstimator.estimate(preview) else { return }
+            var next = self.state
+            next.params["io.raw_white_balance.mode"] = .string("custom")
+            next.params["io.raw_white_balance.temperature"] = .number(estimate.temperature)
+            next.params["io.raw_white_balance.tint"] = .number(estimate.tint)
+            self.apply(next, action: "Auto White Balance")
+        }
+    }
+
+    /// Makes one conservative tint correction from the skin vectorscope.
+    /// Requires enough face-bounded chroma coverage for the one-step correction.
+    func whiteBalanceToSkin() {
+        guard isRaw, let skinAnalysis,
+              skinAnalysis.candidatePixels > 0, skinAnalysis.coveragePercent >= 5,
+              let deviation = skinAnalysis.meanDeviationDegrees else { return }
+        var next = state
+        let currentMode = next.params["io.raw_white_balance.mode"].string
+        let currentTint = currentMode == "custom" ? next.params["io.raw_white_balance.tint"].double : 1
+        next.params["io.raw_white_balance.mode"] = .string("custom")
+        next.params["io.raw_white_balance.tint"] = .number(min(4, max(0.01, currentTint - deviation * 0.004)))
+        apply(next, action: "White Balance to Skin")
+    }
 
     /// What the match depends on: everything that changes how bright the
     /// developed photograph is, except the brightness edits that are the
@@ -1977,7 +2015,7 @@ import UniformTypeIdentifiers
         panel.message = "spektrafilm’s GUI state format: opens in Negs and in spektrafilm."
         panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url, let self else { return }
-            MainActor.assumeIsolated {
+            _ = MainActor.assumeIsolated {
                 Task {
                     do { try await self.presetLibrary.read(preset).write(to: url, options: .atomic) }
                     catch { self.report(error); await self.refreshPresets() }

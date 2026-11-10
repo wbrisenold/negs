@@ -64,6 +64,8 @@ import SwiftUI
         edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
 
         let view = submenu("View")
+        command(view, "Show Library", #selector(showLibrary), "l")
+        view.addItem(.separator())
         command(view, "Hide Film Strip", #selector(toggleFilmstrip), "f", [.command, .option])
         command(view, "Show Adjustments", #selector(toggleAdjustments), "i", [.command, .option])
         command(view, "Show Presets", #selector(togglePresets), "p", [.command, .option])
@@ -120,6 +122,7 @@ import SwiftUI
     @objc private func exportPhotograph() { model.savePanel(export: true) }
     @objc private func exportLUT() { model.exportLUTPanel() }
     @objc private func toggleFilmstrip() { model.filmstripVisible.toggle() }
+    @objc private func showLibrary() { model.workspace = .library }
     @objc private func toggleAdjustments() { model.togglePane(.adjustments) }
     @objc private func togglePresets() { model.togglePane(.presets) }
     @objc private func newPreset() { model.newPreset() }
@@ -132,8 +135,11 @@ import SwiftUI
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if removingAppData { return false }
-        let photo = model.source != nil
+        let photo = model.workspace == .editor && model.source != nil
         switch item.action {
+        case #selector(showLibrary):
+            item.title = model.workspace == .editor ? "Show Library" : "Library"
+            return model.workspace == .editor && !model.cropping
         case #selector(checkForUpdates): return updates.configured && updates.canCheck
         case #selector(showRecent): return !model.recentFiles.isEmpty
         case #selector(savePreview): return model.canSave

@@ -27,7 +27,7 @@ export MACOSX_DEPLOYMENT_TARGET=14.0
 # export with RUSTFLAGS="-C target-cpu=x86-64-v3" on Intel hardware (Rosetta
 # here can't run AVX2) and switch if it is faster and renders the same.
 rust_targets=(--target aarch64-apple-darwin --target x86_64-apple-darwin)
-swift_archs=(--arch arm64 --arch x86_64)
+swift_triples=(arm64-apple-macosx14.0 x86_64-apple-macosx14.0)
 # CI builds each architecture's Rust executables in parallel jobs and places
 # them under $BUILD_TARGET_DIR/<target>/release before calling this script.
 if [[ "${NEGS_PREBUILT_RUST:-}" == 1 ]]; then
@@ -42,14 +42,20 @@ if [[ "${NEGS_PREBUILT_RUST:-}" == 1 ]]; then
 else
     cargo build --locked --release -p spektrafilm-native "${rust_targets[@]}" --target-dir "$BUILD_TARGET_DIR"
 fi
-swift build --package-path macos --scratch-path "$BUILD_TARGET_DIR/swift-native" -c release --force-resolved-versions "${swift_archs[@]}"
-swift_bin_dir="$(swift build --package-path macos --scratch-path "$BUILD_TARGET_DIR/swift-native" -c release --force-resolved-versions "${swift_archs[@]}" --show-bin-path)"
+swift_bin_dirs=()
+for triple in "${swift_triples[@]}"; do
+    scratch="$BUILD_TARGET_DIR/swift-$triple"
+    swift build --package-path macos --scratch-path "$scratch" -c release --force-resolved-versions --triple "$triple"
+    swift_bin_dirs+=("$(swift build --package-path macos --scratch-path "$scratch" -c release --force-resolved-versions --triple "$triple" --show-bin-path)")
+done
 if [[ "${NEGS_PREBUILT_RUST:-}" != 1 ]]; then
     cargo build --locked --release -p spektrafilm-cli --bin spektrafilm "${rust_targets[@]}" --target-dir "$BUILD_TARGET_DIR"
     cargo build --locked --release -p spektrafilm-cli --bin spektrafilm-f64 --features precision-f64 "${rust_targets[@]}" --target-dir "$BUILD_TARGET_DIR"
 fi
 universal_dir="$BUILD_TARGET_DIR/universal-apple-darwin/release"
 mkdir -p "$universal_dir"
+lipo -create -output "$universal_dir/NegsApp" \
+    "${swift_bin_dirs[0]}/NegsApp" "${swift_bin_dirs[1]}/NegsApp"
 for binary in spektrafilm-native spektrafilm spektrafilm-f64; do
     lipo -create -output "$universal_dir/$binary" \
         "$BUILD_TARGET_DIR/aarch64-apple-darwin/release/$binary" \
@@ -59,9 +65,20 @@ done
 rm -rf "$DIST_DIR"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources" "$APP_BUNDLE/Contents/Frameworks" "$RELEASE_DIR"
 # Preserve framework symlinks, executable bits and Sparkle’s nested signatures.
-ditto "$swift_bin_dir/Sparkle.framework" "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+ditto "${swift_bin_dirs[0]}/Sparkle.framework" "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+sparkle_bundle="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+sparkle_info="$sparkle_bundle/Resources/Info.plist"
+sparkle_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$sparkle_info")"
+sparkle_binary="$(realpath "$sparkle_bundle/$sparkle_executable")"
+# SwiftPM's Sparkle XCFramework slice is already universal and signed. Keep
+# that executable intact instead of lipo-rewriting its sealed code signature.
+sparkle_archs="$(lipo -archs "$sparkle_binary")"
+[[ " $sparkle_archs " == *" arm64 "* && " $sparkle_archs " == *" x86_64 "* ]] || {
+    echo "Sparkle framework is missing an architecture slice: $sparkle_archs" >&2
+    exit 1
+}
 
-cp "$swift_bin_dir/NegsApp" "$APP_BUNDLE/Contents/MacOS/NegsApp"
+cp "$universal_dir/NegsApp" "$APP_BUNDLE/Contents/MacOS/NegsApp"
 cp "$universal_dir/spektrafilm-native" "$APP_BUNDLE/Contents/MacOS/spektrafilm-native"
 cp "$universal_dir/spektrafilm" "$APP_BUNDLE/Contents/MacOS/spektrafilm"
 cp "$universal_dir/spektrafilm-f64" "$APP_BUNDLE/Contents/MacOS/spektrafilm-f64"
@@ -146,8 +163,8 @@ README
     echo "Build host: $(uname -m)"
     lipo -archs "$APP_BUNDLE/Contents/MacOS/NegsApp"
     rustc -vV
-    git rev-parse HEAD
-    git status --short
+    git rev-parse HEAD 2>/dev/null || echo "Source revision: unavailable (no Git metadata)"
+    git status --short 2>/dev/null || true
     "$PYTHON" scripts/macos_release.py
 } > "$DIST_DIR/BUILD-INFO.txt"
 

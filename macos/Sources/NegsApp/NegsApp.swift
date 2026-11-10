@@ -1,6 +1,8 @@
 import AppKit
 import SwiftUI
 
+enum EditorWorkspace { case library, editor }
+
 /// AppKit runs the application, menus, window, and toolbar; the canvas and
 /// inspector inside the window are SwiftUI. A SwiftUI scene with the same
 /// toolbar and inspector took about twice as long to show the window
@@ -188,6 +190,19 @@ struct EditorCanvas: View {
         .alert("Negs", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
+    }
+}
+
+struct WorkspaceView: View {
+    let model: EditorModel
+
+    var body: some View {
+        Group {
+            switch model.workspace {
+            case .library: LibraryWorkspaceView(model: model)
+            case .editor: EditorCanvas(model: model)
+            }
+        }
     }
 }
 

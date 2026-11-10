@@ -45,7 +45,7 @@ import SwiftUI
         self.model = model
         // The split view sizes both columns, so SwiftUI never measures their
         // contents for the window's size limits.
-        let canvas = NSHostingController(rootView: EditorCanvas(model: model))
+        let canvas = NSHostingController(rootView: WorkspaceView(model: model))
         canvas.sizingOptions = []
         // The adjustments take about a third of the time to the first frame,
         // so the column starts empty and fills in once the window is on screen.
@@ -74,7 +74,7 @@ import SwiftUI
         if !window.setFrameUsingName("editor") { window.center() }
         // A saved frame from before the minimum, or from a smaller screen,
         // grows to it.
-        Self.fitMinimum(of: window, width: inspector.isCollapsed ? canvasMinimum : columnsMinimum)
+        Self.fitMinimum(of: window, width: model.workspace == .library ? 980 : inspector.isCollapsed ? canvasMinimum : columnsMinimum)
         split.view.frame = NSRect(origin: .zero, size: window.contentRect(forFrameRect: window.frame).size)
         window.contentViewController = split
         window.setFrameAutosaveName("editor")
@@ -90,7 +90,7 @@ import SwiftUI
         // Dragging the inspector closed hides the adjustments, like the toolbar button.
         collapsing = inspector.observe(\.isCollapsed) { [weak self] item, _ in
             MainActor.assumeIsolated {
-                guard let self else { return }
+                guard let self, self.model.workspace == .editor else { return }
                 // A hidden inspector lets the window narrow to the canvas alone.
                 if let window = self.window {
                     Self.fitMinimum(of: window, width: item.isCollapsed ? self.canvasMinimum : self.columnsMinimum)
@@ -164,15 +164,22 @@ import SwiftUI
 
     private func update() {
         guard let window else { return }
-        let photo = model.source != nil
-        window.title = model.source?.lastPathComponent ?? "Negs"
-        window.subtitle = !photo || !model.ready ? "" : model.value("io.scan_film").bool ? model.filmName : "\(model.filmName) → \(model.paperName)"
+        let editing = model.workspace == .editor
+        let photo = editing && model.source != nil
+        window.title = editing ? model.source?.lastPathComponent ?? "Negs" : "Negs"
+        window.subtitle = !editing ? "Library" : !photo || !model.ready ? "" : model.value("io.scan_film").bool ? model.filmName : "\(model.filmName) → \(model.paperName)"
+        if let item = items[.library] {
+            let icon = symbol("square.grid.2x2", "Library")
+            item.image = editing ? icon : icon.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [.controlAccentColor]))
+            item.isEnabled = editing && !model.cropping
+        }
         showCropActions(model.cropping)
         if let item = items[.filmstrip] {
             item.toolTip = model.filmstripVisible ? "Hide film strip (⌥⌘F)" : "Show film strip (⌥⌘F)"
             let icon = symbol("rectangle.bottomthird.inset.filled", "Film Strip")
             item.image = model.filmstripVisible
                 ? icon.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [.controlAccentColor])) : icon
+            item.isEnabled = photo
         }
         setEnabled(.zoom, photo && !model.cropping)
         if let edit = items[.edit] as? NSToolbarItemGroup {
@@ -193,13 +200,16 @@ import SwiftUI
             let icon = symbol(name, label)
             items[id]?.image = model.inspectorVisible && model.inspectorPane == pane
                 ? icon.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [.controlAccentColor])) : icon
+            items[id]?.isEnabled = editing
         }
         // A ratio field being edited keeps its own Return and Escape.
         if let session = model.cropSession {
             cancelButton.keyEquivalent = session.typing ? "" : "\u{1b}"
             doneButton.keyEquivalent = session.typing ? "" : "\r"
         }
-        if inspector.isCollapsed == model.inspectorVisible {
+        if !editing {
+            if !inspector.isCollapsed { inspector.animator().isCollapsed = true }
+        } else if inspector.isCollapsed == model.inspectorVisible {
             // Make room before the inspector slides in, so neither column is
             // squeezed below its minimum.
             if model.inspectorVisible { Self.fitMinimum(of: window, width: columnsMinimum) }
@@ -251,7 +261,7 @@ import SwiftUI
     // MARK: Toolbar
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.open, .filmstrip, .flexibleSpace, .zoom, .edit, .flexibleSpace, .inspectorTrackingSeparator, .flexibleSpace, .export, .presets, .adjustments]
+        [.library, .open, .filmstrip, .flexibleSpace, .zoom, .edit, .flexibleSpace, .inspectorTrackingSeparator, .flexibleSpace, .export, .presets, .adjustments]
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -261,6 +271,9 @@ import SwiftUI
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
         let item: NSToolbarItem
         switch id {
+        case .library:
+            item = button(id, "Library", "square.grid.2x2", "Browse the photo Library", #selector(showLibrary))
+            item.isNavigational = true
         case .open:
             item = button(id, "Open", "folder", "Open photograph (⌘O)", #selector(openPhotograph))
             item.isNavigational = true
@@ -325,6 +338,7 @@ import SwiftUI
 
     // MARK: Actions
 
+    @objc private func showLibrary() { model.workspace = .library }
     @objc private func openPhotograph() { model.openPanel() }
     @objc private func fit() { model.zoom(fit: true) }
     @objc private func actualSize() { model.zoom(fit: false) }
@@ -340,6 +354,6 @@ import SwiftUI
 
 private extension NSToolbarItem.Identifier {
     static let filmstrip = Self("filmstrip")
-    static let open = Self("open"), zoom = Self("zoom"), edit = Self("edit")
+    static let library = Self("library"), open = Self("open"), zoom = Self("zoom"), edit = Self("edit")
     static let export = Self("export"), adjustments = Self("adjustments"), presets = Self("presets"), cancelCrop = Self("cancelCrop"), doneCrop = Self("doneCrop")
 }

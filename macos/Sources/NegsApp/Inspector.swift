@@ -610,7 +610,8 @@ struct AdjustmentInspector: View {
         // The histogram, film and paper, and tab switch stay put above the
         // tab's scrolling sections, so every tab opens with the stocks in view.
         VStack(spacing: 0) {
-            ScopePanelView(histogram: model.histogram, waveform: model.waveform)
+            ScopePanelView(histogram: model.histogram, waveform: model.waveform,
+                           vectorscope: model.vectorscope, skinAnalysis: model.skinAnalysis)
                 .padding(.horizontal, 20)
                 .padding(.top, 10)
             // Sized to its rows; an open stock grid scrolls inside its own frame.
@@ -648,15 +649,36 @@ struct AdjustmentInspector: View {
 
     @ViewBuilder private var prep: some View {
         if model.isRaw {
-            Section {
+            Section("White Balance") {
+                Text("White balance applies before the film process.")
+                    .font(.caption).foregroundStyle(.secondary)
                 control(.choice("White balance", "io.raw_white_balance.mode", ["as_shot", "daylight", "tungsten", "custom"]))
+                HStack(spacing: 8) {
+                    Button("Auto WB", systemImage: "wand.and.stars") { model.autoWhiteBalance() }
+                        .disabled(!model.isRaw || model.source == nil)
+                        .help("Estimate a custom RAW white balance from this photo’s embedded preview using a local gray-world balance.")
+                    Button("WB to Skin", systemImage: "person.crop.circle.badge.checkmark") { model.whiteBalanceToSkin() }
+                        .disabled(!model.isRaw || (model.skinAnalysis?.coveragePercent ?? 0) < 5)
+                        .help("Make one conservative RAW tint adjustment from the skin vectorscope estimate.")
+                }
                 if model.value("io.raw_white_balance.mode").string == "custom" {
-                    control(.slider("Temperature (K)", "io.raw_white_balance.temperature", 1667...25000, 1))
+                    WhiteBalanceTemperatureSlider(model: model)
                     control(.slider("Tint", "io.raw_white_balance.tint", 0.01...4, 0.01))
+                }
+                if let skin = model.skinAnalysis {
+                    HStack {
+                        Text("Skin scope").foregroundStyle(.secondary)
+                        Spacer()
+                        Text(skin.status)
+                        if let deviation = skin.meanDeviationDegrees {
+                            Text(String(format: "%+.1f°", deviation)).monospacedDigit()
+                        }
+                    }
+                    .font(.caption2)
                 }
             }
         }
-        Section("Brightness") {
+        Section("Exposure") {
             Toggle(model.isRaw ? "Match camera brightness" : "Match original brightness",
                    isOn: Binding(get: { model.matchesBrightness }, set: model.setMatchesBrightness))
                 .help(model.isRaw
@@ -670,6 +692,10 @@ struct AdjustmentInspector: View {
                               : "Brightens or darkens the scene before the film, in stops. Unlike Negative exposure, the print doesn’t make up for it.")
             if let note = model.brightnessMatchNote {
                 Text(note).font(.caption).foregroundStyle(.secondary)
+            }
+            if model.isRaw {
+                control(.slider("Global Tone", "prep.global_tone", 0...100, 1))
+                    .help("Lifts the RAW's midtones while retaining a soft roll-off into highlights, before the film process.")
             }
             // While matched the meter only sets where the highlight limit
             // starts, so it shows when matching is off, or when changed.
@@ -953,5 +979,50 @@ struct AdjustmentInspector: View {
             }
             .help(help)
         }
+    }
+}
+
+/// Temperature is displayed and edited in kelvin, while the track follows
+/// Studio's reciprocal-temperature spacing so equal movement feels even.
+private struct WhiteBalanceTemperatureSlider: View {
+    let model: EditorModel
+    private let path = "io.raw_white_balance.temperature"
+
+    private var kelvin: Double { model.value(path).double }
+    private var position: Binding<Double> {
+        Binding(
+            get: { -1_000_000 / max(1667, min(25000, self.kelvin)) },
+            set: { self.model.set(self.path, .number(max(1667, min(25000, -1_000_000 / $0)))) },
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Text("Temperature").lineLimit(1)
+                    .tooltip(ControlHelp.text(path))
+                Spacer(minLength: 8)
+                if model.isModified(path) {
+                    Button { model.resetValue(path) } label: {
+                        Image(systemName: "arrow.counterclockwise")
+                    }
+                    .buttonStyle(.borderless).foregroundStyle(.secondary).imageScale(.small)
+                    .help("Reset temperature")
+                }
+                Text("\(Int(kelvin.rounded())) K")
+                    .monospacedDigit().foregroundStyle(.secondary)
+                    .frame(minWidth: 48, alignment: .trailing)
+            }
+            ResettableSlider(
+                title: "Temperature",
+                value: position,
+                range: (-1_000_000 / 1667)...(-1_000_000 / 25000),
+                neutral: -1_000_000 / model.defaultValue(path).double,
+                editing: { $0 ? model.beginInteraction() : model.endInteraction() },
+                reset: { model.resetValue(path) },
+                toolTip: ControlHelp.text(path),
+            )
+        }
+        .padding(.vertical, 1)
     }
 }

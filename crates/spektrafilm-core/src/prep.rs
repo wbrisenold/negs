@@ -26,6 +26,8 @@ pub struct PrepParams {
     /// Absolute scene placement after camera metering/EV, before recovered
     /// controls. Unlike camera EV, this is excluded from print compensation.
     pub exposure_ev: f32,
+    /// Scene-wide RAW-style tone lift before the film, from 0 (off) to 100.
+    pub global_tone: f32,
     pub highlights: f32,
     pub shadows: f32,
     pub contrast: f32,
@@ -41,6 +43,7 @@ pub struct PrepParams {
 #[serde(default)]
 struct UncheckedPrepParams {
     exposure_ev: f32,
+    global_tone: f32,
     highlights: f32,
     shadows: f32,
     contrast: f32,
@@ -56,6 +59,7 @@ impl TryFrom<UncheckedPrepParams> for PrepParams {
     fn try_from(p: UncheckedPrepParams) -> Result<Self, String> {
         let params = PrepParams {
             exposure_ev: p.exposure_ev,
+            global_tone: p.global_tone,
             highlights: p.highlights,
             shadows: p.shadows,
             contrast: p.contrast,
@@ -86,6 +90,9 @@ impl PrepParams {
         if !self.exposure_ev.is_finite() || !(-3.0..=3.0).contains(&self.exposure_ev) {
             return Err("Invalid Prep exposure_ev; expected a finite value from -3 to 3".into());
         }
+        if !self.global_tone.is_finite() || !(0.0..=100.0).contains(&self.global_tone) {
+            return Err("Invalid Prep global_tone; expected a finite value from 0 to 100".into());
+        }
         for (name, value, min) in [
             ("highlights", self.highlights, -180.),
             ("shadows", self.shadows, -100.),
@@ -115,7 +122,7 @@ pub struct PreparedKey {
     input_color_space: String,
     autoexposure_ev: u64,
     exposure_compensation_ev: u32,
-    prep: [u32; 9],
+    prep: [u32; 10],
 }
 
 impl PreparedKey {
@@ -128,7 +135,7 @@ impl PreparedKey {
             autoexposure_ev: autoexposure_ev.to_bits(),
             exposure_compensation_ev: params.camera.exposure_compensation_ev.to_bits(),
             prep: [
-                p.exposure_ev, p.highlights, p.shadows, p.contrast, p.lift, p.gain,
+                p.exposure_ev, p.global_tone, p.highlights, p.shadows, p.contrast, p.lift, p.gain,
                 p.color_boost, p.saturation, p.midtone_detail,
             ]
             .map(f32::to_bits),
@@ -169,6 +176,7 @@ impl PreparedFrame {
 
 #[derive(Clone, Copy, Default)]
 struct Settings {
+    global_tone: f32,
     highlights: f32,
     shadows: f32,
     boost: f32,
@@ -181,6 +189,7 @@ struct Settings {
 impl From<&PrepParams> for Settings {
     fn from(p: &PrepParams) -> Self {
         Self {
+            global_tone: p.global_tone,
             highlights: p.highlights,
             shadows: p.shadows,
             boost: p.color_boost,
@@ -296,7 +305,11 @@ fn core(
     }
     let base = base * 0.5;
     let detail = y - base;
-    let mapped = tone_sample(lut, base);
+    let mut mapped = tone_sample(lut, base);
+    if s.global_tone > 0.0 {
+        let boost = s.global_tone / 100.0 * 2.0;
+        mapped = mapped * (1.0 + boost) / (mapped + boost);
+    }
     let ratio = if base.abs() > 0.00001 {
         (mapped / base).clamp(1., 4.)
     } else {
