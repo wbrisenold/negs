@@ -516,7 +516,11 @@ fn cam16ucs_to_xyz(cs: &RgbColourspace, jab: [f64; 3]) -> [f64; 3] {
     let m = ((UCS_C2 * mp).exp() - 1.0) / UCS_C2;
     let cc = m / CAM16_F_L.powf(0.25);
     // `np.maximum`, which keeps NaN.
-    let j_prime = if jj.is_nan() { jj } else { jj.max(f64::EPSILON) };
+    let j_prime = if jj.is_nan() {
+        jj
+    } else {
+        jj.max(f64::EPSILON)
+    };
     let t = spow(
         cc / ((j_prime / 100.0).sqrt() * spow(1.64 - 0.29f64.powf(CAM16_N), 0.73)),
         1.0 / 0.9,
@@ -537,7 +541,11 @@ fn cam16ucs_to_xyz(cs: &RgbColourspace, jab: [f64; 3]) -> [f64; 3] {
     let ga = (460.0 * p2 - 891.0 * a - 261.0 * b) / 1403.0;
     let ba = (460.0 * p2 - 220.0 * a - 6300.0 * b) / 1403.0;
     let rgb_c = cam16_padc_inverse([ra, ga, ba]);
-    let rgb = [rgb_c[0] / d_rgb[0], rgb_c[1] / d_rgb[1], rgb_c[2] / d_rgb[2]];
+    let rgb = [
+        rgb_c[0] / d_rgb[0],
+        rgb_c[1] / d_rgb[1],
+        rgb_c[2] / d_rgb[2],
+    ];
     let xyz100 = mat_vec(&CAM16_M16I, rgb);
     [xyz100[0] / 100.0, xyz100[1] / 100.0, xyz100[2] / 100.0]
 }

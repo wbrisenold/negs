@@ -33,6 +33,7 @@ unsafe extern "C" {
         as_shot: i32,
         lens_correction: i32,
         defer_orientation: i32,
+        decode_scale: f32,
         output: *mut NativeImage,
     ) -> i32;
     fn sf_apple_raw_free(pixels: *mut f32);
@@ -95,6 +96,7 @@ impl RawDecoder for AppleRawVersion {
                 (options.white_balance.mode == crate::RawWhiteBalanceMode::AsShot).into(),
                 options.lens_correction.enabled.into(),
                 own_lens.is_some().into(),
+                options.decode_scale.clamp(0.05, 1.0),
                 &mut native,
             )
         };

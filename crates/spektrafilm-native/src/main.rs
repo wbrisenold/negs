@@ -86,6 +86,13 @@ enum Command {
     PreviewColourSpace {
         input: PathBuf,
     },
+    /// Spectral-reference RAW white-balance estimate. Decodes a small native
+    /// RAW preview so estimation uses sensor data, never the embedded JPEG.
+    EstimateItcwb {
+        input: PathBuf,
+        #[serde(default)]
+        method: Option<spektrafilm_io::RawWhiteBalanceMethod>,
+    },
     /// A colour-managed camera/original reference for clients without a
     /// native colour-managed extractor. Independent of retained render state.
     BrightnessReference {
@@ -257,6 +264,7 @@ struct Source {
     interpretation: spektrafilm_io::InputInterpretation,
     colour: spektrafilm_io::InputColour,
     image: ImageBuf,
+    decode_scale: f32,
 }
 
 impl Source {
@@ -266,10 +274,11 @@ impl Source {
         wb: spektrafilm_io::RawWhiteBalance,
         lens: spektrafilm_io::LensCorrection,
         interpretation: &spektrafilm_io::InputInterpretation,
+        decode_scale: f32,
     ) -> bool {
         self.path == path
             && if spektrafilm_io::is_raw(path) {
-                self.wb == wb && self.lens == lens
+                self.wb == wb && self.lens == lens && self.decode_scale >= decode_scale
             } else {
                 &self.interpretation == interpretation
             }
@@ -323,9 +332,10 @@ impl Session {
         wb: spektrafilm_io::RawWhiteBalance,
         lens: spektrafilm_io::LensCorrection,
         interpretation: spektrafilm_io::InputInterpretation,
+        decode_scale: f32,
     ) -> Result<()> {
         let reload = self.source_generation != source_generation
-            || self.source.as_ref().is_none_or(|source| !source.current(input, wb, lens, &interpretation));
+            || self.source.as_ref().is_none_or(|source| !source.current(input, wb, lens, &interpretation, decode_scale));
         if reload {
             // Release the last source's caches before decoding the next.
             self.source = None;
@@ -337,12 +347,13 @@ impl Session {
             self.thumbnail_source = None;
             self.thumbnail_wb_sources = Vec::new();
             self.film_stops = None;
-            let loaded = spektrafilm_io::load_image_colour(
+            let loaded = spektrafilm_io::load_image_colour_scaled(
                 input,
                 spektrafilm_io::Formats::Any,
                 wb,
                 lens,
                 &interpretation,
+                decode_scale,
             )?;
             self.source = Some(Source {
                 path: input.to_path_buf(),
@@ -352,6 +363,7 @@ impl Session {
                 interpretation,
                 colour: loaded.colour,
                 image: loaded.image,
+                decode_scale,
             });
             self.source_generation = source_generation;
         }
@@ -402,7 +414,7 @@ impl Session {
             && self.source_generation == source_generation
             && self.source.as_ref().is_some_and(|s| s.path == input && s.wb.effective() != wb.effective());
         if !own_decode {
-            self.load_source(&input, source_generation, wb, lens, interpretation.clone())?;
+            self.load_source(&input, source_generation, wb, lens, interpretation.clone(), 1.0)?;
         }
         let decoded = started.elapsed();
         let source = &self.source.as_ref().unwrap().image;
@@ -574,6 +586,32 @@ impl Session {
                 });
                 Ok(json!({ "colour_space": space }))
             }
+            Command::EstimateItcwb { input, method } => {
+                let loaded = spektrafilm_io::load_image_colour_scaled(
+                    &input,
+                    spektrafilm_io::Formats::Any,
+                    // Estimate absolute scene illuminant from a neutral D65
+                    // development. Starting from As Shot and then applying
+                    // an absolute temperature estimate double-corrects files
+                    // whose camera WB already neutralized the scene.
+                    spektrafilm_io::RawWhiteBalance {
+                        mode: spektrafilm_io::RawWhiteBalanceMode::Daylight,
+                        ..Default::default()
+                    },
+                    spektrafilm_io::LensCorrection::default(),
+                    &spektrafilm_io::InputInterpretation::default(),
+                    0.25,
+                )?;
+                let estimate = spektrafilm_io::estimate_itcwb_with_method(
+                    &loaded.image,
+                    method.unwrap_or_default(),
+                )?;
+                Ok(json!({
+                    "temperature": estimate.temperature,
+                    "tint": estimate.tint,
+                    "confidence": estimate.confidence,
+                }))
+            }
             Command::BrightnessReference { input, reference_path, expected_width, expected_height } => {
                 ensure!(expected_width > 0 && expected_height > 0,
                     "The brightness reference needs the photograph's dimensions");
@@ -608,7 +646,7 @@ impl Session {
                 let source = self.source.as_ref().context("Open a photograph and wait for its preview before placing exposure")?;
                 ensure!(self.source_generation == source_generation
                     && source.current(&input, params.io.raw_white_balance, params.io.lens_correction,
-                                      &params.io.input_interpretation),
+                                      &params.io.input_interpretation, 1.0),
                     "The photograph or RAW settings changed; wait for its current preview and try again");
                 let reference = placement_reference(&reference_path, &source.image)?;
                 params.io.apply_input_colour(&source.colour);
@@ -752,7 +790,11 @@ impl Session {
                 let lens = params.io.lens_correction;
                 let interpretation = params.io.input_interpretation.clone();
                 interpretation.validate()?;
-                self.load_source(&input, source_generation, wb, lens, interpretation)?;
+                self.load_source(&input, source_generation, wb, lens, interpretation,
+                                 interactive_scale.unwrap_or(1.0))?;
+                let stage_timings = std::env::var_os("SPEKTRAFILM_STAGE_TIMINGS").is_some();
+                let mut stage_started = started;
+                if stage_timings { eprintln!("native decode: {} ms", stage_started.elapsed().as_millis()); }
                 let Source { image: source, colour: input_colour, lens_correction_supported, .. } =
                     self.source.as_ref().unwrap();
                 // RAW and decoded files are the engine's linear sRGB; manual
@@ -761,6 +803,7 @@ impl Session {
                 if params.camera.auto_exposure && self.metering.is_none() {
                     self.metering = Some(spektrafilm_core::stages::filming::metering_preview(source));
                 }
+                if stage_timings { eprintln!("native metering preview: {} ms", stage_started.elapsed().as_millis()); stage_started = Instant::now(); }
                 let (source_width, source_height) = (source.width, source.height);
                 // The uncapped frame an export develops, and the photograph the
                 // crop cuts from it; an invalid or too-large request fails here,
@@ -833,6 +876,7 @@ impl Session {
                     let counts = spektrafilm_core::tone_curve::film_histogram(&self.film_stops.as_ref().unwrap().1, ev, 128);
                     json!({"stops": spektrafilm_core::tone_curve::STOPS, "ev": ev, "counts": counts})
                 };
+                if stage_timings { eprintln!("native film histogram: {} ms", stage_started.elapsed().as_millis()); stage_started = Instant::now(); }
                 let working = if dimensions == photo_dimensions {
                     pipeline = pipeline.with_prepared_frame(self.prepared_photo.clone());
                     working_source(
@@ -845,10 +889,15 @@ impl Session {
                     pipeline = pipeline.with_prepared_frame(self.prepared_interactive.clone());
                     working_source(source, &mut self.interactive, dimensions, downsample_area)
                 };
+                if stage_timings { eprintln!("native interactive resample: {} ms", stage_started.elapsed().as_millis()); stage_started = Instant::now(); }
                 let backend = self
                     .backend
                     .get_or_insert_with(spektrafilm_gpu::select_backend);
-                let (output, used_backend) = if pipeline.params.io.scan_film && pipeline.film.is_positive() {
+                let requires_pre_film_cpu_stage = pipeline.params.io.referent_logc3_enabled
+                    && pipeline.params.io.input_scene_referred;
+                let (output, used_backend) = if requires_pre_film_cpu_stage
+                    || (pipeline.params.io.scan_film && pipeline.film.is_positive())
+                {
                     pipeline.process_with_backend(working.clone(), backend.as_ref())
                 } else {
                     pipeline
@@ -856,8 +905,10 @@ impl Session {
                         .map(|output| (output, backend.name()))
                         .unwrap_or_else(|| pipeline.process_with_backend(working.clone(), backend.as_ref()))
                 };
+                if stage_timings { eprintln!("native film pipeline: {} ms", stage_started.elapsed().as_millis()); stage_started = Instant::now(); }
                 let encoding = Encoding::new(&params.io.output_color_space, params.io.output_cctf_encoding);
                 let (width, height) = write_display(&output, encoding, &post, &preview_path)?;
+                if stage_timings { eprintln!("native display encode: {} ms", stage_started.elapsed().as_millis()); }
                 // At the uncapped working size the output is byte-identical to
                 // a Fast (GPU) export, so the app can save it instead of
                 // rendering again. The display proxy's limit doesn't matter:

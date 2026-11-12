@@ -9,6 +9,7 @@ APP_NAME="${APP_NAME:-Negs}"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 PYTHON="${PYTHON:-python3}"
 RELEASE_DIR="${RELEASE_DIR:-dist/releases}"
+MACOS_ARCHS="${MACOS_ARCHS:-arm64 x86_64}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -21,17 +22,39 @@ release_name="$("$PYTHON" scripts/macos_release.py --field name)"
 # Keep the binary deployment target consistent with Info.plist.
 export MACOSX_DEPLOYMENT_TARGET=14.0
 
-# Universal app: build every executable for Apple silicon and Intel.
-# TODO(intel): the x86_64 slices use Rust's default baseline (SSE4.1). Every
-# Intel Mac that runs macOS 14 has AVX2/FMA, so measure the CPU path and f64
-# export with RUSTFLAGS="-C target-cpu=x86-64-v3" on Intel hardware (Rosetta
-# here can't run AVX2) and switch if it is faster and renders the same.
-rust_targets=(--target aarch64-apple-darwin --target x86_64-apple-darwin)
-swift_triples=(arm64-apple-macosx14.0 x86_64-apple-macosx14.0)
+# Build the requested native slices. The default remains universal for releases;
+# an Intel workstation can set MACOS_ARCHS=x86_64 to skip the unused arm64 build.
+read -r -a requested_archs <<< "$MACOS_ARCHS"
+rust_targets=()
+swift_triples=()
+rust_triples=()
+for arch in "${requested_archs[@]}"; do
+    case "$arch" in
+        arm64)
+            rust_triples+=(aarch64-apple-darwin)
+            rust_targets+=(--target aarch64-apple-darwin)
+            swift_triples+=(arm64-apple-macosx14.0)
+            ;;
+        x86_64)
+            rust_triples+=(x86_64-apple-darwin)
+            rust_targets+=(--target x86_64-apple-darwin)
+            swift_triples+=(x86_64-apple-macosx14.0)
+            ;;
+        *) echo "Unsupported MACOS_ARCHS entry: $arch (use arm64 and/or x86_64)" >&2; exit 2 ;;
+    esac
+done
+[[ ${#requested_archs[@]} -gt 0 ]] || { echo "MACOS_ARCHS must include arm64 and/or x86_64" >&2; exit 2; }
+if [[ ${#requested_archs[@]} -eq 1 ]]; then
+    case "${requested_archs[0]}" in
+        arm64) arch_label=arm64 ;;
+        x86_64) arch_label=intel ;;
+    esac
+    release_name="${release_name%-universal}-$arch_label"
+fi
 # CI builds each architecture's Rust executables in parallel jobs and places
 # them under $BUILD_TARGET_DIR/<target>/release before calling this script.
 if [[ "${NEGS_PREBUILT_RUST:-}" == 1 ]]; then
-    for target in aarch64-apple-darwin x86_64-apple-darwin; do
+    for target in "${rust_triples[@]}"; do
         for binary in spektrafilm-native spektrafilm spektrafilm-f64; do
             test -f "$BUILD_TARGET_DIR/$target/release/$binary" || {
                 echo "Missing prebuilt $target $binary" >&2
@@ -52,15 +75,22 @@ if [[ "${NEGS_PREBUILT_RUST:-}" != 1 ]]; then
     cargo build --locked --release -p spektrafilm-cli --bin spektrafilm "${rust_targets[@]}" --target-dir "$BUILD_TARGET_DIR"
     cargo build --locked --release -p spektrafilm-cli --bin spektrafilm-f64 --features precision-f64 "${rust_targets[@]}" --target-dir "$BUILD_TARGET_DIR"
 fi
-universal_dir="$BUILD_TARGET_DIR/universal-apple-darwin/release"
-mkdir -p "$universal_dir"
-lipo -create -output "$universal_dir/NegsApp" \
-    "${swift_bin_dirs[0]}/NegsApp" "${swift_bin_dirs[1]}/NegsApp"
-for binary in spektrafilm-native spektrafilm spektrafilm-f64; do
-    lipo -create -output "$universal_dir/$binary" \
-        "$BUILD_TARGET_DIR/aarch64-apple-darwin/release/$binary" \
-        "$BUILD_TARGET_DIR/x86_64-apple-darwin/release/$binary"
-done
+app_binary="${swift_bin_dirs[0]}/NegsApp"
+binary_dir="$BUILD_TARGET_DIR/${rust_triples[0]}/release"
+if [[ ${#requested_archs[@]} -gt 1 ]]; then
+    universal_dir="$BUILD_TARGET_DIR/universal-apple-darwin/release"
+    mkdir -p "$universal_dir"
+    swift_inputs=()
+    for dir in "${swift_bin_dirs[@]}"; do swift_inputs+=("$dir/NegsApp"); done
+    lipo -create -output "$universal_dir/NegsApp" "${swift_inputs[@]}"
+    for binary in spektrafilm-native spektrafilm spektrafilm-f64; do
+        inputs=()
+        for target in "${rust_triples[@]}"; do inputs+=("$BUILD_TARGET_DIR/$target/release/$binary"); done
+        lipo -create -output "$universal_dir/$binary" "${inputs[@]}"
+    done
+    app_binary="$universal_dir/NegsApp"
+    binary_dir="$universal_dir"
+fi
 
 rm -rf "$DIST_DIR"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources" "$APP_BUNDLE/Contents/Frameworks" "$RELEASE_DIR"
@@ -73,17 +103,31 @@ sparkle_binary="$(realpath "$sparkle_bundle/$sparkle_executable")"
 # SwiftPM's Sparkle XCFramework slice is already universal and signed. Keep
 # that executable intact instead of lipo-rewriting its sealed code signature.
 sparkle_archs="$(lipo -archs "$sparkle_binary")"
-[[ " $sparkle_archs " == *" arm64 "* && " $sparkle_archs " == *" x86_64 "* ]] || {
-    echo "Sparkle framework is missing an architecture slice: $sparkle_archs" >&2
-    exit 1
-}
+for arch in "${requested_archs[@]}"; do
+    case "$arch" in
+        arm64) required_arch=arm64 ;;
+        x86_64) required_arch=x86_64 ;;
+    esac
+    [[ " $sparkle_archs " == *" $required_arch "* ]] || {
+        echo "Sparkle framework is missing the $required_arch architecture slice: $sparkle_archs" >&2
+        exit 1
+    }
+done
 
-cp "$universal_dir/NegsApp" "$APP_BUNDLE/Contents/MacOS/NegsApp"
-cp "$universal_dir/spektrafilm-native" "$APP_BUNDLE/Contents/MacOS/spektrafilm-native"
-cp "$universal_dir/spektrafilm" "$APP_BUNDLE/Contents/MacOS/spektrafilm"
-cp "$universal_dir/spektrafilm-f64" "$APP_BUNDLE/Contents/MacOS/spektrafilm-f64"
+cp "$app_binary" "$APP_BUNDLE/Contents/MacOS/NegsApp"
+cp "$binary_dir/spektrafilm-native" "$APP_BUNDLE/Contents/MacOS/spektrafilm-native"
+cp "$binary_dir/spektrafilm" "$APP_BUNDLE/Contents/MacOS/spektrafilm"
+cp "$binary_dir/spektrafilm-f64" "$APP_BUNDLE/Contents/MacOS/spektrafilm-f64"
 cp -R data "$APP_BUNDLE/Contents/Resources/data"
 cp LICENSE "$APP_BUNDLE/Contents/Resources/LICENSE.txt"
+# Referent is free to download but carries no redistribution grant. Bundle a
+# copy only into a local package when the user has installed their LUT; never
+# add it to source archives or the public repository.
+referent_lut="${REFERENT_LUT_PATH:-/Library/Application Support/Blackmagic Design/DaVinci Resolve/LUT/Luma Production LUTs/Viewing and Output/Referent/Referent_LogC3_to_Rec709.cube}"
+if [[ -f "$referent_lut" ]]; then
+    mkdir -p "$APP_BUNDLE/Contents/Resources/LUTs"
+    cp "$referent_lut" "$APP_BUNDLE/Contents/Resources/LUTs/Referent_LogC3_to_Rec709.cube"
+fi
 chmod +x "$APP_BUNDLE/Contents/MacOS/NegsApp" \
     "$APP_BUNDLE/Contents/MacOS/spektrafilm-native" \
     "$APP_BUNDLE/Contents/MacOS/spektrafilm" \
@@ -117,7 +161,14 @@ Open the disk image, drag Negs.app to Applications, and double-click it.
 For ZIP downloads, unzip the app and move it to Applications.
 No Rust, Homebrew, or separate data download is needed.
 The native SwiftUI interface requires macOS 14 or newer and runs natively on
-Apple silicon and Intel Macs.
+the architecture or architectures included in this package.
+
+Referent input transform:
+- When the locally licensed Referent LogC3 LUT is installed in DaVinci Resolve,
+  local app packages bundle it and use that bundled copy by default.
+- The LUT is third-party material and is not included in source archives or
+  public CI releases. Install your licensed copy at Resolve's standard LUT path
+  or choose it in Input Transform settings.
 
 Native interface:
 - Standard macOS menus, toolbar, adjustment inspector, and open/save dialogs.
@@ -171,7 +222,7 @@ README
 # Snapshot the actual working source, including uncommitted port changes.
 # Exclude build products and local files unrelated to reproducing the app.
 COPYFILE_DISABLE=1 tar --exclude='.DS_Store' --exclude='__pycache__' --exclude='.build' --exclude='.swiftpm' \
-    -czf "$DIST_DIR/SOURCE.tar.gz" Cargo.toml Cargo.lock LICENSE README.md \
+    -czf "$DIST_DIR/SOURCE.tar.gz" AGENTS.md .gitignore Cargo.toml Cargo.lock LICENSE README.md \
     crates macos data assets scripts docs .github release
 
 # Ad-hoc sign our own executables and the outer app. Do not recursively
@@ -204,6 +255,7 @@ hdiutil create -volname "Negs" -srcfolder "$stage/dmg" -format UDZO -ov "$RELEAS
 hdiutil verify "$RELEASE_DIR/$release_name.dmg"
 "$PYTHON" scripts/verify_macos_package.py --zip "$zip_path" \
     --source "$RELEASE_DIR/$release_name-source.tar.gz" \
+    --architectures "${requested_archs[@]}" \
     --output-dir "$stage/unpacked"
 # Keep the small audit report, then let the EXIT trap remove both app copies.
 cp "$stage/unpacked/package-report.json" "$DIST_DIR/package-report.json"

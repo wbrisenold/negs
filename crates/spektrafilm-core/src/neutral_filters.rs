@@ -71,6 +71,9 @@ mod tests {
             db.lookup("kodak_portra_endura", "TH-KG3", "kodak_portra_400"),
             Some([0.0, 51.8405, 51.2543])
         );
-        assert_eq!(db.lookup("kodak_portra_endura", "TH-KG3", "no_such_film"), None);
+        assert_eq!(
+            db.lookup("kodak_portra_endura", "TH-KG3", "no_such_film"),
+            None
+        );
     }
 }

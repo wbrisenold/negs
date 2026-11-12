@@ -42,7 +42,11 @@ pub enum SizeError {
     /// than 1. Neither silently wins.
     TargetWithFactor(f32),
     InvalidCrop(String),
-    TooLarge { width: f64, height: f64 },
+    InvalidInputTransform(String),
+    TooLarge {
+        width: f64,
+        height: f64,
+    },
 }
 
 impl fmt::Display for SizeError {
@@ -61,6 +65,7 @@ impl fmt::Display for SizeError {
                 "Image Size sets a longest side, so the working resolution factor must be 1, not {factor}"
             ),
             Self::InvalidCrop(reason) => write!(f, "{reason}"),
+            Self::InvalidInputTransform(reason) => write!(f, "{reason}"),
             Self::TooLarge { width, height } => write!(
                 f,
                 "This size needs a {} × {} px frame ({} MP) to develop, more than the {} MP limit. \
@@ -119,7 +124,8 @@ pub fn resolve(
         return Err(SizeError::InvalidFactor(factor));
     }
     if let Some(crop) = crop {
-        crop.validate().map_err(|e| SizeError::InvalidCrop(e.to_string()))?;
+        crop.validate()
+            .map_err(|e| SizeError::InvalidCrop(e.to_string()))?;
     }
     let (width, height) = match photo_long_side {
         Some(target) => {
@@ -131,7 +137,10 @@ pub fn resolve(
             }
             let (cw, ch) = crop.map_or((1.0, 1.0), |c| (c.width, c.height));
             let scale = f64::from(target) / (cw * f64::from(w0)).max(ch * f64::from(h0));
-            ((f64::from(w0) * scale).round().max(1.0), (f64::from(h0) * scale).round().max(1.0))
+            (
+                (f64::from(w0) * scale).round().max(1.0),
+                (f64::from(h0) * scale).round().max(1.0),
+            )
         }
         // Today's working-resolution rounding, in f32.
         None if (factor - 1.0).abs() < 1e-6 => (f64::from(w0), f64::from(h0)),
@@ -164,7 +173,11 @@ pub fn resolve(
         }
         None => working,
     };
-    Ok(ResolvedSize { source, working, photo })
+    Ok(ResolvedSize {
+        source,
+        working,
+        photo,
+    })
 }
 
 #[cfg(test)]
@@ -172,7 +185,13 @@ mod tests {
     use super::*;
 
     fn crop(x: f64, y: f64, width: f64, height: f64, angle: f64) -> Crop {
-        Crop { x, y, width, height, angle }
+        Crop {
+            x,
+            y,
+            width,
+            height,
+            angle,
+        }
     }
 
     #[test]
@@ -185,31 +204,71 @@ mod tests {
         assert!(size.resizes());
         // Portrait, and the same crop straightened.
         let portrait = resolve((4000, 6000), 1.0, Some(6000), Some(&centre)).unwrap();
-        assert_eq!((portrait.working, portrait.photo), ((8000, 12000), (4000, 6000)));
+        assert_eq!(
+            (portrait.working, portrait.photo),
+            ((8000, 12000), (4000, 6000))
+        );
         let turned = crop(0.25, 0.25, 0.5, 0.5, 3.5);
-        assert_eq!(resolve((6000, 4000), 1.0, Some(6000), Some(&turned)).unwrap().photo, (6000, 4000));
+        assert_eq!(
+            resolve((6000, 4000), 1.0, Some(6000), Some(&turned))
+                .unwrap()
+                .photo,
+            (6000, 4000)
+        );
     }
 
     #[test]
     fn original_and_legacy_factors_keep_their_rounding() {
         let original = resolve((6000, 4000), 1.0, None, None).unwrap();
-        assert_eq!((original.working, original.resizes()), ((6000, 4000), false));
+        assert_eq!(
+            (original.working, original.resizes()),
+            ((6000, 4000), false)
+        );
         let half = resolve((6001, 4001), 0.5, None, None).unwrap();
-        assert_eq!(half.working, (((6001f32 * 0.5).round()) as u32, ((4001f32 * 0.5).round()) as u32));
-        assert_eq!(resolve((30, 20), 1.5, None, None).unwrap().working, (45, 30));
+        assert_eq!(
+            half.working,
+            (
+                ((6001f32 * 0.5).round()) as u32,
+                ((4001f32 * 0.5).round()) as u32
+            )
+        );
+        assert_eq!(
+            resolve((30, 20), 1.5, None, None).unwrap().working,
+            (45, 30)
+        );
         assert_eq!(resolve((3, 1), 0.1, None, None).unwrap().working, (1, 1));
         // The crop never changes a legacy size, only the photograph.
-        let cropped = resolve((6000, 4000), 0.5, None, Some(&crop(0.0, 0.0, 0.5, 1.0, 0.0))).unwrap();
-        assert_eq!((cropped.working, cropped.photo), ((3000, 2000), (1500, 2000)));
+        let cropped = resolve(
+            (6000, 4000),
+            0.5,
+            None,
+            Some(&crop(0.0, 0.0, 0.5, 1.0, 0.0)),
+        )
+        .unwrap();
+        assert_eq!(
+            (cropped.working, cropped.photo),
+            ((3000, 2000), (1500, 2000))
+        );
     }
 
     #[test]
     fn the_crop_position_and_angle_never_change_the_working_size() {
         let at = |x: f64, y: f64, angle: f64| {
-            resolve((5472, 3648), 1.0, Some(4321), Some(&crop(x, y, 0.37, 0.61, angle))).unwrap()
+            resolve(
+                (5472, 3648),
+                1.0,
+                Some(4321),
+                Some(&crop(x, y, 0.37, 0.61, angle)),
+            )
+            .unwrap()
         };
         let first = at(0.0, 0.0, 0.0);
-        for (x, y, angle) in [(0.3, 0.2, 0.0), (0.63, 0.39, 0.0), (0.1, 0.1, -7.0), (0.2, 0.15, 12.5)] {
+        for (x, y, angle) in [
+            (0.3, 0.2, 0.0),
+            (0.63, 0.39, 0.0),
+            (0.1, 0.1, -7.0),
+            (0.2, 0.15, 12.5),
+        ] {
             assert_eq!(at(x, y, angle).working, first.working);
         }
         // Rounding at the edges can move the photograph by a pixel, never more.
@@ -222,7 +281,13 @@ mod tests {
     #[test]
     fn quarter_turns_keep_the_longest_side() {
         // A quarter turn swaps the photograph's sides after the pipeline.
-        let wide = resolve((6000, 4000), 1.0, Some(3000), Some(&crop(0.1, 0.0, 0.4, 0.9, 0.0))).unwrap();
+        let wide = resolve(
+            (6000, 4000),
+            1.0,
+            Some(3000),
+            Some(&crop(0.1, 0.0, 0.4, 0.9, 0.0)),
+        )
+        .unwrap();
         let (w, h) = wide.photo;
         assert_eq!(w.max(h).abs_diff(3000), 0);
     }
@@ -242,13 +307,20 @@ mod tests {
             let source = (16 + (next() * 9000.0) as u32, 16 + (next() * 9000.0) as u32);
             let (cw, ch) = (0.002 + next() * 0.998, 0.002 + next() * 0.998);
             let (x, y) = (next() * (1.0 - cw), next() * (1.0 - ch));
-            let angle = if i % 3 == 0 { (next() - 0.5) * 20.0 } else { 0.0 };
+            let angle = if i % 3 == 0 {
+                (next() - 0.5) * 20.0
+            } else {
+                0.0
+            };
             let target = 16 + (next() * 12_000.0) as u32;
             let c = crop(x, y, cw, ch, angle);
             match resolve(source, 1.0, Some(target), Some(&c)) {
                 Ok(size) => {
                     let long = size.photo.0.max(size.photo.1);
-                    assert!(long.abs_diff(target) <= 1, "{source:?} {c:?} {target}: {size:?}");
+                    assert!(
+                        long.abs_diff(target) <= 1,
+                        "{source:?} {c:?} {target}: {size:?}"
+                    );
                 }
                 Err(SizeError::TooLarge { width, height }) => {
                     assert!(width * height > MAX_WORKING_PIXELS as f64)
@@ -258,7 +330,13 @@ mod tests {
         }
         // Half-pixel edges.
         // Half-pixel edges: 12.5 and 37.5 in a 50 px wide frame.
-        let half = resolve((100, 80), 1.0, Some(25), Some(&crop(0.25, 0.25, 0.5, 0.25, 0.0))).unwrap();
+        let half = resolve(
+            (100, 80),
+            1.0,
+            Some(25),
+            Some(&crop(0.25, 0.25, 0.5, 0.25, 0.0)),
+        )
+        .unwrap();
         assert_eq!(half.working, (50, 40));
         assert!(half.photo.0.max(half.photo.1).abs_diff(25) <= 1, "{half:?}");
     }
@@ -266,35 +344,86 @@ mod tests {
     #[test]
     fn enlargements_are_bounded_before_allocation() {
         // 12 MP at 3× (108 MP) is admitted; the limit itself is the boundary.
-        assert_eq!(resolve((4000, 3000), 1.0, Some(12_000), None).unwrap().working, (12_000, 9000));
-        assert_eq!(resolve((16_000, 8000), 1.0, None, None).unwrap().working, (16_000, 8000));
+        assert_eq!(
+            resolve((4000, 3000), 1.0, Some(12_000), None)
+                .unwrap()
+                .working,
+            (12_000, 9000)
+        );
+        assert_eq!(
+            resolve((16_000, 8000), 1.0, None, None).unwrap().working,
+            (16_000, 8000)
+        );
         assert!(resolve((8000, 4000), 1.0, Some(16_000), None).is_ok()); // exactly 128 MP
-        assert!(matches!(resolve((8000, 4000), 1.0, Some(16_002), None), Err(SizeError::TooLarge { .. })));
+        assert!(matches!(
+            resolve((8000, 4000), 1.0, Some(16_002), None),
+            Err(SizeError::TooLarge { .. })
+        ));
         // The same target from a smaller crop needs a much larger frame.
         let small = crop(0.4, 0.4, 0.2, 0.2, 0.0);
-        assert!(matches!(resolve((4000, 3000), 1.0, Some(6000), Some(&small)), Err(SizeError::TooLarge { .. })));
+        assert!(matches!(
+            resolve((4000, 3000), 1.0, Some(6000), Some(&small)),
+            Err(SizeError::TooLarge { .. })
+        ));
         // Legacy enlargements are bounded too.
-        assert!(matches!(resolve((10_000, 10_000), 1.2, None, None), Err(SizeError::TooLarge { .. })));
+        assert!(matches!(
+            resolve((10_000, 10_000), 1.2, None, None),
+            Err(SizeError::TooLarge { .. })
+        ));
         // Sources above the limit develop at their own size or smaller.
-        assert_eq!(resolve((16_000, 10_000), 1.0, None, None).unwrap().working, (16_000, 10_000));
-        assert_eq!(resolve((16_000, 10_000), 1.0, Some(15_000), None).unwrap().working, (15_000, 9375));
+        assert_eq!(
+            resolve((16_000, 10_000), 1.0, None, None).unwrap().working,
+            (16_000, 10_000)
+        );
+        assert_eq!(
+            resolve((16_000, 10_000), 1.0, Some(15_000), None)
+                .unwrap()
+                .working,
+            (15_000, 9375)
+        );
         // A crop of a vanishing extent can't overflow the frame's arithmetic.
         let speck = crop(0.5, 0.5, 1e-12, 1e-12, 0.0);
-        assert!(matches!(resolve((6000, 4000), 1.0, Some(65_535), Some(&speck)), Err(SizeError::TooLarge { .. })));
-        let message = resolve((4000, 3000), 1.0, Some(6000), Some(&small)).unwrap_err().to_string();
-        assert!(message.contains("30000 × 22500 px frame (675 MP)") && message.contains("128 MP limit"), "{message}");
+        assert!(matches!(
+            resolve((6000, 4000), 1.0, Some(65_535), Some(&speck)),
+            Err(SizeError::TooLarge { .. })
+        ));
+        let message = resolve((4000, 3000), 1.0, Some(6000), Some(&small))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("30000 × 22500 px frame (675 MP)") && message.contains("128 MP limit"),
+            "{message}"
+        );
     }
 
     #[test]
     fn invalid_requests_fail() {
-        assert_eq!(resolve((0, 10), 1.0, None, None), Err(SizeError::EmptySource));
-        assert_eq!(resolve((10, 10), 1.0, Some(15), None), Err(SizeError::TargetOutOfRange(15)));
-        assert_eq!(resolve((10, 10), 1.0, Some(65_536), None), Err(SizeError::TargetOutOfRange(65_536)));
-        assert_eq!(resolve((10, 10), 0.5, Some(100), None), Err(SizeError::TargetWithFactor(0.5)));
+        assert_eq!(
+            resolve((0, 10), 1.0, None, None),
+            Err(SizeError::EmptySource)
+        );
+        assert_eq!(
+            resolve((10, 10), 1.0, Some(15), None),
+            Err(SizeError::TargetOutOfRange(15))
+        );
+        assert_eq!(
+            resolve((10, 10), 1.0, Some(65_536), None),
+            Err(SizeError::TargetOutOfRange(65_536))
+        );
+        assert_eq!(
+            resolve((10, 10), 0.5, Some(100), None),
+            Err(SizeError::TargetWithFactor(0.5))
+        );
         for factor in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-            assert!(matches!(resolve((10, 10), factor, None, None), Err(SizeError::InvalidFactor(_))));
+            assert!(matches!(
+                resolve((10, 10), factor, None, None),
+                Err(SizeError::InvalidFactor(_))
+            ));
         }
         let outside = crop(0.6, 0.0, 0.5, 1.0, 0.0);
-        assert!(matches!(resolve((10, 10), 1.0, Some(100), Some(&outside)), Err(SizeError::InvalidCrop(_))));
+        assert!(matches!(
+            resolve((10, 10), 1.0, Some(100), Some(&outside)),
+            Err(SizeError::InvalidCrop(_))
+        ));
     }
 }

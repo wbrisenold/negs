@@ -1,0 +1,32 @@
+# Negs project guidance
+
+## Targets and repository boundaries
+
+- The active workstation target is Intel macOS (`x86_64-apple-darwin`). Keep Intel build, preview, and packaging paths working when changing native code.
+- Keep the `upstream` remote pointed at `noahhaasis/negs`. Develop and push this fork's work on a branch; never push this fork's feature work to upstream `main`.
+- Core image processing belongs in the Rust crates. SwiftUI owns macOS presentation and interaction. Preserve the CLI, web, and non-macOS builds unless a task explicitly narrows scope.
+- Keep generated output (`target/`, `.build/`, `/dist/`), personal image assets, and locally licensed LUTs out of Git. Do not add user photos or local app bundles to commits.
+- The Referent LogC3 LUT is third-party material. Local packaging may bundle the copy installed by the developer, but source archives and public GitHub releases must not redistribute it without permission. The app can use a bundled local copy or the user's Resolve-installed/custom LUT.
+
+## Preview performance contract
+
+- Keep interactive RAW previews at or below 38% of the source dimensions. `EditorModel.rawPreviewScale(requested:)` is the single clamp: requested quality may be lower, never higher. Full-resolution export remains separate from the interactive preview path.
+- Keep expensive full-frame exposure metering on the reduced-area meter path; do not restore a full-resolution wide-kernel blur for the meter. Preserve asynchronous/coalesced preview work and reuse cached decoded/processed data where valid; slider changes should not synchronously block the main/UI thread.
+- Treat performance as a regression-gated feature. The optimized Intel Rust gate is in `.github/workflows/release.yml`: run the 12 MP meter test with a 500 ms ceiling and verify the 38% RAW preview dimensions. Keep both checks on the `x86_64-apple-darwin` release test path.
+- Local gate commands:
+
+  ```sh
+  CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER='arch -x86_64' \
+    cargo test --locked --release --target x86_64-apple-darwin -p spektrafilm-core --lib metering_preview_keeps_area_reduction_on_large_raw_frames
+  CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER='arch -x86_64' \
+    cargo test --locked --release --target x86_64-apple-darwin -p spektrafilm-core --lib interactive_preview_at_editor_quality_keeps_expected_detail
+  swift test --package-path macos --filter QuickFrameTests/testRawPreviewQualityScaleIs38PercentAndNeverUpscales
+  ```
+
+- Report measured timings with the host, build mode, image dimensions, preview scale, and whether the number is engine-only or end-to-end. A single local result is not a general performance promise. Verify user-visible RAW behavior separately from unit tests and meter microbenchmarks.
+
+## Build and package
+
+- Use `scripts/package_macos_app.sh` for a local app bundle. To build only Intel, set `MACOS_ARCHS=x86_64`. Verify the architecture with `lipo -archs` and the bundle with `scripts/verify_macos_package.py`.
+- Public CI and release builds must remain reproducible without local files, external LUTs, or developer credentials. Keep third-party assets out of source tarballs.
+- Avoid committing build output or screenshots; keep only source, tests, docs, and intentional small fixtures.

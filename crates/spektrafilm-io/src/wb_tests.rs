@@ -109,6 +109,7 @@ fn selection_reloads_raw_and_export_json_reproduces_preview_pixels() {
             mode,
             temperature: 3200.0,
             tint: 0.85,
+            ..Default::default()
         };
         let preview = load_image_with_wb(&file.0, Formats::Any, wb).unwrap();
         let export_wb = serde_json::from_str(&serde_json::to_string(&wb).unwrap()).unwrap();
@@ -144,6 +145,7 @@ fn selection_reloads_raw_and_export_json_reproduces_preview_pixels() {
             mode: RawWhiteBalanceMode::Custom,
             temperature: 6504.0,
             tint: 1.0,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -157,7 +159,7 @@ fn selection_reloads_raw_and_export_json_reproduces_preview_pixels() {
 fn byte_loaders_apply_the_same_wb_as_path_loaders() {
     let file = write_fixture();
     let bytes = std::fs::read(&file.0).unwrap();
-    let wbs = RawWhiteBalanceMode::ALL.map(|mode| RawWhiteBalance { mode, temperature: 3200.0, tint: 0.85 });
+    let wbs = RawWhiteBalanceMode::ALL.map(|mode| RawWhiteBalance { mode, temperature: 3200.0, tint: 0.85, ..Default::default() });
     for wb in wbs {
         let path = load_raw_with_wb(&file.0, wb).unwrap();
         assert_eq!(load_raw_bytes(&bytes, wb).unwrap().data, path.data, "{:?}", wb.mode);
@@ -177,10 +179,10 @@ fn byte_loaders_apply_the_same_wb_as_path_loaders() {
     assert_ne!(daylight, as_shot);
     assert_ne!(tungsten, daylight);
     assert_ne!(custom, daylight);
-    let custom_daylight = RawWhiteBalance { mode: RawWhiteBalanceMode::Custom, temperature: 6504.0, tint: 1.0 };
+    let custom_daylight = RawWhiteBalance { mode: RawWhiteBalanceMode::Custom, temperature: 6504.0, tint: 1.0, ..Default::default() };
     assert_eq!(load_raw_bytes(&bytes, custom_daylight).unwrap().data, daylight);
     assert_eq!(load_raw_bytes(&bytes, RawWhiteBalance::default()).unwrap().data, as_shot);
-    let invalid = RawWhiteBalance { mode: RawWhiteBalanceMode::Custom, temperature: 1000.0, tint: 1.0 };
+    let invalid = RawWhiteBalance { mode: RawWhiteBalanceMode::Custom, temperature: 1000.0, tint: 1.0, ..Default::default() };
     for error in [
         load_raw_bytes(&bytes, invalid).unwrap_err(),
         load_raw_bytes_unoriented(&bytes, invalid).unwrap_err(),
@@ -189,7 +191,7 @@ fn byte_loaders_apply_the_same_wb_as_path_loaders() {
         assert!(format!("{error:#}").contains("temperature must be between 1667 and 25000 K"), "{error:#}");
     }
     // Inactive custom values are kept but not validated or applied.
-    let inactive = RawWhiteBalance { mode: RawWhiteBalanceMode::Daylight, temperature: f64::NAN, tint: -1.0 };
+    let inactive = RawWhiteBalance { mode: RawWhiteBalanceMode::Daylight, temperature: f64::NAN, tint: -1.0, ..Default::default() };
     assert_eq!(load_raw_bytes(&bytes, inactive).unwrap().data, daylight);
 }
 
@@ -227,6 +229,7 @@ fn non_raw_ignores_wb_including_inapplicable_custom_values() {
             mode: RawWhiteBalanceMode::Custom,
             temperature: f64::NAN,
             tint: -1.0,
+            ..Default::default()
         };
         assert_eq!(
             baseline.data,
@@ -246,6 +249,7 @@ fn monochrome_is_not_tinted() {
         mode: RawWhiteBalanceMode::Custom,
         temperature: 2850.0,
         tint: 0.5,
+        ..Default::default()
     };
     white_balance::prepare(&mut raw, wb).unwrap();
     assert!(white_balance::is_monochrome(&raw));
@@ -276,6 +280,7 @@ fn camera_raw_smoke() {
                 mode,
                 temperature: 3200.0,
                 tint: 0.85,
+                ..Default::default()
             };
             let image = load_raw_with_wb(&path, wb).unwrap();
             assert_eq!(

@@ -36,6 +36,8 @@ def main():
     parser.add_argument("--zip", required=True, type=Path)
     parser.add_argument("--source", type=Path, help="Matching source release asset")
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--architectures", nargs="+", choices=("arm64", "x86_64"),
+                        default=("arm64", "x86_64"), help="Expected executable slices")
     args = parser.parse_args()
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -68,7 +70,8 @@ def main():
                 f"{name} requires a newer OS than Info.plist advertises")
         report["binaries"][name] = {"sha256": sha(binary), "architecture": arch,
                                      "minimum_macos": minimum, "dependencies": dependencies}
-        require(set(arch.split()) == {"arm64", "x86_64"}, f"Not a universal binary: {name}: {arch}")
+        require(set(arch.split()) == set(args.architectures),
+                f"Unexpected architecture slices in {name}: expected {args.architectures}, got {arch}")
     framework = app / "Contents/Frameworks/Sparkle.framework"
     require(framework.is_dir(), "Sparkle framework missing")
     checked("/usr/bin/codesign", "--verify", "--deep", "--strict", str(framework))

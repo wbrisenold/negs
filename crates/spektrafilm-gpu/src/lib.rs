@@ -238,6 +238,39 @@ pub struct DisplayPost {
     pub encode: Vec<f32>,
     /// Linear luminance → adjusted linear luminance, sampled on √Y.
     pub tone: Vec<f32>,
+    pub color_separation: DisplayColorSeparation,
+    pub film_compression: DisplayFilmCompression,
+    pub film_expand: DisplayFilmExpand,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DisplayColorSeparation {
+    pub strength: f32,
+    pub target_hue: f32,
+    pub complementary_hue: f32,
+    pub target_saturation: f32,
+    pub luminance_mask: f32,
+    pub neutral_protection: f32,
+    pub method: f32,
+    pub color_wash: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DisplayFilmCompression {
+    pub enabled: bool,
+    pub impact: f32,
+    pub white_point: f32,
+    pub range: f32,
+    pub color_density: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DisplayFilmExpand {
+    pub enabled: bool,
+    pub blacks: f32,
+    pub whites: f32,
+    pub rgb_mode: bool,
+    pub impact: f32,
 }
 
 /// A finished [`PendingFilmChain`], by its [`ChainOutput`].

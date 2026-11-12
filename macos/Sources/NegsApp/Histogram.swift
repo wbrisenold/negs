@@ -31,7 +31,8 @@ struct Waveform: Equatable, Sendable {
     let red: [UInt32]
     let green: [UInt32]
     let blue: [UInt32]
-    /// A small precomputed raster keeps drawing independent of photo size.
+    /// Three side-by-side channel rasters keep the RGB parade drawing
+    /// independent of photo size and prevent overlaid channels washing white.
     let rgba: [UInt8]
     let sampleCount: Int
 
@@ -41,16 +42,22 @@ struct Waveform: Equatable, Sendable {
         sampleCount = Int(red.reduce(0, +))
         let peak = max(red.max() ?? 0, green.max() ?? 0, blue.max() ?? 0)
         let normalizer = log1p(Double(peak))
-        var pixels = [UInt8](repeating: 0, count: width * 256 * 4)
+        let paradeWidth = width * 3
+        var pixels = [UInt8](repeating: 0, count: paradeWidth * 256 * 4)
         if peak > 0 {
             func intensity(_ count: UInt32) -> UInt8 {
-                count == 0 ? 0 : UInt8((255 * (0.18 + 0.82 * log1p(Double(count)) / normalizer)).rounded())
+                count == 0 ? 0 : UInt8((232 * (0.16 + 0.84 * log1p(Double(count)) / normalizer)).rounded())
             }
             for level in 0..<256 {
                 for x in 0..<width {
-                    let bin = level * width + x, pixel = ((255 - level) * width + x) * 4
-                    pixels[pixel] = intensity(red[bin]); pixels[pixel + 1] = intensity(green[bin]); pixels[pixel + 2] = intensity(blue[bin])
-                    pixels[pixel + 3] = max(pixels[pixel], pixels[pixel + 1], pixels[pixel + 2])
+                    let source = level * width + x
+                    let row = (255 - level) * paradeWidth
+                    for (channel, counts) in [red, green, blue].enumerated() {
+                        let value = intensity(counts[source])
+                        let pixel = (row + channel * width + x) * 4
+                        pixels[pixel + channel] = value
+                        pixels[pixel + 3] = value
+                    }
                 }
             }
         }
@@ -59,8 +66,8 @@ struct Waveform: Equatable, Sendable {
 
     var image: CGImage? {
         guard sampleCount > 0, let provider = CGDataProvider(data: Data(rgba) as CFData) else { return nil }
-        return CGImage(width: width, height: 256, bitsPerComponent: 8, bitsPerPixel: 32,
-                       bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+        return CGImage(width: width * 3, height: 256, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: width * 3 * 4, space: CGColorSpaceCreateDeviceRGB(),
                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
                        provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
     }
@@ -73,6 +80,91 @@ struct ImageScopes: Equatable, Sendable {
     var waveform = Waveform()
     var vectorscope = Vectorscope()
     var skinAnalysis = SkinAnalysis()
+
+    /// Transparent false-colour mask for clipped highlights (red) and
+    /// crushed shadows (blue). Highlights include either clipped luma or an
+    /// individually clipped RGB channel, so saturated colour clipping is
+    /// visible even when the weighted luma remains below white. Generated
+    /// only when the viewer overlay is on.
+    static func clippingOverlay(_ surface: IOSurface, low: Double, high: Double) -> CGImage? {
+        guard surface.bytesPerElement >= 4 else { return nil }
+        surface.lock(options: .readOnly, seed: nil)
+        defer { surface.unlock(options: .readOnly, seed: nil) }
+        let sourceWidth = surface.width, sourceHeight = surface.height
+        let scale = min(1.0, sqrt(Double(1 << 22) / Double(sourceWidth * sourceHeight)))
+        let width = max(1, Int((Double(sourceWidth) * scale).rounded()))
+        let height = max(1, Int((Double(sourceHeight) * scale).rounded()))
+        let source = surface.baseAddress.assumingMemoryBound(to: UInt8.self)
+        let rowBytes = surface.bytesPerRow
+        var rgba = [UInt8](repeating: 0, count: width * height * 4)
+        for y in 0..<height {
+            for x in 0..<width {
+                let sx = min(sourceWidth - 1, Int((Double(x) + 0.5) * Double(sourceWidth) / Double(width)))
+                let sy = min(sourceHeight - 1, Int((Double(y) + 0.5) * Double(sourceHeight) / Double(height)))
+                let src = sy * rowBytes + sx * surface.bytesPerElement
+                let r = source[src + 2], g = source[src + 1], b = source[src]
+                let offset = (y * width + x) * 4
+                let y = (0.299 * Double(r) + 0.587 * Double(g) + 0.114 * Double(b)) / 255
+                let channelClipped = Double(max(r, max(g, b))) / 255 >= high
+                if y <= low {
+                    rgba[offset] = 12; rgba[offset + 1] = 34; rgba[offset + 2] = 230; rgba[offset + 3] = 230
+                } else if y >= high || channelClipped {
+                    rgba[offset] = 230; rgba[offset + 1] = 18; rgba[offset + 2] = 12; rgba[offset + 3] = 230
+                }
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData) else { return nil }
+        return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+
+    /// False-colour exposure map for the developed display-referred frame.
+    /// It is generated only while enabled and capped at one megapixel so it
+    /// remains a lightweight diagnostic overlay rather than a develop stage.
+    static func falseColorOverlay(_ surface: IOSurface) -> CGImage? {
+        guard surface.bytesPerElement >= 4 else { return nil }
+        surface.lock(options: .readOnly, seed: nil)
+        defer { surface.unlock(options: .readOnly, seed: nil) }
+        let sourceWidth = surface.width, sourceHeight = surface.height
+        let scale = min(1.0, sqrt(Double(1 << 20) / Double(sourceWidth * sourceHeight)))
+        let width = max(1, Int((Double(sourceWidth) * scale).rounded()))
+        let height = max(1, Int((Double(sourceHeight) * scale).rounded()))
+        let source = surface.baseAddress.assumingMemoryBound(to: UInt8.self)
+        let rowBytes = surface.bytesPerRow, alpha = 224.0 / 255.0
+        var rgba = [UInt8](repeating: 0, count: width * height * 4)
+        for y in 0..<height {
+            let sy = min(sourceHeight - 1, Int((Double(y) + 0.5) * Double(sourceHeight) / Double(height)))
+            for x in 0..<width {
+                let sx = min(sourceWidth - 1, Int((Double(x) + 0.5) * Double(sourceWidth) / Double(width)))
+                let src = sy * rowBytes + sx * surface.bytesPerElement
+                let luma = (54 * Int(source[src]) + 183 * Int(source[src + 1]) + 19 * Int(source[src + 2])) >> 8
+                let color: (UInt8, UInt8, UInt8)
+                switch luma {
+                case ..<13: color = (14, 8, 52)       // 0–5 IRE: near-black
+                case ..<31: color = (34, 46, 190)     // 5–12 IRE: deep blue
+                case ..<64: color = (0, 164, 222)     // 12–25 IRE: cyan
+                case ..<112: color = (0, 178, 88)     // 25–44 IRE: green
+                case ..<148: color = (225, 210, 0)    // 44–58 IRE: yellow
+                case ..<179: color = (255, 132, 0)    // 58–70 IRE: orange
+                case ..<217: color = (226, 32, 28)    // 70–85 IRE: red
+                case ..<245: color = (213, 32, 196)   // 85–96 IRE: magenta
+                default: color = (245, 245, 245)      // 96–100 IRE: highlight
+                }
+                let offset = (y * width + x) * 4
+                rgba[offset] = UInt8((Double(color.0) * alpha).rounded())
+                rgba[offset + 1] = UInt8((Double(color.1) * alpha).rounded())
+                rgba[offset + 2] = UInt8((Double(color.2) * alpha).rounded())
+                rgba[offset + 3] = 224
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData) else { return nil }
+        return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
 
     static func of(_ surface: IOSurface, crop: CropSettings, rotation: Int = 0, maxSamples: Int = 1 << 20) -> ImageScopes {
         let size = CGSize(width: surface.width, height: surface.height)
@@ -255,7 +347,23 @@ struct WaveformView: View {
             Canvas { context, size in
                 scopeGrid(context: &context, size: size)
                 if let image = waveform?.image {
-                    context.draw(Image(decorative: image, scale: 1), in: CGRect(origin: .zero, size: size))
+                    let labelHeight: CGFloat = 13
+                    context.draw(Image(decorative: image, scale: 1), in: CGRect(x: 0, y: labelHeight,
+                                  width: size.width, height: max(0, size.height - labelHeight)))
+                    for (index, label) in ["R", "G", "B"].enumerated() {
+                        let tint: Color = [Color(red: 1, green: 0.36, blue: 0.34),
+                                           Color(red: 0.38, green: 0.9, blue: 0.48),
+                                           Color(red: 0.34, green: 0.62, blue: 1)][index]
+                        let center = size.width * (CGFloat(index) + 0.5) / 3
+                        context.draw(Text(label).font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .foregroundColor(tint.opacity(0.86)), at: CGPoint(x: center, y: 7))
+                    }
+                    var separators = Path()
+                    for fraction in [1.0 / 3, 2.0 / 3] {
+                        separators.move(to: CGPoint(x: size.width * fraction, y: 0))
+                        separators.addLine(to: CGPoint(x: size.width * fraction, y: size.height))
+                    }
+                    context.stroke(separators, with: .color(.white.opacity(0.12)), lineWidth: 0.7)
                 }
             }
         }
@@ -278,6 +386,23 @@ private func scopeGrid(context: inout GraphicsContext, size: CGSize) {
 
 enum ScopeMode: String, CaseIterable {
     case histogram = "Histogram", waveform = "Waveform", vectorscope = "Vectorscope", skin = "Skin Analysis"
+
+    var symbol: String {
+        switch self {
+        case .histogram: "chart.bar.xaxis"
+        case .waveform: "waveform.path"
+        case .vectorscope: "circle.hexagongrid"
+        case .skin: "person.crop.circle"
+        }
+    }
+
+    var signalLabel: String {
+        switch self {
+        case .histogram, .waveform: "RGB"
+        case .vectorscope: "Cb · Cr"
+        case .skin: "FACE CHROMA"
+        }
+    }
 }
 
 struct ScopePanelView: View {
@@ -285,24 +410,27 @@ struct ScopePanelView: View {
     let waveform: Waveform?
     let vectorscope: Vectorscope?
     let skinAnalysis: SkinAnalysis?
+    var clippingEnabled = false
+    var setClippingEnabled: (Bool) -> Void = { _ in }
+    var falseColorEnabled = false
+    var setFalseColorEnabled: (Bool) -> Void = { _ in }
     @AppStorage("scopeMode") private var mode = ScopeMode.histogram
     /// Dragged with the handle below the scope; remembered.
     @AppStorage("scopeHeight") private var height = ScopePanelView.defaultHeight
     /// The height while the handle is dragged, saved to `height` when it's let go.
     @State private var dragHeight: Double?
-    /// Starts at the smallest height, leaving the room to the controls.
-    static let heights = 88.0...420.0, defaultHeight = heights.lowerBound
+    /// Compact dock leaves room for adjustments; expanded is available for
+    /// judging scope detail. The grabber still allows any intermediate size.
+    static let heights = 88.0...420.0
+    static let compactHeight = 120.0
+    static let expandedHeight = 240.0
+    static let defaultHeight = compactHeight
 
     var body: some View {
-        VStack(spacing: 6) {
-            HStack {
-                Picker("Scope", selection: $mode) {
-                    ForEach(ScopeMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                }
-                .pickerStyle(.menu).labelsHidden().fixedSize().controlSize(.small)
-                .accessibilityLabel("Scope view")
-                Spacer()
-                Text("RGB").font(.caption2).foregroundStyle(.secondary)
+        VStack(spacing: StudioStyle.Space.compact) {
+            scopeToolbar
+            if falseColorEnabled {
+                FalseColorLegend().padding(.horizontal, 3)
             }
             Group {
                 switch mode {
@@ -320,6 +448,60 @@ struct ScopePanelView: View {
             }
             resizeHandle
         }
+    }
+
+    private var scopeToolbar: some View {
+        HStack {
+                Menu {
+                    ForEach(ScopeMode.allCases, id: \.self) { option in
+                        Button {
+                            mode = option
+                        } label: {
+                            if mode == option { Label(option.rawValue, systemImage: "checkmark") }
+                            else { Text(option.rawValue) }
+                        }
+                    }
+                } label: {
+                    Label(mode.rawValue, systemImage: mode.symbol).lineLimit(1).minimumScaleFactor(0.8)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .controlSize(.small)
+                .accessibilityLabel("Scope view")
+                Button {
+                    setClippingEnabled(!clippingEnabled)
+                } label: {
+                    Label("Clip", systemImage: clippingEnabled ? "exclamationmark.triangle.fill" : "exclamationmark.triangle")
+                        .lineLimit(1).minimumScaleFactor(0.8)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(clippingEnabled ? Color.blue : Color.secondary)
+                }
+                .buttonStyle(.borderless)
+                .fixedSize(horizontal: true, vertical: false)
+                .accessibilityLabel("Clipping indicators")
+                .help("Toggle clipping colors on the photograph. Red marks clipped highlights; blue marks near-black or crushed shadows.")
+                Button {
+                    setFalseColorEnabled(!falseColorEnabled)
+                } label: {
+                    Label("False Color", systemImage: "camera.filters")
+                        .lineLimit(1).minimumScaleFactor(0.8)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(falseColorEnabled ? Color.yellow : Color.secondary)
+                }
+                .buttonStyle(.borderless)
+                .fixedSize(horizontal: true, vertical: false)
+                .accessibilityLabel("False Color")
+                .help("Show a false-colour exposure map over the developed photograph.")
+                Spacer()
+                Text(mode.signalLabel)
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .tracking(0.5)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+        }
+        .controlSize(.small)
+        .frame(maxWidth: .infinity)
     }
 
     /// A grabber under the scope: drag to resize, double-click for the default height.
@@ -353,29 +535,95 @@ struct ScopePanelView: View {
     }
 }
 
+private struct FalseColorLegend: View {
+    private let stops: [(String, Color)] = [
+        ("0", Color(red: 0.05, green: 0.03, blue: 0.2)), ("10", Color(red: 0.13, green: 0.18, blue: 0.75)),
+        ("25", Color(red: 0, green: 0.64, blue: 0.87)), ("44", Color(red: 0, green: 0.7, blue: 0.35)),
+        ("58", Color(red: 0.88, green: 0.82, blue: 0)), ("70", Color(red: 1, green: 0.52, blue: 0)),
+        ("85", Color(red: 0.88, green: 0.13, blue: 0.11)), ("96", Color(red: 0.84, green: 0.13, blue: 0.77)),
+        ("100", Color(white: 0.96))
+    ]
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(Array(stops.enumerated()), id: \.offset) { _, stop in
+                VStack(spacing: 3) {
+                    RoundedRectangle(cornerRadius: 2).fill(stop.1).frame(height: 5)
+                    Text(stop.0).font(.system(size: 8, weight: .medium, design: .monospaced)).foregroundStyle(.secondary)
+                }
+            }
+            Text("IRE").font(.system(size: 8, weight: .semibold, design: .monospaced)).foregroundStyle(.tertiary)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("False color exposure scale in IRE")
+    }
+}
+
 private struct VectorscopeView: View {
     let vectorscope: Vectorscope?
     let skinOnly: Bool
     var skinAnalysis: SkinAnalysis? = nil
 
     var body: some View {
-        VStack(spacing: 5) {
+        VStack(spacing: StudioStyle.Space.compact) {
             Canvas { context, size in
                 let side = min(size.width, size.height)
                 let origin = CGPoint(x: (size.width - side) / 2, y: (size.height - side) / 2)
                 let center = CGPoint(x: origin.x + side / 2, y: origin.y + side / 2)
-                let radius = side * 0.43
-                for fraction in [0.33, 0.66, 1.0] {
+                let radius = side * 0.39
+                let plot = CGRect(x: center.x - radius, y: center.y - radius,
+                                  width: radius * 2, height: radius * 2)
+                context.fill(Path(ellipseIn: plot), with: .color(StudioStyle.plot))
+
+                let targets: [(String, Double, Double)] = [
+                    ("R", 103, 0), ("Y", 167, 1.0 / 6), ("G", 241, 2.0 / 6),
+                    ("C", 283, 3.0 / 6), ("B", 347, 4.0 / 6), ("M", 61, 5.0 / 6)
+                ]
+                for fraction in [0.25, 0.5, 0.75, 1.0] {
                     let rect = CGRect(x: center.x - radius * fraction, y: center.y - radius * fraction,
                                       width: radius * fraction * 2, height: radius * fraction * 2)
-                    context.stroke(Path(ellipseIn: rect), with: .color(.white.opacity(fraction == 1 ? 0.24 : 0.10)), lineWidth: 0.6)
+                    let opacity = fraction == 1 ? 0.58 : fraction == 0.75 ? 0.30 : 0.17
+                    context.stroke(Path(ellipseIn: rect), with: .color(.primary.opacity(opacity)),
+                                   lineWidth: fraction == 1 ? 0.9 : 0.65)
                 }
                 var cross = Path()
                 cross.move(to: CGPoint(x: center.x - radius, y: center.y)); cross.addLine(to: CGPoint(x: center.x + radius, y: center.y))
                 cross.move(to: CGPoint(x: center.x, y: center.y - radius)); cross.addLine(to: CGPoint(x: center.x, y: center.y + radius))
-                context.stroke(cross, with: .color(.white.opacity(0.14)), lineWidth: 0.6)
+                context.stroke(cross, with: .color(.primary.opacity(0.28)), lineWidth: 0.8)
+
+                for (label, degrees, hue) in targets {
+                    let angle = degrees * .pi / 180
+                    let tint = Color(hue: hue, saturation: 0.78, brightness: 0.96)
+                    var spoke = Path()
+                    spoke.move(to: center)
+                    spoke.addLine(to: CGPoint(x: center.x + cos(angle) * radius,
+                                              y: center.y - sin(angle) * radius))
+                    context.stroke(spoke, with: .color(tint.opacity(0.11)), lineWidth: 0.65)
+
+                    // The small outlined squares mark the broadcast 75% hue targets.
+                    let targetCenter = CGPoint(x: center.x + cos(angle) * radius * 0.75,
+                                               y: center.y - sin(angle) * radius * 0.75)
+                    let targetSize = max(7, side * 0.035)
+                    let targetRect = CGRect(x: targetCenter.x - targetSize / 2,
+                                            y: targetCenter.y - targetSize / 2,
+                                            width: targetSize, height: targetSize)
+                    context.stroke(Path(roundedRect: targetRect, cornerRadius: 1.5),
+                                   with: .color(tint.opacity(0.62)), lineWidth: 0.8)
+                    let labelCenter = CGPoint(x: center.x + cos(angle) * radius * 1.13,
+                                              y: center.y - sin(angle) * radius * 1.13)
+                    context.draw(Text(label).font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundColor(tint.opacity(0.88)), at: labelCenter)
+                }
+
                 guard let vectorscope else { return }
                 let counts = skinOnly ? vectorscope.skinBins : vectorscope.bins
+                guard counts.count == vectorscope.size * vectorscope.size,
+                      (skinOnly ? vectorscope.skinSampleCount : vectorscope.sampleCount) > 0 else {
+                    context.draw(Text("No chroma samples")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.secondary), at: center)
+                    return
+                }
                 let peak = Double(max(1, counts.max() ?? 1))
                 for y in 0..<vectorscope.size {
                     for x in 0..<vectorscope.size {
@@ -385,9 +633,14 @@ private struct VectorscopeView: View {
                         let ny = Double(y) / Double(vectorscope.size - 1) * 2 - 1
                         guard nx * nx + ny * ny <= 1.05 else { continue }
                         let point = CGPoint(x: center.x + nx * radius, y: center.y + ny * radius)
-                        let rect = CGRect(x: point.x, y: point.y, width: 1.5, height: 1.5)
-                        let strength = min(0.95, 0.25 + log1p(Double(count)) / log1p(peak) * 0.7)
-                        context.fill(Path(ellipseIn: rect), with: .color(skinOnly ? .orange.opacity(strength) : .cyan.opacity(strength)))
+                        let dot = max(1.8, side / CGFloat(vectorscope.size) * 1.15)
+                        let rect = CGRect(x: point.x - dot / 2, y: point.y - dot / 2, width: dot, height: dot)
+                        let strength = min(0.94, 0.32 + log1p(Double(count)) / log1p(peak) * 0.62)
+                        let angle = atan2(-ny, nx) * 180 / .pi
+                        let tint = skinOnly
+                            ? Color(hue: 0.105, saturation: 0.82, brightness: 1)
+                            : Color(hue: vectorscopeHue(for: angle), saturation: 0.9, brightness: 1)
+                        context.fill(Path(ellipseIn: rect), with: .color(tint.opacity(strength)))
                     }
                 }
                 if skinOnly {
@@ -395,7 +648,8 @@ private struct VectorscopeView: View {
                     var reference = Path()
                     reference.move(to: center)
                     reference.addLine(to: CGPoint(x: center.x + cos(angle) * radius, y: center.y - sin(angle) * radius))
-                    context.stroke(reference, with: .color(.yellow.opacity(0.9)), style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                    context.stroke(reference, with: .color(StudioStyle.warning.opacity(0.95)),
+                                   style: StrokeStyle(lineWidth: 1.2, dash: [4, 3]))
                 }
             }
             if skinOnly, let skinAnalysis {
@@ -411,8 +665,31 @@ private struct VectorscopeView: View {
                     .font(.system(size: 9)).foregroundStyle(.tertiary).padding(.horizontal, 8)
             }
         }
-        .padding(6).background(Color(white: 0.075), in: RoundedRectangle(cornerRadius: 6))
+        .padding(StudioStyle.Space.compact)
+        .background(StudioStyle.panel, in: RoundedRectangle(cornerRadius: StudioStyle.Radius.panel))
+        .overlay {
+            RoundedRectangle(cornerRadius: StudioStyle.Radius.panel)
+                .strokeBorder(StudioStyle.outline, lineWidth: 0.8)
+        }
         .accessibilityElement().accessibilityLabel(skinOnly ? "Skin tone vectorscope" : "Vectorscope")
         .accessibilityValue(skinOnly ? skinAnalysis?.status ?? "No developed photograph" : "Chroma distribution of the developed photograph")
     }
+}
+
+/// Maps Rec.709 Cb/Cr hue angles to the familiar R/Y/G/C/B/M signal colors.
+private func vectorscopeHue(for angle: Double) -> Double {
+    let anchors: [(angle: Double, hue: Double)] = [
+        (49, 5.0 / 6), (103, 0), (175, 1.0 / 6),
+        (230, 2.0 / 6), (283, 3.0 / 6), (355, 4.0 / 6), (409, 5.0 / 6)
+    ]
+    var value = angle.truncatingRemainder(dividingBy: 360)
+    if value < 49 { value += 360 }
+    for pair in zip(anchors, anchors.dropFirst()) where value <= pair.1.angle {
+        let (start, end) = pair
+        var endHue = end.hue
+        if endHue < start.hue { endHue += 1 }
+        let fraction = (value - start.angle) / (end.angle - start.angle)
+        return (start.hue + (endHue - start.hue) * fraction).truncatingRemainder(dividingBy: 1)
+    }
+    return 0
 }

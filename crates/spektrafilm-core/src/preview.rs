@@ -1,9 +1,9 @@
 //! Shared preview calibration and resolution policy for desktop clients.
 use crate::params::RuntimeParams;
 use rayon::prelude::*;
-use spektrafilm_math::image::ImageBuf;
 use spektrafilm_io::encoding::Encoding;
 use spektrafilm_math::colorspace::{self, RgbColourspace, SRGB};
+use spektrafilm_math::image::ImageBuf;
 use spektrafilm_math::precision::{from_f32, to_f32};
 
 /// Largest exact CPU diffusion FFT buffer required by this edit. The camera
@@ -20,9 +20,20 @@ pub fn cpu_diffusion_fft_buffer_bytes(params: &RuntimeParams, width: u32, height
     .flatten()
     .filter(|filter| filter.active)
     .filter_map(|filter| {
-        spektrafilm_model::diffusion::diffusion_psf_spec(&filter.to_model(), pitch as f64, width, height)
+        spektrafilm_model::diffusion::diffusion_psf_spec(
+            &filter.to_model(),
+            pitch as f64,
+            width,
+            height,
+        )
     })
-    .map(|spec| spektrafilm_math::fft_conv::reflect_fft_buffer_bytes(height as usize, width as usize, spec.radius))
+    .map(|spec| {
+        spektrafilm_math::fft_conv::reflect_fft_buffer_bytes(
+            height as usize,
+            width as usize,
+            spec.radius,
+        )
+    })
     .max()
     .unwrap_or(0)
 }
@@ -38,7 +49,10 @@ mod diffusion_memory_tests {
         params.camera.diffusion_filter.active = true;
         params.camera.diffusion_filter.spatial_scale = 3.0;
         params.camera.diffusion_filter.bloom_size = 3.0;
-        assert_eq!(cpu_diffusion_fft_buffer_bytes(&params, 6240, 4160), 2_916_000_000);
+        assert_eq!(
+            cpu_diffusion_fft_buffer_bytes(&params, 6240, 4160),
+            2_916_000_000
+        );
         assert!(cpu_diffusion_fft_buffer_bytes(&params, 1512, 1008) < 512 * 1024 * 1024);
         params.camera.diffusion_filter.strength = 0.0;
         assert_eq!(cpu_diffusion_fft_buffer_bytes(&params, 6240, 4160), 0);
@@ -67,10 +81,14 @@ pub fn preview_pipeline_cache_key(
         "film": film_name,
         "print": print_name,
         "film_dev": params.film_render.development_time,
+        "silver_retention": params.film_render.silver_retention,
         "print_dev": params.print_render.development_time,
         "scan_film": params.io.scan_film,
         "input_color_space": params.io.input_color_space,
         "input_cctf_decoding": params.io.input_cctf_decoding,
+        "referent_logc3_enabled": params.io.referent_logc3_enabled,
+        "referent_logc3_path": params.io.referent_logc3_path,
+        "input_scene_referred": params.io.input_scene_referred,
         "input_gamut": params.io.input_gamut_compress,
         "camera_color_filter": params.camera.color_filter,
         "output_color_space": params.io.output_color_space,
@@ -140,7 +158,8 @@ pub fn interactive_dimensions(photo: (u32, u32), scale: f32, source: (u32, u32))
     if frame.0 <= source.0 && frame.1 <= source.1 {
         return frame;
     }
-    let fit = (f64::from(source.0) / f64::from(frame.0)).min(f64::from(source.1) / f64::from(frame.1));
+    let fit =
+        (f64::from(source.0) / f64::from(frame.0)).min(f64::from(source.1) / f64::from(frame.1));
     (
         ((f64::from(frame.0) * fit).floor() as u32).clamp(1, source.0),
         ((f64::from(frame.1) * fit).floor() as u32).clamp(1, source.1),
@@ -220,7 +239,11 @@ pub enum DisplaySpace {
 
 impl DisplaySpace {
     pub fn of(encoding: Encoding) -> Self {
-        if encoding.space.name == SRGB.name { Self::Srgb } else { Self::Rec2020SrgbTransfer }
+        if encoding.space.name == SRGB.name {
+            Self::Srgb
+        } else {
+            Self::Rec2020SrgbTransfer
+        }
     }
 
     /// The name the helper's responses use.
@@ -252,7 +275,11 @@ fn tpdf_dither(x: usize, y: usize, c: usize) -> f64 {
 /// `encoding` says how `image` is encoded (a bool means sRGB, encoded or
 /// linear); the bytes are in [`DisplaySpace::of`] it. `image` itself is
 /// never modified.
-pub fn display_rgba(image: &ImageBuf, max_dim: usize, encoding: impl Into<Encoding>) -> (usize, usize, Vec<u8>) {
+pub fn display_rgba(
+    image: &ImageBuf,
+    max_dim: usize,
+    encoding: impl Into<Encoding>,
+) -> (usize, usize, Vec<u8>) {
     display_rgba_with_post(image, max_dim, encoding, None)
 }
 
@@ -298,13 +325,25 @@ pub fn display_rgba_with_post(
         if let Some(m) = &wide {
             let linear = rgb.map(|v| {
                 let v = f64::from(v);
-                if encoded { encoding.space.cctf.decode(v) } else { v }
+                if encoded {
+                    encoding.space.cctf.decode(v)
+                } else {
+                    v
+                }
             });
             for (c, v) in colorspace::mat3_vec_f64(m, linear).into_iter().enumerate() {
                 let v = v.clamp(0.0, 1.0);
-                let v = if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+                let v = if v <= 0.003_130_8 {
+                    v * 12.92
+                } else {
+                    1.055 * v.powf(1.0 / 2.4) - 0.055
+                };
                 // Black and white stay exact: borders, clipped highlights.
-                let dither = if v > 0.0 && v < 1.0 { tpdf_dither(x, y, c) } else { 0.0 };
+                let dither = if v > 0.0 && v < 1.0 {
+                    tpdf_dither(x, y, c)
+                } else {
+                    0.0
+                };
                 out[c] = (v * 255.0 + dither).round().clamp(0.0, 255.0) as u8;
             }
             out[3] = 255;
@@ -413,7 +452,13 @@ pub fn original_encoding(
 ) -> (Encoding, Option<ImageBuf>) {
     if !colour.linear_srgb {
         let space = RgbColourspace::input(&params.io.input_color_space);
-        return (Encoding { space, encoded: params.io.input_cctf_decoding }, None);
+        return (
+            Encoding {
+                space,
+                encoded: params.io.input_cctf_decoding,
+            },
+            None,
+        );
     }
     let encoding = Encoding::new(&params.io.output_color_space, false);
     let converted = (encoding.space.name != "sRGB").then(|| {
@@ -474,14 +519,31 @@ mod tests {
     #[test]
     fn interactive_frames_fit_inside_the_source() {
         // Zoomed past fit on a 3x enlargement: the old frame was 1.5x the source.
-        assert_eq!(interactive_dimensions((18_000, 12_000), 0.5, (6000, 4000)), (6000, 4000));
-        assert_eq!(interactive_dimensions((18_000, 12_000), 0.25, (6000, 4000)), (4500, 3000));
+        assert_eq!(
+            interactive_dimensions((18_000, 12_000), 0.5, (6000, 4000)),
+            (6000, 4000)
+        );
+        assert_eq!(
+            interactive_dimensions((18_000, 12_000), 0.25, (6000, 4000)),
+            (4500, 3000)
+        );
         // An odd aspect from rounding the working frame still fits both sides.
         let (w, h) = interactive_dimensions((12_001, 7999), 0.9, (6000, 4000));
         assert!(w <= 6000 && h <= 4000 && w >= 5990, "{w}x{h}");
         let source = ImageBuf::from_data(60, 40, vec![from_f32(0.5); 60 * 40 * 3]);
         let frame = interactive_dimensions((180, 120), 0.75, (60, 40));
         assert_eq!(downsample_area(&source, frame).width, 60);
+    }
+
+    #[test]
+    fn interactive_preview_at_editor_quality_keeps_expected_detail() {
+        // The Intel editor's 38% RAW preview on this representative 3:2 frame
+        // is 1.73 MP. Keep its dimensions and source bound stable alongside
+        // the editor-side scale test.
+        assert_eq!(
+            interactive_dimensions((2829, 4241), 0.38, (5464, 8192)),
+            (1075, 1612)
+        );
     }
 
     /// Per-pixel bilinear sampling, as the display proxy did before it read
@@ -528,7 +590,10 @@ mod tests {
     #[test]
     fn display_clips_each_pixel_before_interpolating() {
         let values = [-0.2f32, 0.3, 4.0, 0.9, 1.7, 0.0, 0.5, 2.5];
-        let unclipped: Vec<_> = (0..10 * 9).flat_map(|i| [values[i % values.len()]; 3]).map(from_f32).collect();
+        let unclipped: Vec<_> = (0..10 * 9)
+            .flat_map(|i| [values[i % values.len()]; 3])
+            .map(from_f32)
+            .collect();
         let unclipped = ImageBuf::from_data(10, 9, unclipped);
         for encoded in [true, false] {
             let mut clipped = unclipped.clone();
@@ -551,30 +616,76 @@ mod tests {
     fn wide_proxies_hold_the_renders_colours() {
         use spektrafilm_io::encoding::Encoding;
         let rec2020 = RgbColourspace::find("ITU-R BT.2020").unwrap();
-        let encode = |v: f64| if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
-        for (space, encoded) in [("Display P3", true), ("Adobe RGB (1998)", false), ("ProPhoto RGB", true)] {
-            let encoding = Encoding::new(space, encoded);
-            assert_eq!(DisplaySpace::of(encoding), DisplaySpace::Rec2020SrgbTransfer);
-            let colour = [0.2f32, 0.55, 0.35];
-            let image = ImageBuf::from_data(64, 64, colour.repeat(64 * 64).into_iter().map(from_f32).collect());
-            let (_, _, rgba) = display_rgba(&image, 64, encoding);
-            assert_eq!(display_rgba(&image, 64, encoding).2, rgba, "{space}: deterministic");
-            let linear = colour.map(|v| if encoded { encoding.space.cctf.decode(f64::from(v)) } else { f64::from(v) });
-            let want = colorspace::mat3_vec_f64(&colorspace::icc_rgb_to_rgb(encoding.space, rec2020), linear);
-            for c in 0..3 {
-                let mean = rgba.chunks_exact(4).map(|p| f64::from(p[c])).sum::<f64>() / (64.0 * 64.0);
-                let want = encode(want[c]) * 255.0;
-                assert!((mean - want).abs() < 0.1, "{space} channel {c}: {mean} vs {want}");
+        let encode = |v: f64| {
+            if v <= 0.003_130_8 {
+                v * 12.92
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
             }
-            let extremes = ImageBuf::from_data(2, 1, [1.0f32, 1.0, 1.0, 0.0, 0.0, 0.0].map(from_f32).to_vec());
-            assert_eq!(display_rgba(&extremes, 2, encoding).2, [255, 255, 255, 255, 0, 0, 0, 255], "{space}");
+        };
+        for (space, encoded) in [
+            ("Display P3", true),
+            ("Adobe RGB (1998)", false),
+            ("ProPhoto RGB", true),
+        ] {
+            let encoding = Encoding::new(space, encoded);
+            assert_eq!(
+                DisplaySpace::of(encoding),
+                DisplaySpace::Rec2020SrgbTransfer
+            );
+            let colour = [0.2f32, 0.55, 0.35];
+            let image = ImageBuf::from_data(
+                64,
+                64,
+                colour.repeat(64 * 64).into_iter().map(from_f32).collect(),
+            );
+            let (_, _, rgba) = display_rgba(&image, 64, encoding);
+            assert_eq!(
+                display_rgba(&image, 64, encoding).2,
+                rgba,
+                "{space}: deterministic"
+            );
+            let linear = colour.map(|v| {
+                if encoded {
+                    encoding.space.cctf.decode(f64::from(v))
+                } else {
+                    f64::from(v)
+                }
+            });
+            let want = colorspace::mat3_vec_f64(
+                &colorspace::icc_rgb_to_rgb(encoding.space, rec2020),
+                linear,
+            );
+            for c in 0..3 {
+                let mean =
+                    rgba.chunks_exact(4).map(|p| f64::from(p[c])).sum::<f64>() / (64.0 * 64.0);
+                let want = encode(want[c]) * 255.0;
+                assert!(
+                    (mean - want).abs() < 0.1,
+                    "{space} channel {c}: {mean} vs {want}"
+                );
+            }
+            let extremes = ImageBuf::from_data(
+                2,
+                1,
+                [1.0f32, 1.0, 1.0, 0.0, 0.0, 0.0].map(from_f32).to_vec(),
+            );
+            assert_eq!(
+                display_rgba(&extremes, 2, encoding).2,
+                [255, 255, 255, 255, 0, 0, 0, 255],
+                "{space}"
+            );
         }
         // Display P3 green in the proxy is more saturated than sRGB allows.
         let green = ImageBuf::from_data(1, 1, [0.0f32, 1.0, 0.0].map(from_f32).to_vec());
         let (_, _, p3) = display_rgba(&green, 1, Encoding::new("Display P3", true));
         let (_, _, srgb) = display_rgba(&green, 1, Encoding::new("sRGB", true));
-        let srgb_green_in_2020 = colorspace::mat3_vec_f64(&colorspace::icc_rgb_to_rgb(&SRGB, rec2020), [0.0, 1.0, 0.0]);
-        assert!(f64::from(p3[0]) < encode(srgb_green_in_2020[0]) * 255.0 - 20.0, "{p3:?}");
+        let srgb_green_in_2020 =
+            colorspace::mat3_vec_f64(&colorspace::icc_rgb_to_rgb(&SRGB, rec2020), [0.0, 1.0, 0.0]);
+        assert!(
+            f64::from(p3[0]) < encode(srgb_green_in_2020[0]) * 255.0 - 20.0,
+            "{p3:?}"
+        );
         assert_eq!(srgb, [0, 255, 0, 255], "sRGB proxies are unchanged");
     }
 

@@ -20,7 +20,7 @@ import SwiftUI
 /// inspector column. The window, toolbar, and columns are AppKit; the canvas
 /// and inspector contents are SwiftUI. They follow the model through
 /// Observation, like the views.
-@MainActor final class EditorWindowController: NSWindowController, NSToolbarDelegate {
+@MainActor final class EditorWindowController: NSWindowController, NSToolbarDelegate, NSMenuDelegate, NSMenuItemValidation, NSPopoverDelegate {
     private let model: EditorModel
     private let inspector: NSSplitViewItem
     private let panel: NSHostingController<InspectorPanel>
@@ -30,16 +30,31 @@ import SwiftUI
     private var collapsing: NSKeyValueObservation?
     private var appearing: NSObjectProtocol?
     private var resigning: NSObjectProtocol?
+    private var becomingKey: NSObjectProtocol?
     private var keyMonitor: Any?
     /// The narrowest canvas, and the narrowest the content can be with the
     /// inspector shown beside it. The split view can't keep both columns at
     /// their minimums in a narrower window, so the window enforces the sum.
     private let canvasMinimum: CGFloat
+    private let presetCanvasMinimum: CGFloat
     private let columnsMinimum: CGFloat
     private static let minimumHeight: CGFloat = 560
     /// The key held to show the original, so its release is found even if
     /// a modifier (⌥⇧ on some layouts) was let go first.
     private var originalKey: UInt16?
+    /// The mode the toolbar's items are laid out for.
+    private var toolbarMode = LibraryMode.photo
+    private var toolbarIsLibrary: Bool?
+    /// The batch export popover, and what the Export item shows now.
+    private var batchPopover: NSPopover?
+    private var exportIcon = ""
+    private lazy var sizeSlider: NSSlider = {
+        let slider = NSSlider(value: GridMetrics.defaultSize, minValue: GridMetrics.sizes.lowerBound, maxValue: GridMetrics.sizes.upperBound,
+                              target: self, action: #selector(resizeGrid(_:)))
+        slider.controlSize = .small
+        slider.widthAnchor.constraint(equalToConstant: 160).isActive = true
+        return slider
+    }()
 
     init(model: EditorModel) {
         self.model = model
@@ -57,12 +72,13 @@ import SwiftUI
         inspector = NSSplitViewItem(inspectorWithViewController: panel)
         inspector.minimumThickness = 300
         inspector.maximumThickness = 440
-        inspector.isCollapsed = !model.inspectorVisible
+        inspector.isCollapsed = !model.inspectorVisible || (model.inspectorPane == .presets && !model.cropping)
         let split = NSSplitViewController()
         split.addSplitViewItem(canvasItem)
         split.addSplitViewItem(inspector)
         split.splitView.autosaveName = "editor"
         canvasMinimum = canvasItem.minimumThickness
+        presetCanvasMinimum = canvasItem.minimumThickness + StudioStyle.Layout.editorPresetSidebarWidth
         columnsMinimum = canvasItem.minimumThickness + inspector.minimumThickness + split.splitView.dividerThickness
 
         let window = EditorWindow(contentRect: NSRect(x: 0, y: 0, width: 1320, height: 860),
@@ -74,7 +90,10 @@ import SwiftUI
         if !window.setFrameUsingName("editor") { window.center() }
         // A saved frame from before the minimum, or from a smaller screen,
         // grows to it.
-        Self.fitMinimum(of: window, width: model.workspace == .library ? 980 : inspector.isCollapsed ? canvasMinimum : columnsMinimum)
+        let initialMinimum = model.workspace == .library ? 980
+            : model.inspectorPane == .presets && model.inspectorVisible && !model.cropping ? presetCanvasMinimum
+            : inspector.isCollapsed ? canvasMinimum : columnsMinimum
+        Self.fitMinimum(of: window, width: initialMinimum)
         split.view.frame = NSRect(origin: .zero, size: window.contentRect(forFrameRect: window.frame).size)
         window.contentViewController = split
         window.setFrameAutosaveName("editor")
@@ -83,8 +102,9 @@ import SwiftUI
 
         let toolbar = NSToolbar(identifier: "editor")
         toolbar.delegate = self
-        toolbar.displayMode = .iconOnly
-        toolbar.centeredItemIdentifiers = [.zoom, .edit]
+        toolbar.displayMode = .iconAndLabel
+        toolbar.sizeMode = .small
+        toolbar.centeredItemIdentifiers = model.mode == .grid ? [.gridSize] : [.zoom, .edit]
         window.toolbar = toolbar
         model.undoManager = window.undoManager
         // Dragging the inspector closed hides the adjustments, like the toolbar button.
@@ -93,9 +113,17 @@ import SwiftUI
                 guard let self, self.model.workspace == .editor else { return }
                 // A hidden inspector lets the window narrow to the canvas alone.
                 if let window = self.window {
-                    Self.fitMinimum(of: window, width: item.isCollapsed ? self.canvasMinimum : self.columnsMinimum)
+                    let width = item.isCollapsed
+                        ? (self.model.inspectorPane == .presets && self.model.inspectorVisible && !self.model.cropping
+                            ? self.presetCanvasMinimum : self.canvasMinimum)
+                        : self.columnsMinimum
+                    Self.fitMinimum(of: window, width: width)
                 }
-                guard self.model.inspectorVisible == item.isCollapsed else { return }
+                // The grid collapses it without hiding the adjustments.
+                // The presets page uses a separate leading browser; collapsing
+                // the trailing column is part of that layout, not a hide action.
+                if self.model.inspectorPane == .presets && !self.model.cropping { return }
+                guard self.model.mode == .photo, self.model.inspectorVisible == item.isCollapsed else { return }
                 self.model.inspectorVisible = !item.isCollapsed
             }
         }
@@ -103,13 +131,18 @@ import SwiftUI
             MainActor.assumeIsolated { self?.windowChangedOcclusion() }
         }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
-            MainActor.assumeIsolated { self?.holdOriginal(event) ?? false } ? nil : event
+            MainActor.assumeIsolated { self?.holdOriginal(event) == true || self?.escapeToGrid(event) == true } ? nil : event
         }
         resigning = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.originalKey != nil else { return }
                 self.originalKey = nil; self.model.holdOriginal(false)
             }
+        }
+        // File events on network shares get lost, so the folder is listed
+        // again whenever the window comes back.
+        becomingKey = NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.model.library.refreshNow() }
         }
         observe()
     }
@@ -140,10 +173,21 @@ import SwiftUI
             originalKey = nil; model.holdOriginal(false)
             return true
         }
-        guard event.window === window, event.characters == "\\",
+        guard event.window === window, model.mode == .photo, event.characters == "\\",
               event.modifierFlags.isDisjoint(with: [.command, .control]),
               !(window?.firstResponder is NSText) else { return false }
         if !event.isARepeat { originalKey = event.keyCode; model.holdOriginal(true) }
+        return true
+    }
+
+    /// Esc shows the grid, as in Lightroom, unless text is being typed or a
+    /// crop drawn (whose Cancel takes it). The canvas's hosting view claims
+    /// Escape before the menu would see it, so it's caught here.
+    private func escapeToGrid(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown, event.keyCode == 53, event.window === window,
+              event.modifierFlags.isDisjoint(with: [.command, .control, .option, .shift]),
+              model.mode == .photo, model.source != nil, !model.cropping, MainMenu.takesRatingKeys(window) else { return false }
+        model.showGrid()
         return true
     }
 
@@ -164,22 +208,46 @@ import SwiftUI
 
     private func update() {
         guard let window else { return }
-        let editing = model.workspace == .editor
-        let photo = editing && model.source != nil
-        window.title = editing ? model.source?.lastPathComponent ?? "Negs" : "Negs"
-        window.subtitle = !editing ? "Library" : !photo || !model.ready ? "" : model.value("io.scan_film").bool ? model.filmName : "\(model.filmName) → \(model.paperName)"
-        if let item = items[.library] {
-            let icon = symbol("square.grid.2x2", "Library")
-            item.image = editing ? icon : icon.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [.controlAccentColor]))
-            item.isEnabled = editing && !model.cropping
+        let inLibrary = model.workspace == .library
+        let editing = !inLibrary
+        let photo = editing && model.source != nil && model.mode == .photo
+        let grid = editing && model.mode == .grid
+        if inLibrary {
+            window.title = "Negs"
+            window.subtitle = "Library"
+        } else if grid, let folder = model.library.directory ?? model.source?.deletingLastPathComponent() {
+            window.title = folder.lastPathComponent
+            let shown = model.shownPhotos.count, selected = model.ratingTargets.count
+            window.subtitle = selected > 1 ? "\(selected) of \(shown) selected" : shown == 1 ? "1 photograph" : "\(shown) photographs"
+        } else {
+            window.title = model.sourceItem.map { model.library.name(of: $0) } ?? "Negs"
+            window.subtitle = !photo || !model.ready ? "" : model.value("io.scan_film").bool ? model.filmName : "\(model.filmName) → \(model.paperName)"
         }
+        if let item = items[.library] { item.isEnabled = !model.cropping }
+        if let item = items[.backToEdit] {
+            item.isEnabled = model.photoLibrary.selectedPhotoURL != nil || model.source != nil
+        }
+        showItems(for: inLibrary ? .photo : model.mode)
         showCropActions(model.cropping)
+        if let item = items[.mode] as? NSToolbarItemGroup {
+            item.selectedIndex = grid ? 1 : 0
+            item.isEnabled = photo && !model.cropping
+            item.subitems.forEach { $0.isEnabled = photo && !model.cropping }
+        }
+        if sizeSlider.doubleValue != model.gridCellSize { sizeSlider.doubleValue = model.gridCellSize }
         if let item = items[.filmstrip] {
             item.toolTip = model.filmstripVisible ? "Hide film strip (⌥⌘F)" : "Show film strip (⌥⌘F)"
             let icon = symbol("rectangle.bottomthird.inset.filled", "Film Strip")
             item.image = model.filmstripVisible
                 ? icon.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [.controlAccentColor])) : icon
             item.isEnabled = photo
+        }
+        if let item = items[.filter] {
+            // Filled while a filter is on, so a half-empty strip is never a mystery.
+            let on = model.photoLibrary.filter != .all || !model.photoLibrary.cullFilters.isEmpty
+            item.image = symbol(on ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle", "Filter")
+            item.toolTip = on ? "Filter: \(model.photoLibrary.filter.title) and AI culling" : "Filter the Library and Edit photo set"
+            item.isEnabled = photo || grid
         }
         setEnabled(.zoom, photo && !model.cropping)
         if let edit = items[.edit] as? NSToolbarItemGroup {
@@ -193,7 +261,8 @@ import SwiftUI
                 ? symbol("crop", "Crop").withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [.controlAccentColor]))
                 : symbol("crop", "Crop")
         }
-        setEnabled(.export, photo && model.ready && !model.exporting && !model.saving)
+        setEnabled(.export, model.batch != nil || model.canExport)
+        updateExportItem()
         // The accent color marks the panel the inspector column shows.
         for (id, pane, name, label) in [(NSToolbarItem.Identifier.adjustments, InspectorPane.adjustments, "slider.horizontal.3", "Adjustments"),
                                         (.presets, .presets, "square.stack", "Presets")] {
@@ -207,13 +276,14 @@ import SwiftUI
             cancelButton.keyEquivalent = session.typing ? "" : "\u{1b}"
             doneButton.keyEquivalent = session.typing ? "" : "\r"
         }
-        if !editing {
-            if !inspector.isCollapsed { inspector.animator().isCollapsed = true }
-        } else if inspector.isCollapsed == model.inspectorVisible {
+        let presetBrowserShown = photo && !model.cropping && model.inspectorVisible && model.inspectorPane == .presets
+        let inspectorShown = photo && model.inspectorVisible && !presetBrowserShown
+        let workspaceMinimum = inspectorShown ? columnsMinimum : presetBrowserShown ? presetCanvasMinimum : canvasMinimum
+        Self.fitMinimum(of: window, width: workspaceMinimum)
+        if inspector.isCollapsed != !inspectorShown {
             // Make room before the inspector slides in, so neither column is
             // squeezed below its minimum.
-            if model.inspectorVisible { Self.fitMinimum(of: window, width: columnsMinimum) }
-            inspector.animator().isCollapsed = !model.inspectorVisible
+            inspector.animator().isCollapsed = !inspectorShown
         }
     }
 
@@ -243,6 +313,28 @@ import SwiftUI
         (item as? NSToolbarItemGroup)?.subitems.forEach { $0.isEnabled = enabled }
     }
 
+    /// The Library gets a short, labeled toolbar. Editor tools appear only
+    /// when editing, so disabled photo controls do not crowd Library.
+    private func showItems(for mode: LibraryMode) {
+        let inLibrary = model.workspace == .library
+        guard (mode != toolbarMode || toolbarIsLibrary != inLibrary), let toolbar = window?.toolbar else { return }
+        toolbarMode = mode
+        toolbarIsLibrary = inLibrary
+        toolbar.displayMode = .iconAndLabel
+        toolbar.centeredItemIdentifiers = inLibrary ? [] : mode == .grid ? [.gridSize] : [.zoom, .edit]
+        let ids = inLibrary ? [.backToEdit, .open] : Self.itemIdentifiers(for: mode)
+        while !toolbar.items.isEmpty { toolbar.removeItem(at: 0) }
+        for (index, id) in ids.enumerated() { toolbar.insertItem(withItemIdentifier: id, at: index) }
+    }
+
+    static func itemIdentifiers(for mode: LibraryMode) -> [NSToolbarItem.Identifier] {
+        switch mode {
+        case .photo: [.library, .open, .mode, .filter, .filmstrip, .flexibleSpace, .zoom, .edit, .flexibleSpace, .inspectorTrackingSeparator,
+                      .flexibleSpace, .export, .presets, .adjustments]
+        case .grid: [.library, .open, .mode, .filter, .flexibleSpace, .gridSize, .flexibleSpace, .export]
+        }
+    }
+
     /// While cropping, Cancel and Done take the place of Export.
     private func showCropActions(_ cropping: Bool) {
         guard let toolbar = window?.toolbar else { return }
@@ -260,25 +352,49 @@ import SwiftUI
 
     // MARK: Toolbar
 
-    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.library, .open, .filmstrip, .flexibleSpace, .zoom, .edit, .flexibleSpace, .inspectorTrackingSeparator, .flexibleSpace, .export, .presets, .adjustments]
-    }
-
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { Self.itemIdentifiers(for: .photo) }
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        toolbarDefaultItemIdentifiers(toolbar) + [.cancelCrop, .doneCrop]
+        toolbarDefaultItemIdentifiers(toolbar) + [.backToEdit, .gridSize, .cancelCrop, .doneCrop]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
         let item: NSToolbarItem
         switch id {
+        case .backToEdit:
+            item = button(id, "Back to Edit", "slider.horizontal.3", "Edit the selected photo or return to the previous edit", #selector(showEditor))
+            item.isNavigational = true
         case .library:
             item = button(id, "Library", "square.grid.2x2", "Browse the photo Library", #selector(showLibrary))
             item.isNavigational = true
         case .open:
             item = button(id, "Open", "folder", "Open photograph (⌘O)", #selector(openPhotograph))
             item.isNavigational = true
+        case .mode:
+            // A segmented switch shows which mode the window is in.
+            let group = NSToolbarItemGroup(itemIdentifier: id, images: [symbol("photo", "Photo"), symbol("square.grid.2x2", "Grid")],
+                                           selectionMode: .selectOne, labels: ["Photo", "Grid"], target: self, action: #selector(switchMode(_:)))
+            group.label = "View"
+            group.subitems[0].toolTip = "Edit the photograph (E)"
+            group.subitems[1].toolTip = "Show all photographs in the folder (G)"
+            group.selectedIndex = model.mode == .grid ? 1 : 0
+            group.controlRepresentation = .expanded
+            item = group
+        case .gridSize:
+            item = NSToolbarItem(itemIdentifier: id)
+            sizeSlider.doubleValue = model.gridCellSize
+            item.view = sizeSlider; item.label = "Size"; item.toolTip = "Thumbnail size (⌘+, ⌘−)"
         case .filmstrip:
             item = button(id, "Film Strip", "rectangle.bottomthird.inset.filled", "Show or hide film strip (⌥⌘F)", #selector(toggleFilmstrip))
+        case .filter:
+            let menuItem = NSMenuToolbarItem(itemIdentifier: id)
+            menuItem.label = "Filter"
+            menuItem.image = symbol("line.3.horizontal.decrease.circle", "Filter")
+            menuItem.showsIndicator = false
+            // Filled in when it opens, from the filter as it is then.
+            let menu = NSMenu(title: "Filter")
+            menu.delegate = self
+            menuItem.menu = menu
+            item = menuItem
         case .zoom:
             let group = NSToolbarItemGroup(itemIdentifier: id)
             group.subitems = [button(.init("fit"), "Fit", "arrow.down.right.and.arrow.up.left", "Fit photograph (⌘0)", #selector(fit)),
@@ -336,24 +452,149 @@ import SwiftUI
         NSImage(systemSymbolName: name, accessibilityDescription: description) ?? NSImage()
     }
 
+    // MARK: Filter
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        func add(_ title: String, _ action: Selector, on: Bool, tag: Int = 0) {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
+            item.target = self; item.tag = tag; item.state = on ? .on : .off
+        }
+        // A pull-down toolbar menu takes its first item as the button's title
+        // and doesn't list it.
+        menu.addItem(withTitle: "Filter", action: nil, keyEquivalent: "")
+        menu.addItem(.sectionHeader(title: "Library"))
+        for (index, filter) in LibraryFilter.allCases.enumerated() {
+            add(filter.title, #selector(photoLibraryFilter(_:)), on: model.photoLibrary.filter == filter, tag: index)
+        }
+        menu.addItem(.separator())
+        menu.addItem(.sectionHeader(title: "AI Culling · All Must Match"))
+        for (index, filter) in CullFilterChip.allCases.enumerated() {
+            let title = filter == .topPicks
+                ? "Top \(model.photoLibrary.topPickValue)\(model.photoLibrary.topPickUnit == .percent ? "%" : "") / Scene"
+                : filter.title
+            add(title, #selector(toggleCullFilter(_:)), on: model.photoLibrary.cullFilters.contains(filter), tag: index)
+        }
+        menu.addItem(.separator())
+        let active = model.photoLibrary.filter != .all || model.photoLibrary.selectedSmartCollectionID != nil
+            || !model.photoLibrary.cullFilters.isEmpty
+        let clear = menu.addItem(withTitle: "Clear Filters", action: active ? #selector(clearFilters) : nil, keyEquivalent: "l")
+        clear.keyEquivalentModifierMask = [.command, .option]; clear.target = self
+    }
+
+    @objc private func photoLibraryFilter(_ item: NSMenuItem) {
+        guard LibraryFilter.allCases.indices.contains(item.tag) else { return }
+        model.chooseLibraryFilter(LibraryFilter.allCases[item.tag])
+    }
+    @objc private func toggleCullFilter(_ item: NSMenuItem) {
+        guard CullFilterChip.allCases.indices.contains(item.tag) else { return }
+        model.toggleCullFilter(CullFilterChip.allCases[item.tag])
+    }
+    @objc private func clearFilters() { model.clearLibraryFilters() }
+
     // MARK: Actions
 
     @objc private func showLibrary() { model.workspace = .library }
+    @objc private func showEditor() {
+        if let url = model.photoLibrary.selectedPhotoURL { model.open(url) }
+        else if model.source != nil { model.workspace = .editor }
+    }
     @objc private func openPhotograph() { model.openPanel() }
+    @objc private func switchMode(_ sender: NSToolbarItemGroup) { sender.selectedIndex == 1 ? model.showGrid() : model.editCurrent() }
+    @objc private func resizeGrid(_ sender: NSSlider) { model.gridCellSize = sender.doubleValue.rounded() }
     @objc private func fit() { model.zoom(fit: true) }
     @objc private func actualSize() { model.zoom(fit: false) }
     @objc private func rotateClockwise() { model.rotate() }
     @objc private func toggleCrop() { model.cropping ? model.endCrop(apply: true) : model.beginCrop() }
     @objc private func cancelCrop() { model.endCrop(apply: false) }
     @objc private func applyCrop() { model.endCrop(apply: true) }
-    @objc private func export() { model.savePanel(export: true) }
+    @objc private func export() {
+        if let run = model.batch { return toggleBatchPopover(run) }
+        model.exportPanel()
+    }
+
+    /// A batch replaces the icon with its ring; one that ended with failures
+    /// shows a warning until its popover has been seen.
+    private func updateExportItem() {
+        guard let item = items[.export] else { return }
+        let icon: String, help: String
+        if let run = model.batch, run.running {
+            icon = "ring \(run.finished)/\(run.total)"
+            help = "\(run.title). Click for details."
+        } else if let run = model.batch, !run.failures.isEmpty {
+            icon = "failed"
+            help = "\(run.title), \(run.failures.count) failed. Click for details."
+        } else {
+            icon = "export"
+            help = model.exportTitle == "Export Photograph…" ? "Export photograph (⇧⌘E)" : "Export the selected photographs (⇧⌘E)"
+        }
+        item.toolTip = help
+        guard icon != exportIcon else { return }
+        exportIcon = icon
+        if let run = model.batch, run.running { item.image = BatchRing.image(run.fraction) }
+        else if icon == "failed" { item.image = symbol("exclamationmark.triangle", "Export finished with failures") }
+        else { item.image = symbol("square.and.arrow.down", "Export") }
+    }
+
+    private func toggleBatchPopover(_ run: BatchRun) {
+        if let batchPopover, batchPopover.isShown { return batchPopover.performClose(nil) }
+        guard let item = items[.export] else { return }
+        let content = NSHostingController(rootView: BatchProgressView(run: run, retry: { [weak self] in self?.model.retryBatch() },
+                                                                      showInFinder: { [weak self] in self?.model.showBatchInFinder() }))
+        content.sizingOptions = .preferredContentSize
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = content
+        popover.delegate = self
+        batchPopover = popover
+        model.batchPopoverShown = true
+        popover.show(relativeTo: item)
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        guard (notification.object as? NSPopover) === batchPopover else { return }
+        batchPopover = nil
+        model.batchPopoverShown = false
+        model.clearBatch()
+    }
     @objc private func toggleFilmstrip() { model.filmstripVisible.toggle() }
     @objc private func toggleAdjustments() { model.togglePane(.adjustments) }
     @objc private func togglePresets() { model.togglePane(.presets) }
+
+    // MARK: Selection
+
+    // Edit › Select All and Deselect All reach here through the responder
+    // chain only when no text field takes them first.
+    override func selectAll(_ sender: Any?) { model.selectAll() }
+    @objc func deselectAll(_ sender: Any?) { model.deselectAll() }
+
+    /// The photographs are selected where they're shown: the grid, or the strip.
+    private var selecting: Bool {
+        model.source != nil && !model.cropping && (model.mode == .grid || model.filmstripVisible)
+    }
+
+    // MARK: Edits
+
+    // Edit › Copy and Paste (⌘C, ⌘V) copy and paste the photograph's edits,
+    // like Photo › Copy Edits and Paste Edits (⇧⌘C, ⇧⌘V). They reach here,
+    // the end of the responder chain, only when no text field or view takes
+    // them first, so typed text keeps its own copy and paste.
+    @objc func copy(_ sender: Any?) { model.copyEdits() }
+    @objc func paste(_ sender: Any?) { model.pasteEdits() }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(selectAll(_:)), #selector(deselectAll(_:)): selecting
+        // Not while a sheet or another window has the keys, as for Photo › Copy Edits.
+        case #selector(copy(_:)): model.canCopyEdits && MainMenu.takesRatingKeys(NSApp.keyWindow)
+        case #selector(paste(_:)): model.canPasteEdits && MainMenu.takesRatingKeys(NSApp.keyWindow)
+        default: true
+        }
+    }
 }
 
-private extension NSToolbarItem.Identifier {
-    static let filmstrip = Self("filmstrip")
-    static let library = Self("library"), open = Self("open"), zoom = Self("zoom"), edit = Self("edit")
+extension NSToolbarItem.Identifier {
+    static let filmstrip = Self("filmstrip"), filter = Self("filter"), mode = Self("mode"), gridSize = Self("gridSize")
+    static let library = Self("library"), backToEdit = Self("backToEdit"), open = Self("open"), zoom = Self("zoom"), edit = Self("edit")
     static let export = Self("export"), adjustments = Self("adjustments"), presets = Self("presets"), cancelCrop = Self("cancelCrop"), doneCrop = Self("doneCrop")
 }

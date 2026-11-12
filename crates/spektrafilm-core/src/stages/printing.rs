@@ -4,8 +4,8 @@
 use rayon::prelude::*;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::tetra3d::tetrahedral_interp;
 use spektrafilm_math::precision::from_f64;
+use spektrafilm_math::tetra3d::tetrahedral_interp;
 
 use crate::params::RuntimeParams;
 use crate::profile::Profile;
@@ -324,7 +324,12 @@ pub fn develop(
     // Stored-curve fallback (profiles without a fitted model). Python parity
     // note for this path: print's `develop` uses `develop_simple` directly with
     // RAW (un-normalized) density curves — no nanmin subtraction.
-    backend.density_curve_interp(log_raw_print, &log_exposure, &print.density_curves_f64(), 1.0)
+    backend.density_curve_interp(
+        log_raw_print,
+        &log_exposure,
+        &print.density_curves_f64(),
+        1.0,
+    )
 }
 
 /// Full printing stage with pre-calibrated enlarger.

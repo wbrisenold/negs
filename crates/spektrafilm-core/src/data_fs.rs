@@ -21,7 +21,9 @@ mod store {
 #[cfg(target_arch = "wasm32")]
 pub fn register(path: impl Into<std::path::PathBuf>, bytes: Vec<u8>) {
     let mut files = store::FILES.write().unwrap();
-    files.get_or_insert_with(Default::default).insert(path.into(), bytes.into());
+    files
+        .get_or_insert_with(Default::default)
+        .insert(path.into(), bytes.into());
 }
 
 /// The unregistered paths read since the last call (browser only).

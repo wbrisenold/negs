@@ -21,6 +21,7 @@ fn main() -> Result<()> {
         match arg.as_str() {
             "--decoder" => decoder = args.next().context("missing decoder")?.parse()?,
             "--iterations" => iterations = args.next().context("missing iterations")?.parse()?,
+            "--scale" => options.decode_scale = args.next().context("missing RAW scale")?.parse()?,
             "--no-orient" => options.apply_orientation = false,
             "--lens-correction" => options.lens_correction.enabled = true,
             "--wb" => {
@@ -43,7 +44,7 @@ fn main() -> Result<()> {
             }
             "--help" => {
                 println!(
-                    "raw_decoder_probe [--decoder auto|apple|apple9|apple8|rawler] [--iterations N] [--no-orient] [--lens-correction] [--wb as_shot|daylight|tungsten|custom] [--temperature K] [--tint T] [--output DIR] INPUT"
+                    "raw_decoder_probe [--decoder auto|apple|apple9|apple8|rawler] [--scale 0..1] [--iterations N] [--no-orient] [--lens-correction] [--wb as_shot|daylight|tungsten|custom] [--temperature K] [--tint T] [--output DIR] INPUT"
                 );
                 return Ok(());
             }

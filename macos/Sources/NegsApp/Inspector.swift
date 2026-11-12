@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 enum Adjustment: Identifiable {
     case slider(String, String, ClosedRange<Double>, Double)
@@ -26,7 +28,27 @@ enum InspectorSection: String, CaseIterable {
 
 /// Prepare the photograph, develop the film, then finish the scan.
 enum InspectorTab: String, CaseIterable {
-    case prep = "Prep", lab = "Lab", output = "Output"
+    case prep = "Prep", adjust = "Adjust", lab = "Lab", output = "Output"
+    // Read the previous release's saved tab and migrate it to the combined
+    // adjustment workspace instead of dropping the user's editor location.
+    case tone = "Tone", color = "Color", detail = "Detail"
+
+    static var allCases: [InspectorTab] { [.prep, .adjust, .lab, .output] }
+
+    var title: String {
+        switch self {
+        case .prep: "Input"
+        case .adjust, .tone, .color, .detail: "Adjust"
+        case .lab: "Film"
+        case .output: "Output"
+        }
+    }
+
+}
+
+/// Keeps the adjustment inspector focused: show one kind of edit at a time.
+private enum AdjustmentWorkspace: String, CaseIterable {
+    case tone, color, detail
 }
 
 let prepToneControls: [Adjustment] = [
@@ -266,6 +288,11 @@ struct LabeledSlider: View {
     let editing: (Bool) -> Void
     /// The tooltip of the title and the slider.
     var help: String? = nil
+    /// Optional slider-domain mapping; the value field and stored value retain
+    /// their native units while a mapped track can place neutral at center.
+    var trackValue: Binding<Double>? = nil
+    var trackRange: ClosedRange<Double>? = nil
+    var trackNeutral: Double? = nil
 
     @State private var typing = false
     private var decimals: Int { max(0, Int(-log10(step).rounded(.down))) }
@@ -297,7 +324,8 @@ struct LabeledSlider: View {
                         .help("Click to type a value")
                 }
             }
-            ResettableSlider(title: title, value: value, range: range, neutral: defaultValue, editing: editing, reset: reset, toolTip: help)
+            ResettableSlider(title: title, value: trackValue ?? value, range: trackRange ?? range,
+                             neutral: trackNeutral ?? defaultValue, editing: editing, reset: reset, toolTip: help)
         }
         .padding(.vertical, 1)
         .resettable(modified: modified, reset: reset)
@@ -602,52 +630,114 @@ struct AdjustmentInspector: View {
     let model: EditorModel
     @AppStorage("expandedAdjustments") private var expanded = "Enlarger"
     @AppStorage("inspectorTab") private var tab = InspectorTab.prep
+    @AppStorage("adjustmentWorkspace") private var adjustmentWorkspace = AdjustmentWorkspace.tone.rawValue
+    @AppStorage("inspectorScopesVisible") private var scopesVisible = true
+    @AppStorage("scopeHeight") private var scopeHeight = ScopePanelView.defaultHeight
+    @AppStorage("inspectorLayoutRevision") private var inspectorLayoutRevision = 0
+    @State private var formSessionID = UUID()
     /// Off, the Lab shows the few controls most photographs need, plus any
     /// setting that is off its default.
     @AppStorage("labAllControls") private var allControls = false
 
     var body: some View {
-        // The histogram, film and paper, and tab switch stay put above the
-        // tab's scrolling sections, so every tab opens with the stocks in view.
+        // Scopes stay in a compact dock; each tab owns the controls for that
+        // stage of the photo workflow.
         VStack(spacing: 0) {
-            ScopePanelView(histogram: model.histogram, waveform: model.waveform,
-                           vectorscope: model.vectorscope, skinAnalysis: model.skinAnalysis)
-                .padding(.horizontal, 20)
-                .padding(.top, 10)
-            // Sized to its rows; an open stock grid scrolls inside its own frame.
-            Form { filmAndPaper }
-                .formStyle(.grouped)
-                .scrollDisabled(true)
-                .fixedSize(horizontal: false, vertical: true)
-            Picker("Tab", selection: $tab) {
-                ForEach(InspectorTab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            HStack {
+                Text("SCOPES").font(.caption2.weight(.semibold)).tracking(0.7).foregroundStyle(.secondary)
+                Spacer()
+                if scopesVisible {
+                    Button(scopeHeight > 144 ? "Compact" : "Expand") {
+                        scopeHeight = scopeHeight > 144 ? ScopePanelView.compactHeight : ScopePanelView.expandedHeight
+                    }
+                    .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
+                    .help("Resize the scope dock for control space or detailed inspection")
+                }
+                Button(scopesVisible ? "Hide" : "Show") { scopesVisible.toggle() }
+                    .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
             }
-            .pickerStyle(.segmented).labelsHidden()
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 20)
-            .padding(.bottom, 10)
+            .padding(.horizontal, StudioStyle.Space.standard)
+            .padding(.top, StudioStyle.Space.compact)
+            if scopesVisible {
+                ScopePanelView(histogram: model.histogram, waveform: model.waveform,
+                               vectorscope: model.vectorscope, skinAnalysis: model.skinAnalysis,
+                               clippingEnabled: model.clippingOverlayEnabled,
+                               setClippingEnabled: { model.clippingOverlayEnabled = $0 },
+                               falseColorEnabled: model.falseColorEnabled,
+                               setFalseColorEnabled: { model.falseColorEnabled = $0 })
+                    .padding(.horizontal, StudioStyle.Space.standard)
+            }
+            HStack(spacing: 3) {
+                ForEach(InspectorTab.allCases, id: \.self) { item in
+                    Button { tab = item } label: {
+                        Text(item.title)
+                            .font(.system(size: 10, weight: tab == item ? .semibold : .regular))
+                            .lineLimit(1).minimumScaleFactor(0.8)
+                        .frame(maxWidth: .infinity, minHeight: 28)
+                        .foregroundStyle(tab == item ? Color.primary : Color.secondary)
+                        .background(tab == item ? StudioStyle.panel : .clear,
+                                    in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Show \(item.title.lowercased()) controls")
+                    .accessibilityAddTraits(tab == item ? .isSelected : [])
+                }
+            }
+            .padding(3)
+            .background(StudioStyle.plot.opacity(0.8), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .padding(.horizontal, StudioStyle.Space.standard)
+            .padding(.bottom, StudioStyle.Space.compact)
             Divider()
             Form {
                 switch tab {
                 case .prep: prep
+                case .adjust, .tone, .color, .detail: adjust
                 case .lab: lab
                 case .output: output
                 }
             }
             .formStyle(.grouped)
+            // Each workflow tab has its own top-level position; do not keep
+            // a stale scroll offset when moving from Input to Film/Output.
+            .id("\(tab.rawValue)-\(formSessionID)")
             // Pinned below the sections, like the Reset Adjustments button in Photos.
             Button(action: model.reset) {
                 Text("Reset Adjustments").frame(maxWidth: .infinity)
             }
-            .buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.extraLarge)
+            .buttonStyle(.bordered).buttonBorderShape(.roundedRectangle).controlSize(.small)
             .help("Restore defaults on all tabs while keeping the film, paper, rotation, crop, border, and Image Size. You can undo this.")
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
+            .padding(.horizontal, StudioStyle.Space.standard)
+            .padding(.vertical, StudioStyle.Space.compact)
         }
         .disabled(!model.hasCatalog)
+        .preferredColorScheme(.dark)
+        .background(StudioStyle.window)
+        .onAppear {
+            switch tab {
+            case .tone, .color, .detail: tab = .adjust
+            default: break
+            }
+            // The previous layout persisted a large scope above all controls.
+            // Start the new workflow compact once; users can resize it any time.
+            guard inspectorLayoutRevision < 1 else { return }
+            scopeHeight = min(scopeHeight, ScopePanelView.compactHeight)
+            inspectorLayoutRevision = 1
+        }
     }
 
     @ViewBuilder private var prep: some View {
+        // Read the source's colour before balancing or changing exposure.
+        if !model.isRaw {
+            Section("Input") { inputColour }
+        } else {
+            Section("Input Transform") { referentInputTransform }
+        }
+        if !model.isRaw,
+           model.value("io.input_interpretation.mode").string == "assume",
+           model.value("io.input_interpretation.color_space").string == "ARRI LogC3 / AWG3" {
+            Section("Input Transform") { referentInputTransform }
+        }
         if model.isRaw {
             Section("White Balance") {
                 Text("White balance applies before the film process.")
@@ -656,14 +746,26 @@ struct AdjustmentInspector: View {
                 HStack(spacing: 8) {
                     Button("Auto WB", systemImage: "wand.and.stars") { model.autoWhiteBalance() }
                         .disabled(!model.isRaw || model.source == nil)
-                        .help("Estimate a custom RAW white balance from this photo’s embedded preview using a local gray-world balance.")
+                        .help("Estimate RAW white balance with spectral color references (ITCWB). Uses a reduced sensor RAW decode; frames without enough varied color report why they could not be estimated.")
                     Button("WB to Skin", systemImage: "person.crop.circle.badge.checkmark") { model.whiteBalanceToSkin() }
                         .disabled(!model.isRaw || (model.skinAnalysis?.coveragePercent ?? 0) < 5)
                         .help("Make one conservative RAW tint adjustment from the skin vectorscope estimate.")
                 }
                 if model.value("io.raw_white_balance.mode").string == "custom" {
+                    Picker("Adaptation", selection: Binding(
+                        get: {
+                            let method = model.value("io.raw_white_balance.method").string
+                            return method.isEmpty ? "cat02" : method
+                        },
+                        set: { model.set("io.raw_white_balance.method", .string($0)) },
+                    )) {
+                        Text("CAT02").tag("cat02")
+                        Text("XYZ Scaling").tag("xyz_scaling")
+                    }
+                    .pickerStyle(.menu)
+                    .help("Choose chromatic adaptation. XYZ Scaling directly scales linear CIE XYZ channels from the source white to D65.")
                     WhiteBalanceTemperatureSlider(model: model)
-                    control(.slider("Tint", "io.raw_white_balance.tint", 0.01...4, 0.01))
+                    WhiteBalanceTintSlider(model: model)
                 }
                 if let skin = model.skinAnalysis {
                     HStack {
@@ -678,55 +780,146 @@ struct AdjustmentInspector: View {
                 }
             }
         }
-        Section("Exposure") {
-            Toggle(model.isRaw ? "Match camera brightness" : "Match original brightness",
-                   isOn: Binding(get: { model.matchesBrightness }, set: model.setMatchesBrightness))
-                .help(model.isRaw
-                      ? "Develops the RAW about as bright as the camera’s own preview, and keeps it there when you change film, paper or a preset. Exposure adds to it."
-                      : "Develops the photograph about as bright as the file itself, and keeps it there when you change film, paper or a preset. Exposure adds to it.")
-            LabeledSlider(title: "Exposure (EV)", value: model.exposureOffset, range: model.exposureOffsetRange, step: 0.05,
-                          defaultValue: 0, modified: model.exposureOffsetModified, reset: model.resetExposureOffset,
-                          editing: { $0 ? model.beginInteraction() : model.endInteraction() },
-                          help: model.matchesBrightness
-                              ? "Brighter or darker than the match, in stops. It stays when the match changes with the film, paper or a preset."
-                              : "Brightens or darkens the scene before the film, in stops. Unlike Negative exposure, the print doesn’t make up for it.")
-            if let note = model.brightnessMatchNote {
-                Text(note).font(.caption).foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder private var referentInputTransform: some View {
+        Toggle("Referent LogC3 → Rec.709", isOn: model.toggle("io.referent_logc3_enabled"))
+            .help("Uses Referent's LogC3/AWG3 color mapping before the film look while preserving scene luminance. The LUT's Rec.709 tone curve is not stacked onto the film rendering.")
+        if model.value("io.referent_logc3_enabled").bool {
+            HStack {
+                Text(URL(fileURLWithPath: model.value("io.referent_logc3_path").string).lastPathComponent)
+                    .lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
+                Spacer(minLength: 6)
+                Button("Choose .cube…") { chooseReferentCube() }
             }
-            if model.isRaw {
-                control(.slider("Global Tone", "prep.global_tone", 0...100, 1))
-                    .help("Lifts the RAW's midtones while retaining a soft roll-off into highlights, before the film process.")
-            }
-            // While matched the meter only sets where the highlight limit
-            // starts, so it shows when matching is off, or when changed.
-            if !model.brightnessMatchActive || model.isModified("camera.auto_exposure") || model.isModified("camera.auto_exposure_method") {
-                Toggle("Auto exposure", isOn: model.toggle("camera.auto_exposure"))
-                    .help("Meters the photograph and exposes the film so the metered area lands on mid-grey, as a camera's meter does. Exposure adds to it.")
-                if model.value("camera.auto_exposure").bool {
-                    control(.choice("Metering", "camera.auto_exposure_method", ["average", "median", "center_weighted", "partial", "matrix", "multi_zone", "highlight_weighted"]))
-                }
-            }
+            .font(.caption)
+            Text("Color mapping only. Scene exposure and tone remain with the film pipeline.")
+                .font(.caption).foregroundStyle(.secondary)
         }
-        Section("Tone") { ForEach(prepToneControls) { control($0) } }
-        Section("Color") { ForEach(prepColorControls) { control($0) } }
-        Section("Detail") { ForEach(prepDetailControls) { control($0) } }
-        // How the file is read; set once per photograph.
-        if model.isRaw {
-            if model.lensCorrectionSupported {
+    }
+
+    @ViewBuilder private var adjust: some View {
+        Section {
+            Picker("Adjustment group", selection: $adjustmentWorkspace) {
+                Text("Tone").tag(AdjustmentWorkspace.tone.rawValue)
+                Text("Color").tag(AdjustmentWorkspace.color.rawValue)
+                Text("Detail").tag(AdjustmentWorkspace.detail.rawValue)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .accessibilityLabel("Adjustment group")
+        }
+        switch AdjustmentWorkspace(rawValue: adjustmentWorkspace) ?? .tone {
+        case .tone:
+            Section("Light") {
+                Toggle(model.isRaw ? "Match camera brightness" : "Match original brightness",
+                       isOn: Binding(get: { model.matchesBrightness }, set: model.setMatchesBrightness))
+                    .help(model.isRaw
+                          ? "Develops the RAW about as bright as the camera’s own preview, and keeps it there when you change film, paper or a preset. Exposure adds to it."
+                          : "Develops the photograph about as bright as the file itself, and keeps it there when you change film, paper or a preset. Exposure adds to it.")
+                LabeledSlider(title: "Exposure", value: model.exposureOffset, range: model.exposureOffsetRange, step: 0.05, unit: " EV",
+                              defaultValue: 0, modified: model.exposureOffsetModified, reset: model.resetExposureOffset,
+                              editing: { $0 ? model.beginInteraction() : model.endInteraction() },
+                              help: model.matchesBrightness
+                                  ? "Brighter or darker than the match, in stops. It stays when the match changes with the film, paper or a preset."
+                                  : "Brightens or darkens the scene before the film, in stops. Unlike Negative exposure, the print doesn’t make up for it.")
+                if let note = model.brightnessMatchNote {
+                    Text(note).font(.caption).foregroundStyle(.secondary)
+                }
+                if !model.brightnessMatchActive || model.isModified("camera.auto_exposure") || model.isModified("camera.auto_exposure_method") {
+                    Toggle("Auto exposure", isOn: model.toggle("camera.auto_exposure"))
+                        .help("Meters the photograph and exposes the film so the metered area lands on mid-grey, as a camera's meter does. Exposure adds to it.")
+                    if model.value("camera.auto_exposure").bool {
+                        control(.choice("Metering", "camera.auto_exposure_method", ["average", "median", "center_weighted", "partial", "matrix", "multi_zone", "highlight_weighted"]))
+                    }
+                }
+                if model.isRaw {
+                    control(.slider("Global Tone", "prep.global_tone", -100...100, 1))
+                        .help("At zero the control is neutral. Positive values lift shadows and midtones; negative values lower the overall tone, including highlights, before the film process.")
+                }
+                ForEach(prepToneControls) { control($0) }
+                Text("Expand")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 4)
+                Toggle("Enable Expand", isOn: model.toggle("post.film_expand.enabled"))
+                    .help("Remap the black and white output points before the film look.")
+                Group {
+                    LabeledSlider(title: "Black Point",
+                                  value: Binding(get: { model.value("post.film_expand.blacks").double },
+                                                 set: { model.set("post.film_expand.blacks", .number($0)) }),
+                                  range: -20...30, step: 0.1, unit: "%", defaultValue: 0,
+                                  modified: model.isModified("post.film_expand.blacks"),
+                                  reset: { model.resetValue("post.film_expand.blacks") },
+                                  editing: { $0 ? model.beginInteraction() : model.endInteraction() },
+                                  help: "Move right to raise the black point and deepen shadows. Move left to lower it and retain shadow detail.")
+                    LabeledSlider(title: "White Point",
+                                  value: Binding(get: { model.value("post.film_expand.whites").double },
+                                                 set: { model.set("post.film_expand.whites", .number($0)) }),
+                                  range: 30...120, step: 0.1, unit: "%", defaultValue: 100,
+                                  modified: model.isModified("post.film_expand.whites"),
+                                  reset: { model.resetValue("post.film_expand.whites") },
+                                  editing: { $0 ? model.beginInteraction() : model.endInteraction() },
+                                  help: "Move right to raise the white point and hold back highlights. Move left to lower it and brighten highlights.")
+                    Picker("Color Mode", selection: Binding(
+                        get: { model.value("post.film_expand.mode").string.isEmpty ? "Luminance" : model.value("post.film_expand.mode").string },
+                        set: { mode in
+                            model.setInteractive("post.film_expand.mode", .string(mode), action: "Change Expand Mode")
+                            model.setInteractive("post.film_expand.impact", .number(1), action: "Change Expand Mode")
+                        }
+                    )) {
+                        Text("Luminance").tag("Luminance")
+                        Text("RGB").tag("RGB")
+                    }
+                    .help("Apply the range remap to luminance while preserving hue, or to each RGB channel.")
+                }
+                .disabled(!model.value("post.film_expand.enabled").bool)
+            }
+        case .color:
+            Section("Color Balance") {
+                ForEach(prepColorControls) { control($0) }
+            }
+            Section("Color Separation") {
+                Text("Applied after the film scan. This is an inferred approximation of published controls, not a reconstruction of the unavailable DCTL.")
+                    .font(.caption).foregroundStyle(.secondary)
+                control(.slider("Separation strength", "post.color_separation.strength", 0...100, 1))
+            }
+            Section("Hue Selection") {
+                HStack {
+                    ColorPicker("Hue color", selection: colorSeparationTargetHueColor, supportsOpacity: false)
+                        .help("Choose the hue used by Color Separation.")
+                    Button("Sample", systemImage: "eyedropper") {
+                        NSColorSampler().show { sampledColor in
+                            guard let sampledColor else { return }
+                            colorSeparationTargetHueColor.wrappedValue = Color(nsColor: sampledColor)
+                        }
+                    }
+                    .help("Sample a color from the photo or anywhere else on screen; only its hue is used.")
+                }
+                control(.slider("Hue angle", "post.color_separation.target_hue", 0...360, 1))
+                control(.slider("Complementary hue", "post.color_separation.complementary_hue", 0...360, 1))
+                control(.slider("High-saturation threshold", "post.color_separation.target_saturation", 0...100, 1))
+            }
+            Section("Mask & Method") {
+                control(.slider("Luminance mask", "post.color_separation.luminance_mask", -100...100, 1))
+                control(.slider("Neutral protection", "post.color_separation.neutral_protection", 0...100, 1))
+                control(.slider("Method blend", "post.color_separation.method", 0...100, 1))
+                Toggle("Color wash", isOn: model.toggle("post.color_separation.color_wash"))
+                    .help("Blend the target hue band toward the selected hue instead of separating it from its complement.")
+            }
+        case .detail:
+            Section("Detail") { ForEach(prepDetailControls) { control($0) } }
+            if model.isRaw, model.lensCorrectionSupported {
                 Section("Lens") {
                     control(.toggle("Lens corrections", EditorModel.lensCorrectionPath))
                         .help("Corrects distortion and vignetting with the data the camera recorded for its lens.")
                 }
             }
-        } else {
-            Section { inputColour }
         }
     }
 
-    /// Above the tabs: the stocks shape everything the tabs adjust.
-    @ViewBuilder private var filmAndPaper: some View {
-        let scanning = model.value("io.scan_film").bool
-        Section {
+    @ViewBuilder private var filmStock: some View {
+        Section("Film & Paper") {
             // Preview grids, or the plain menus when Settings turns them off.
             if model.previews.enabled {
                 StockFoldout(model: model, paper: false)
@@ -746,7 +939,8 @@ struct AdjustmentInspector: View {
             }
             developmentTime(stock: model.films.first { $0.id == model.film }, path: "film_render.development_time", label: "Development",
                             help: "How long the film develops, from the times the stock was measured at. Longer gives more density and contrast.")
-            if !scanning {
+            if !model.value("io.scan_film").bool {
+                Divider()
                 if model.previews.enabled {
                     StockFoldout(model: model, paper: true)
                 } else {
@@ -762,27 +956,47 @@ struct AdjustmentInspector: View {
                 }
                 developmentTime(stock: model.papers.first { $0.id == model.paper }, path: "print_render.development_time", label: "Print development",
                                 help: "How long the paper develops, from the times it was measured at. Longer gives deeper blacks and more contrast.")
-            } else {
-                // The switch lives in the Lab's Print section; say why the paper went.
-                LabeledContent {
-                    Text("Skipped – scanning film").foregroundStyle(.secondary)
-                } label: {
-                    Text("Paper").foregroundStyle(.secondary)
-                }
-                .help("Scan film directly is on in the Lab’s Print section.")
             }
         }
     }
 
     @ViewBuilder private var lab: some View {
         let scanning = model.value("io.scan_film").bool
-        Section("Camera") {
-            control(.slider("Negative exposure (EV)", "camera.exposure_compensation_ev", -5...5, 0.1))
+        let silverRetentionPath = "film_render.silver_retention"
+        let silverRetentionHelp = "Keystone-style bleach bypass after the scan. 0 is bypass and 80 matches Keystone’s maximum: saturation falls, shadows multiply, and highlights screen."
+        filmStock
+        Section("Workflow") {
+            Toggle("Advanced controls", isOn: $allControls)
+                .help("Show every Film and Print control. Off, common controls and anything changed from its default remain visible.")
+        }
+        Section("Negative") {
+            let path = "camera.exposure_compensation_ev"
+            LabeledSlider(title: "Negative exposure", value: model.number(path, range: -5...5, step: 0.1),
+                          range: -5...5, step: 0.1, unit: " EV",
+                          defaultValue: model.defaultValue(path).double, modified: model.isModified(path),
+                          reset: { model.resetValue(path) },
+                          editing: { $0 ? model.beginInteraction() : model.endInteraction() },
+                          help: ControlHelp.text(path))
             FilmFormatPicker(model: model)
             if shows("camera.lens_blur_um") { control(.slider("Lens blur (µm)", "camera.lens_blur_um", 0...100, 0.1)) }
             groups(.camera)
         }
-        Section("Film") { groups(.film) }
+        Section("Film Effects") {
+            LabeledSlider(
+                title: "Silver Retention",
+                value: Binding(
+                    get: { model.value(silverRetentionPath).double * 80 },
+                    set: { model.set(silverRetentionPath, .number($0 / 80)) }
+                ),
+                range: 0...80, step: 1,
+                defaultValue: model.defaultValue(silverRetentionPath).double * 80,
+                modified: model.isModified(silverRetentionPath),
+                reset: { model.resetValue(silverRetentionPath) },
+                editing: { $0 ? model.beginInteraction() : model.endInteraction() },
+                help: silverRetentionHelp
+            )
+            groups(.film)
+        }
         Section {
             // Here rather than beside the stocks: few photographs want it.
             if allControls || scanning {
@@ -795,7 +1009,7 @@ struct AdjustmentInspector: View {
         }
         let outputChanged = model.previewSpace != SaveSettings.colorSpaces[0] || model.isModified("io.output_cctf_encoding")
         if allControls || outputChanged || adjustmentGroups.contains(where: { $0.section == .scan && shows($0) }) {
-            Section("Scan & Color") {
+            Section("Scan") {
                 groups(.scan)
                 if allControls || outputChanged {
                     disclosure("Output", symbol: "square.and.arrow.down.on.square") {
@@ -808,15 +1022,6 @@ struct AdjustmentInspector: View {
                     }
                 }
             }
-        }
-        Section {
-            Toggle("Advanced controls", isOn: $allControls)
-                .help("Shows every Lab setting. Off, the Lab shows the few most photographs need, and any that you or a preset changed.")
-        } footer: {
-            Text(allControls
-                 ? "Every camera, film, print and scan setting."
-                 : "The settings most photographs need. Any setting you or a preset changed also shows.")
-                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -842,15 +1047,20 @@ struct AdjustmentInspector: View {
             Picker("Read as", selection: model.inputInterpretation) {
                 Text("Automatic").tag("auto")
                 Section("Assume") {
-                    ForEach(["sRGB", "Display P3", "Adobe RGB (1998)", "ProPhoto RGB", "ITU-R BT.2020"], id: \.self) { Text($0).tag("assume:" + $0) }
+                    ForEach(["sRGB", "Display P3", "Adobe RGB (1998)", "ProPhoto RGB", "ITU-R BT.2020", "ARRI LogC3 / AWG3"], id: \.self) { Text($0).tag("assume:" + $0) }
                 }
                 Text("Manual").tag("manual")
             }
             .help("Automatic reads the embedded profile or tags; untagged files are read as sRGB. Assume overrides them. Manual uses the colour space and curve below, as Negs 0.8 did.")
             switch model.value("io.input_interpretation.mode").string {
             case "assume":
-                Toggle("Linear values", isOn: model.toggle("io.input_interpretation.linear"))
-                    .tooltip(ControlHelp.text("io.input_interpretation.linear"))
+                if model.value("io.input_interpretation.color_space").string == "ARRI LogC3 / AWG3" {
+                    Text("Decodes LogC3 EI 800 to scene-linear AWG3, then converts to linear sRGB before the film response.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Toggle("Linear values", isOn: model.toggle("io.input_interpretation.linear"))
+                        .tooltip(ControlHelp.text("io.input_interpretation.linear"))
+                }
             case "manual":
                 control(.choice("Colour space", "io.input_color_space", ["sRGB", "Display P3", "Adobe RGB (1998)", "ProPhoto RGB", "ITU-R BT.2020", "ACES2065-1", "ACEScg"]))
                 Toggle("Decode the curve", isOn: model.toggle("io.input_cctf_decoding"))
@@ -873,6 +1083,12 @@ struct AdjustmentInspector: View {
     /// live in Prep, before the film, where nothing has clipped yet.
     @ViewBuilder private var output: some View {
         ImageSizeSection(model: model)
+        Section("Levels") {
+            control(.slider("White point", "post.whites", -100...100, 1))
+                .help("Set the output white point. Lower it to retain bright detail; raise it to make highlights reach white sooner.")
+            control(.slider("Black point", "post.blacks", -100...100, 1))
+                .help("Set the output black point. Raise it to lift shadow detail; lower it to deepen blacks.")
+        }
         Section("Border") {
             Toggle("Add border", isOn: model.border(\.enabled))
                 .help("Frames the photograph in a mat or a film frame. The preview always shows it; Include in export decides whether files get it.")
@@ -890,6 +1106,17 @@ struct AdjustmentInspector: View {
                     .help("Adds the border to exported photographs and saved previews.")
             }
             .disabled(!model.border.enabled)
+        }
+    }
+
+    private func chooseReferentCube() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "cube") ?? .data]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            model.set("io.referent_logc3_path", .string(url.path))
         }
     }
 
@@ -925,7 +1152,73 @@ struct AdjustmentInspector: View {
                              help: help)
     }
 
-    private func control(_ adjustment: Adjustment) -> some View { AdjustmentControl(model: model, adjustment: adjustment) }
+    @ViewBuilder private func control(_ adjustment: Adjustment) -> some View {
+        if case .slider(let title, let path, let range, let step) = adjustment, path == "prep.highlights" {
+            let value = model.number(path, range: range, step: step)
+            let trackValue = Binding<Double>(
+                get: { value.wrappedValue < 0 ? value.wrappedValue / 180 : value.wrappedValue / 100 },
+                set: { value.wrappedValue = $0 < 0 ? $0 * 180 : $0 * 100 }
+            )
+            LabeledSlider(title: title, value: value, range: range, step: step,
+                          defaultValue: model.defaultValue(path).double, modified: model.isModified(path),
+                          reset: { model.resetValue(path) },
+                          editing: { $0 ? model.beginInteraction() : model.endInteraction() },
+                          help: ControlHelp.text(path), trackValue: trackValue, trackRange: -1...1, trackNeutral: 0)
+        } else {
+            AdjustmentControl(model: model, adjustment: adjustment)
+        }
+    }
+
+    private var colorSeparationTargetHueColor: Binding<Color> {
+        let path = "post.color_separation.target_hue"
+        return Binding(
+            get: {
+                let hue = model.value(path).double.truncatingRemainder(dividingBy: 360)
+                let angle = hue < 0 ? hue + 360 : hue
+                let sector = angle / 60
+                let chroma = 0.95 * 0.85
+                let x = chroma * (1 - abs(sector.truncatingRemainder(dividingBy: 2) - 1))
+                let m = 0.95 - chroma
+                let rgb: (Double, Double, Double) = switch sector {
+                case 0..<1: (chroma, x, 0)
+                case 1..<2: (x, chroma, 0)
+                case 2..<3: (0, chroma, x)
+                case 3..<4: (0, x, chroma)
+                case 4..<5: (x, 0, chroma)
+                default: (chroma, 0, x)
+                }
+                return Color(.sRGB, red: rgb.0 + m, green: rgb.1 + m, blue: rgb.2 + m, opacity: 1)
+            },
+            set: { color in
+                setColorSeparationHue(from: NSColor(color))
+            }
+        )
+    }
+
+    private func setColorSeparationHue(from color: NSColor) {
+        // The effect compares hue in output-encoded RGB. Convert the screen
+        // sample to sRGB first, then use its displayed hue directly. Passing
+        // it through linear RGB changes the hue angle (notably for orange).
+        guard let rgb = color.usingColorSpace(.extendedSRGB) ?? color.usingColorSpace(.deviceRGB) else { return }
+        let red = Double(rgb.redComponent)
+        let green = Double(rgb.greenComponent)
+        let blue = Double(rgb.blueComponent)
+        let maximum = max(red, max(green, blue))
+        let minimum = min(red, min(green, blue))
+        let chroma = maximum - minimum
+        guard chroma > 0.02, maximum > 0 else { return }
+        let hue: Double
+        if maximum == red {
+            hue = 60 * ((green - blue) / chroma).truncatingRemainder(dividingBy: 6)
+        } else if maximum == green {
+            hue = 60 * ((blue - red) / chroma + 2)
+        } else {
+            hue = 60 * ((red - green) / chroma + 4)
+        }
+        model.setInteractive("post.color_separation.target_hue", .number(hue < 0 ? hue + 360 : hue),
+                             action: "Change Color Separation Hue")
+    }
+
     /// A photograph's aspect ratio as people name it, such as 16:9.
     static func ratio(_ size: CGSize) -> String {
         let ratio = max(size.width, size.height) / min(size.width, size.height)
@@ -987,6 +1280,7 @@ struct AdjustmentInspector: View {
 private struct WhiteBalanceTemperatureSlider: View {
     let model: EditorModel
     private let path = "io.raw_white_balance.temperature"
+    @State private var typing = false
 
     private var kelvin: Double { model.value(path).double }
     private var position: Binding<Double> {
@@ -1009,9 +1303,17 @@ private struct WhiteBalanceTemperatureSlider: View {
                     .buttonStyle(.borderless).foregroundStyle(.secondary).imageScale(.small)
                     .help("Reset temperature")
                 }
-                Text("\(Int(kelvin.rounded())) K")
-                    .monospacedDigit().foregroundStyle(.secondary)
-                    .frame(minWidth: 48, alignment: .trailing)
+                if typing {
+                    ValueField(title: "Temperature (K)", value: kelvinBinding, decimals: 0) { typing = false }
+                        .frame(width: 76)
+                } else {
+                    Text("\(Int(kelvin.rounded())) K")
+                        .monospacedDigit().foregroundStyle(.secondary)
+                        .frame(minWidth: 58, alignment: .trailing)
+                        .contentShape(Rectangle())
+                        .onTapGesture { typing = true }
+                        .help("Click to enter a precise temperature in kelvin")
+                }
             }
             ResettableSlider(
                 title: "Temperature",
@@ -1024,5 +1326,76 @@ private struct WhiteBalanceTemperatureSlider: View {
             )
         }
         .padding(.vertical, 1)
+    }
+
+    private var kelvinBinding: Binding<Double> {
+        Binding(get: { kelvin }, set: { model.set(path, .number(min(25000, max(1667, $0)))) })
+    }
+}
+
+/// Tint is a multiplicative camera gain. A logarithmic track gives useful
+/// precision around neutral while preserving the full supported correction range.
+private struct WhiteBalanceTintSlider: View {
+    let model: EditorModel
+    private let path = "io.raw_white_balance.tint"
+    private let range = 0.01...4.0
+    @State private var typing = false
+
+    private var tint: Double { min(range.upperBound, max(range.lowerBound, model.value(path).double)) }
+    private var stopsRange: ClosedRange<Double> { log2(range.lowerBound)...log2(range.upperBound) }
+    private var stops: Double { log2(tint) }
+    private var stopsBinding: Binding<Double> {
+        Binding(get: { stops }, set: { model.set(path, .number(pow(2, min(stopsRange.upperBound, max(stopsRange.lowerBound, $0))))) })
+    }
+    private var position: Binding<Double> {
+        Binding(
+            get: {
+                let value = stops
+                return value < 0 ? value / abs(stopsRange.lowerBound) : value / stopsRange.upperBound
+            },
+            set: { position in
+                let bounded = min(1, max(-1, position))
+                let value = bounded < 0 ? bounded * abs(stopsRange.lowerBound) : bounded * stopsRange.upperBound
+                model.set(path, .number(pow(2, value)))
+            },
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Text("Tint · Magenta / Green").lineLimit(1)
+                    .tooltip("Move left to add magenta, right to add green. 0 stops is neutral.")
+                Spacer(minLength: 8)
+                if model.isModified(path) {
+                    Button { model.resetValue(path) } label: { Image(systemName: "arrow.counterclockwise") }
+                        .buttonStyle(.borderless).foregroundStyle(.secondary).imageScale(.small)
+                    .help("Reset tint to neutral")
+                }
+                if typing {
+                    ValueField(title: "Tint (stops)", value: stopsBinding, decimals: 2) { typing = false }
+                        .frame(width: 64)
+                } else {
+                    Text(stops.formatted(.number.precision(.fractionLength(2)).sign(strategy: .always())) + (stops < 0 ? " M" : stops > 0 ? " G" : ""))
+                        .monospacedDigit().foregroundStyle(.secondary)
+                        .frame(minWidth: 48, alignment: .trailing)
+                        .contentShape(Rectangle())
+                        .onTapGesture { typing = true }
+                        .help("Click to enter tint in stops from neutral. Negative adds magenta; positive adds green.")
+                }
+            }
+            ResettableSlider(
+                title: "Tint",
+                value: position,
+                range: -1...1,
+                neutral: 0,
+                editing: { $0 ? model.beginInteraction() : model.endInteraction() },
+                reset: { model.resetValue(path) },
+                toolTip: "Tint in stops from neutral. Left adds magenta; right adds green.",
+            )
+        }
+        .padding(.vertical, 1)
+        .resettable(modified: model.isModified(path), reset: { model.resetValue(path) })
+        .accessibilityElement(children: .contain)
     }
 }

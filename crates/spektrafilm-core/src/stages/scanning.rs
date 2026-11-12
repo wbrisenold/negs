@@ -5,9 +5,9 @@ use rayon::prelude::*;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::colorspace::{self, RgbColourspace};
 use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::tetra3d::tetrahedral_interp;
 use spektrafilm_math::precision::{Scalar, from_f64};
 use spektrafilm_math::spectral;
+use spektrafilm_math::tetra3d::tetrahedral_interp;
 
 use crate::params::{OutputAdaptation, RuntimeParams};
 use crate::profile::Profile;
@@ -113,7 +113,12 @@ fn scan_spectral_log_xyz(
     // Exactly per pixel, or a log_xyz LUT — the same function Python LUTs.
     enum Source {
         Exact(Vec<f64>),
-        Lut { table: Vec<f64>, steps: usize, data_min: [f64; 3], inv: [f64; 3] },
+        Lut {
+            table: Vec<f64>,
+            steps: usize,
+            data_min: [f64; 3],
+            inv: [f64; 3],
+        },
     }
     let source = match lut {
         None => Source::Exact(log_xyz_of(&density_cmy)),
@@ -132,40 +137,51 @@ fn scan_spectral_log_xyz(
         }
     };
     let mut out = density_cmy;
-    out.data.par_chunks_exact_mut(3).enumerate().for_each(|(i, dst)| {
-        let log_xyz = match &source {
-            Source::Exact(all) => [all[3 * i], all[3 * i + 1], all[3 * i + 2]],
-            Source::Lut { table, steps, data_min, inv } => {
-                let r = (dst[0] as f64 - data_min[0]) * inv[0];
-                let g = (dst[1] as f64 - data_min[1]) * inv[1];
-                let b = (dst[2] as f64 - data_min[2]) * inv[2];
-                tetrahedral_interp(table, *steps, r, g, b)
+    out.data
+        .par_chunks_exact_mut(3)
+        .enumerate()
+        .for_each(|(i, dst)| {
+            let log_xyz = match &source {
+                Source::Exact(all) => [all[3 * i], all[3 * i + 1], all[3 * i + 2]],
+                Source::Lut {
+                    table,
+                    steps,
+                    data_min,
+                    inv,
+                } => {
+                    let r = (dst[0] as f64 - data_min[0]) * inv[0];
+                    let g = (dst[1] as f64 - data_min[1]) * inv[1];
+                    let b = (dst[2] as f64 - data_min[2]) * inv[2];
+                    tetrahedral_interp(table, *steps, r, g, b)
+                }
+            };
+            // Post-LUT: 10^log_xyz → CAT → xyz_to_rgb, mirroring Python's
+            // `_density_to_rgb` AFTER the LUT call. bw_correction and
+            // glare run after this returns (RGB space).
+            let mut xyz = [
+                10.0f64.powf(log_xyz[0]),
+                10.0f64.powf(log_xyz[1]),
+                10.0f64.powf(log_xyz[2]),
+            ];
+            // B&W/slide luminance remap on the pre-CAT scan XYZ (Python's
+            // black_white_xyz_correction). Scalar scale from the Y channel;
+            // no-op when color_ref has no remap.
+            let scale = color_ref.xyz_scale(xyz[1]);
+            if scale != 1.0 {
+                xyz[0] *= scale;
+                xyz[1] *= scale;
+                xyz[2] *= scale;
             }
-        };
-        // Post-LUT: 10^log_xyz → CAT → xyz_to_rgb, mirroring Python's
-        // `_density_to_rgb` AFTER the LUT call. bw_correction and
-        // glare run after this returns (RGB space).
-        let mut xyz = [
-            10.0f64.powf(log_xyz[0]),
-            10.0f64.powf(log_xyz[1]),
-            10.0f64.powf(log_xyz[2]),
-        ];
-        // B&W/slide luminance remap on the pre-CAT scan XYZ (Python's
-        // black_white_xyz_correction). Scalar scale from the Y channel;
-        // no-op when color_ref has no remap.
-        let scale = color_ref.xyz_scale(xyz[1]);
-        if scale != 1.0 {
-            xyz[0] *= scale;
-            xyz[1] *= scale;
-            xyz[2] *= scale;
-        }
-        let xa = cat[0][0] * xyz[0] + cat[0][1] * xyz[1] + cat[0][2] * xyz[2];
-        let ya = cat[1][0] * xyz[0] + cat[1][1] * xyz[1] + cat[1][2] * xyz[2];
-        let za = cat[2][0] * xyz[0] + cat[2][1] * xyz[1] + cat[2][2] * xyz[2];
-        dst[0] = from_f64(xyz_to_rgb[0][0] * xa + xyz_to_rgb[0][1] * ya + xyz_to_rgb[0][2] * za);
-        dst[1] = from_f64(xyz_to_rgb[1][0] * xa + xyz_to_rgb[1][1] * ya + xyz_to_rgb[1][2] * za);
-        dst[2] = from_f64(xyz_to_rgb[2][0] * xa + xyz_to_rgb[2][1] * ya + xyz_to_rgb[2][2] * za);
-    });
+            let xa = cat[0][0] * xyz[0] + cat[0][1] * xyz[1] + cat[0][2] * xyz[2];
+            let ya = cat[1][0] * xyz[0] + cat[1][1] * xyz[1] + cat[1][2] * xyz[2];
+            let za = cat[2][0] * xyz[0] + cat[2][1] * xyz[1] + cat[2][2] * xyz[2];
+            dst[0] =
+                from_f64(xyz_to_rgb[0][0] * xa + xyz_to_rgb[0][1] * ya + xyz_to_rgb[0][2] * za);
+            dst[1] =
+                from_f64(xyz_to_rgb[1][0] * xa + xyz_to_rgb[1][1] * ya + xyz_to_rgb[1][2] * za);
+            dst[2] =
+                from_f64(xyz_to_rgb[2][0] * xa + xyz_to_rgb[2][1] * ya + xyz_to_rgb[2][2] * za);
+        });
     out
 }
 
@@ -418,7 +434,11 @@ pub fn encode_output(rgb: &mut ImageBuf, output_color_space: &str) {
 /// The scan's XYZ adaptation, from the viewing illuminant's white to
 /// `output`'s white (see [`OutputAdaptation`]). The CPU scan and the GPU
 /// chains both use it.
-pub fn output_adaptation(viewing_white: [f64; 3], output: &RgbColourspace, mode: OutputAdaptation) -> [[f64; 3]; 3] {
+pub fn output_adaptation(
+    viewing_white: [f64; 3],
+    output: &RgbColourspace,
+    mode: OutputAdaptation,
+) -> [[f64; 3]; 3] {
     let d65 = RgbColourspace::output("sRGB").whitepoint_xyz;
     let is_d65 = (0..3).all(|i| (output.whitepoint_xyz[i] - d65[i]).abs() < 1e-9);
     if mode == OutputAdaptation::Direct || is_d65 {
@@ -447,7 +467,11 @@ pub fn convert_output(rgb: &mut ImageBuf, from: &str, to: &str, encoded: bool) {
     rgb.data.par_chunks_exact_mut(3).for_each(|px| {
         let lin = [0, 1, 2].map(|i| {
             let v = px[i] as f64;
-            if encoded { decode.decode(v.clamp(0.0, 1.0)) } else { v }
+            if encoded {
+                decode.decode(v.clamp(0.0, 1.0))
+            } else {
+                v
+            }
         });
         for (i, row) in m.iter().enumerate() {
             let v = (row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2]).clamp(0.0, 1.0);
@@ -489,6 +513,9 @@ mod tests {
         for (a, b) in red.iter().zip([0.9175, 0.2003, 0.1386]) {
             assert!((a - b).abs() < 1e-3, "{red:?}");
         }
-        assert_eq!(converted([0.25, 0.5, 0.75], "sRGB"), [0.25, 0.5, 0.75].map(|v| from_f64(v) as f64));
+        assert_eq!(
+            converted([0.25, 0.5, 0.75], "sRGB"),
+            [0.25, 0.5, 0.75].map(|v| from_f64(v) as f64)
+        );
     }
 }

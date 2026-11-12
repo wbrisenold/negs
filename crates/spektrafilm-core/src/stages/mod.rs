@@ -131,11 +131,7 @@ mod integration_tests {
         // 1×1 midgray.
         let img = ImageBuf::from_data(1, 1, vec![from_f64(0.184); 3]);
         let out = pipeline.process(img, &backend);
-        let want = [
-            0.18168434872454148,
-            0.1816510949027062,
-            0.18153344933652843,
-        ];
+        let want = [0.18168434872454148, 0.1816510949027062, 0.18153344933652843];
         for c in 0..3 {
             let got = out.get(0, 0)[c] as f64;
             assert!(
@@ -274,8 +270,7 @@ mod integration_tests {
         let mut built = RuntimeParams::default();
         built.enlarger.m_filter_shift = 7.3;
         built.enlarger.preflash_exposure = 0.04;
-        let cached =
-            Pipeline::new_with_spectral(film.clone(), print.clone(), built, &dir).unwrap();
+        let cached = Pipeline::new_with_spectral(film.clone(), print.clone(), built, &dir).unwrap();
         let cases: [(f32, f32, f32, f32, f32, bool, bool, f32); 6] = [
             (0.0, 0.0, 0.0, 0.0, 0.0, true, true, 0.0),
             (12.3, -4.7, 0.0, 0.0, 0.0, true, true, 0.0),
@@ -294,7 +289,19 @@ mod integration_tests {
             params.enlarger.normalize_print_exposure = normalize;
             params.enlarger.print_exposure_compensation = compensation;
             params.camera.exposure_compensation_ev = ev;
-            let case = format!("{:?}", (m, y, preflash, preflash_m, preflash_y, normalize, compensation, ev));
+            let case = format!(
+                "{:?}",
+                (
+                    m,
+                    y,
+                    preflash,
+                    preflash_m,
+                    preflash_y,
+                    normalize,
+                    compensation,
+                    ev
+                )
+            );
             let fresh =
                 Pipeline::new_with_spectral(film.clone(), print.clone(), params.clone(), &dir)
                     .unwrap();
@@ -305,7 +312,11 @@ mod integration_tests {
                 bits(fresh.print_illuminant_slice()),
                 "illuminant {case}"
             );
-            assert_eq!(bits(&updated.preflash_raw()), bits(&fresh.preflash_raw()), "preflash {case}");
+            assert_eq!(
+                bits(&updated.preflash_raw()),
+                bits(&fresh.preflash_raw()),
+                "preflash {case}"
+            );
             assert_eq!(
                 updated.print_exposure_factor().to_bits(),
                 fresh.print_exposure_factor().to_bits(),

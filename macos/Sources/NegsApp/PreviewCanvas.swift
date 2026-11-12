@@ -13,9 +13,12 @@ struct PreviewCanvas: NSViewRepresentable {
     let border: BorderSettings?
     let filmTexture: CGImage?
     let filmStrip: FilmStrip?
+    let diagnosticOverlay: CGImage?
     let zoomCommand: UUID
     let fit: Bool
     var scale: CanvasScale?
+    /// A double-click on the photograph; true if it's zoomed from fitting.
+    var doubleClick: ((_ zoomed: Bool) -> Void)?
 
     func makeNSView(context: Context) -> ImageScrollView {
         let scroll = ImageScrollView()
@@ -26,12 +29,13 @@ struct PreviewCanvas: NSViewRepresentable {
         scroll.allowsMagnification = true; scroll.minMagnification = 0.005; scroll.maxMagnification = 16
         scroll.documentView = PhotographView()
         scroll.setAccessibilityLabel("Photograph preview")
-        scroll.setAccessibilityHelp("Pinch to zoom, scroll or drag to pan, double-click to fit.")
+        scroll.setAccessibilityHelp("Pinch to zoom, scroll or drag to pan, double-click to fit or, when fitted, to show the grid.")
         return scroll
     }
 
     func updateNSView(_ scroll: ImageScrollView, context: Context) {
         scale?.view = scroll
+        scroll.doubleClick = doubleClick
         let photo = scroll.documentView as! PhotographView
         let cropped = crop.size(of: size)
         let displaySize = rotation % 2 != 0 ? CGSize(width: cropped.height, height: cropped.width) : cropped
@@ -44,7 +48,7 @@ struct PreviewCanvas: NSViewRepresentable {
         // A different crop (such as an undone one) is a new picture: fit it.
         let recropped = photo.crop != crop && oldSize.width != 0
         if recropped { scroll.fitting = true }
-        photo.show(image, size: size, rotation: rotation, crop: crop, border: border, filmTexture: filmTexture, filmStrip: filmStrip)
+        photo.show(image, size: size, rotation: rotation, crop: crop, border: border, filmTexture: filmTexture, filmStrip: filmStrip, diagnosticOverlay: diagnosticOverlay)
         if oldSize != documentSize {
             if commanded || scroll.fitting || oldSize.width == 0 {
                 photo.setFrameSize(documentSize)
@@ -88,6 +92,7 @@ final class CenteringClipView: NSClipView {
 final class ImageScrollView: NSScrollView {
     var lastCommand: UUID?
     var fitting = true
+    var doubleClick: ((_ zoomed: Bool) -> Void)?
     private var lastViewport = CGSize.zero
     override func layout() {
         super.layout()
@@ -108,6 +113,21 @@ final class ImageScrollView: NSScrollView {
         let oneToOne = 1 / backingScale
         guard fitting else { return oneToOne }
         return min(viewport.width / document.width, viewport.height / document.height, oneToOne)
+    }
+    /// Zoomed in or out from fitting the window. A zoom that happens to
+    /// match the fit, such as 1:1 on a small photograph, isn't.
+    var zoomedFromFit: Bool {
+        guard !fitting, let documentView else { return false }
+        return Self.zoomed(magnification, minimum: minMagnification, maximum: maxMagnification, document: documentView.frame.size,
+                           viewport: contentSize, backingScale: window?.backingScaleFactor ?? 2)
+    }
+    static func zoomed(_ magnification: CGFloat, minimum: CGFloat, maximum: CGFloat, document: CGSize, viewport: CGSize, backingScale: CGFloat) -> Bool {
+        guard document.width > 0, document.height > 0, viewport.width > 0, viewport.height > 0 else { return false }
+        let fit = min(max(Self.magnification(fitting: true, document: document, viewport: viewport, backingScale: backingScale), minimum), maximum)
+        return abs(magnification / fit - 1) > 0.005
+    }
+    func doubleClicked() {
+        if let doubleClick { doubleClick(zoomedFromFit) } else { fitting = true; applyZoom() }
     }
     /// A higher-resolution render of the same photograph replaces the shown
     /// one; keep the same region on screen at the same apparent scale.
@@ -144,6 +164,7 @@ final class PhotographView: NSView {
     private let clip = CALayer()
     /// The whole photograph, straightened inside the crop.
     private let photo = CALayer()
+    private let clipping = CALayer()
     private var borderLayers: BorderLayers!
     private var image: AnyObject?
     private var size = CGSize.zero
@@ -152,6 +173,7 @@ final class PhotographView: NSView {
     private var border: BorderSettings?
     private var filmTexture: CGImage?
     private var filmStrip: FilmStrip?
+    private var diagnosticOverlay: CGImage?
     /// The photograph's size on the canvas, after cropping and rotation.
     var displaySize: CGSize {
         let cropped = crop.size(of: size)
@@ -170,43 +192,64 @@ final class PhotographView: NSView {
         photo.isOpaque = true
         let none = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull(), "transform": NSNull()]
         photo.actions = none; clip.actions = none
+        clipping.contentsGravity = .resize
+        clipping.actions = none
+        clipping.opacity = 0.88
         clip.masksToBounds = true
         clip.addSublayer(photo)
+        clip.addSublayer(clipping)
         layer?.addSublayer(clip)
         borderLayers = BorderLayers(in: layer!, around: clip)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    func show(_ image: AnyObject, size: CGSize, rotation: Int, crop: CropSettings = CropSettings(), border: BorderSettings? = nil, filmTexture: CGImage? = nil, filmStrip: FilmStrip? = nil) {
+    func show(_ image: AnyObject, size: CGSize, rotation: Int, crop: CropSettings = CropSettings(), border: BorderSettings? = nil, filmTexture: CGImage? = nil, filmStrip: FilmStrip? = nil, diagnosticOverlay: CGImage? = nil) {
         guard image !== self.image || size != self.size || rotation != self.rotation || crop != self.crop
-            || border != self.border || filmTexture !== self.filmTexture || filmStrip != self.filmStrip else { return }
+            || border != self.border || filmTexture !== self.filmTexture || filmStrip != self.filmStrip || diagnosticOverlay !== self.diagnosticOverlay else { return }
         self.image = image; self.size = size; self.rotation = rotation; self.crop = crop
-        self.border = border; self.filmTexture = filmTexture; self.filmStrip = filmStrip
+        self.border = border; self.filmTexture = filmTexture; self.filmStrip = filmStrip; self.diagnosticOverlay = diagnosticOverlay
         photo.contents = image
+        clipping.contents = diagnosticOverlay
+        clipping.isHidden = diagnosticOverlay == nil
         needsLayout = true
     }
 
     override func layout() {
         super.layout()
         CATransaction.begin(); CATransaction.setDisableActions(true)
+        Self.layout(clip: clip, photo: photo, size: size, crop: crop, rotation: rotation, center: CGPoint(x: bounds.midX, y: bounds.midY))
+        Self.layout(clip: clip, photo: clipping, size: size, crop: crop, rotation: rotation, center: CGPoint(x: bounds.midX, y: bounds.midY))
+        borderLayers.layout(border, photo: displaySize, host: layer!, texture: filmTexture, filmStrip: filmStrip)
+        CATransaction.commit()
+    }
+
+    /// Places a photograph of `size` in `clip`, cropped, straightened and
+    /// turned as the exporter does, centred on `center`. The edited
+    /// thumbnails use it too. `cut`: the photograph's image is the crop
+    /// already, straightened.
+    static func layout(clip: CALayer, photo: CALayer, size: CGSize, crop: CropSettings, rotation: Int, center: CGPoint, cut: Bool = false) {
         // The crop's pixels, as the exporter cuts them. Layers are y-up, so
         // the rectangle's top-left origin flips, and clockwise is negative.
         let pixels = crop.pixels(in: size)
         clip.bounds = CGRect(origin: .zero, size: pixels.size)
-        clip.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        clip.position = center
         clip.setAffineTransform(CGAffineTransform(rotationAngle: -.pi / 2 * CGFloat(rotation)))
+        if cut {
+            photo.bounds = clip.bounds
+            photo.position = CGPoint(x: pixels.width / 2, y: pixels.height / 2)
+            photo.setAffineTransform(.identity)
+            return
+        }
         photo.bounds = CGRect(origin: .zero, size: size)
         photo.position = CGPoint(x: size.width / 2 - pixels.minX, y: pixels.height - (size.height / 2 - pixels.minY))
         photo.setAffineTransform(CGAffineTransform(rotationAngle: -crop.angle * .pi / 180))
-        borderLayers.layout(border, photo: displaySize, host: layer!, texture: filmTexture, filmStrip: filmStrip)
-        CATransaction.commit()
     }
 
     private var grabbing = false
     override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
     override func mouseDown(with event: NSEvent) {
         if event.clickCount == 2, let scroll = enclosingScrollView as? ImageScrollView {
-            scroll.fitting = true; scroll.applyZoom()
+            scroll.doubleClicked()
         } else if !grabbing { grabbing = true; NSCursor.closedHand.push() }
     }
     override func mouseDragged(with event: NSEvent) {

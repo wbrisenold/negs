@@ -1,5 +1,13 @@
 target/
+.build/
 /dist/
+**/.swiftpm/
+**/xcuserdata/
+*.xcuserstate
+*.hmap
+*.ipa
+*.dSYM/
+*.dSYM.zip
 __pycache__/
 .DS_Store
 **/.DS_Store
@@ -7,7 +15,10 @@ __pycache__/
 # Local task tracking (Beads) — data lives in the Dolt server, config is
 # machine-local and not shared through git.
 .beads/
-AGENTS.md
+
+# Cullen Kelly Referent is user licensed; local package builds may bundle it,
+# but never commit or publish the LUT itself.
+local-assets/
 
 # Diagnostic outputs from local runs (test renders, exports).
 # Scoped to the repo root so legitimate fixtures under data/ and tests/
@@ -16,7 +27,3 @@ AGENTS.md
 /*.tif
 /*.tiff
 /*.jpg
-
-# SwiftPM local build and IDE state
-macos/.build/
-macos/.swiftpm/

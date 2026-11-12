@@ -45,108 +45,31 @@ pub fn grain_pixel_size_um(params: &RuntimeParams, width: u32, height: u32) -> f
     params.camera.film_format_mm as f64 * 1000.0 / width.max(height) as f64
 }
 
-
-/// The auto-exposure metering frame: upstream's `_compute_small_preview`
-/// (`runtime/services/resize.py`), which `ResizingService.crop_and_rescale`
-/// takes from the full frame before any crop or resize, so the metered
-/// exposure doesn't move with the crop or the working size. Frames with a
-/// long side above 256 px go through `skimage.transform.rescale(order=0)`:
-/// the output size rounds half to even, a Gaussian anti-aliasing filter of
-/// `σ = (factor − 1)/2` per axis (`scipy.ndimage`, mirror edges, 4σ radius)
-/// runs before the nearest-neighbour sampling, and the result is clipped to
-/// the input's range. The filter is only evaluated at the sampled pixels.
+/// A small full-frame exposure meter. Area averaging is antialiased, preserves
+/// the average linear exposure, and keeps spatial metering patterns at 256 px.
+/// This avoids evaluating a wide Gaussian kernel across every source pixel on
+/// every RAW edit.
 pub fn metering_preview(image: &ImageBuf) -> ImageBuf {
-    const MAX_SIZE: f64 = 256.0;
-    let (w, h) = (image.width as usize, image.height as usize);
-    let max_dim = w.max(h);
-    if max_dim as f64 <= MAX_SIZE {
+    const MAX_SIZE: u32 = 256;
+    let max_dim = image.width.max(image.height);
+    if max_dim <= MAX_SIZE {
         return image.clone();
     }
-    let scale = MAX_SIZE / max_dim as f64;
-    let out_dim = |dim: usize| ((scale * dim as f64).round_ties_even() as usize).max(1);
-    let (out_w, out_h) = (out_dim(w), out_dim(h));
-    // scipy `zoom(grid_mode=True, order=0)`: the source of output `o` is
-    // `floor((o + 0.5)·in/out − 0.5 + 0.5)`.
-    let axis = |out: usize, dim: usize| -> (Vec<usize>, Vec<f64>) {
-        let zoom = dim as f64 / out as f64;
-        let index = (0..out)
-            .map(|o| {
-                let cc = (o as f64 + 0.5) * zoom - 0.5;
-                mirror_index((cc + 0.5).floor() as isize, dim)
-            })
-            .collect();
-        (index, gaussian_kernel(((zoom - 1.0) / 2.0).max(0.0)))
-    };
-    let (rows, row_kernel) = axis(out_h, h);
-    let (cols, col_kernel) = axis(out_w, w);
-    let pixel = |y: usize, x: usize, c: usize| to_f64(image.data[(y * w + x) * 3 + c]);
-    // scipy `correlate1d` with a symmetric kernel: the centre tap, then the
-    // pairs from the outermost in.
-    let correlate = |kernel: &[f64], at: usize, dim: usize, sample: &dyn Fn(usize) -> f64| {
-        let r = kernel.len() / 2;
-        let mut acc = sample(at) * kernel[r];
-        for j in (1..=r).rev() {
-            let lo = mirror_index(at as isize - j as isize, dim);
-            let hi = mirror_index(at as isize + j as isize, dim);
-            acc += (sample(lo) + sample(hi)) * kernel[r - j];
-        }
-        acc
-    };
-    // Axis 0 (rows) at the sampled rows, every column.
-    let filtered_rows: Vec<f64> = rows
-        .par_iter()
-        .flat_map_iter(|&y| {
-            let correlate = &correlate;
-            let row_kernel = &row_kernel;
-            (0..w).flat_map(move |x| {
-                (0..3).map(move |c| correlate(row_kernel, y, h, &|yy| pixel(yy, x, c)))
-            })
-        })
-        .collect();
-    let (lo, hi) = image
-        .data
-        .iter()
-        .map(|&v| to_f64(v))
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(v), hi.max(v)));
-    let mut data = Vec::with_capacity(out_w * out_h * 3);
-    for r in 0..out_h {
-        let row = &filtered_rows[r * w * 3..(r + 1) * w * 3];
-        for &x in &cols {
-            for c in 0..3 {
-                let v = correlate(&col_kernel, x, w, &|xx| row[xx * 3 + c]);
-                data.push(from_f64(v.clamp(lo, hi)));
-            }
-        }
-    }
-    ImageBuf::from_data(out_w as u32, out_h as u32, data)
-}
-
-/// `scipy.ndimage` "mirror" extension (`d c b | a b c d | c b a`).
-fn mirror_index(i: isize, dim: usize) -> usize {
-    if dim == 1 {
-        return 0;
-    }
-    let period = 2 * (dim as isize - 1);
-    let i = i.rem_euclid(period);
-    (if i >= dim as isize { period - i } else { i }) as usize
-}
-
-/// `scipy.ndimage._gaussian_kernel1d` at radius `int(4σ + 0.5)`; the identity
-/// for σ ≤ 1e-15, which `gaussian_filter` skips.
-fn gaussian_kernel(sigma: f64) -> Vec<f64> {
-    if sigma <= 1e-15 {
-        return vec![1.0];
-    }
-    let radius = (4.0 * sigma + 0.5) as i64;
-    let factor = -0.5 / (sigma * sigma);
-    let phi: Vec<f64> = (-radius..=radius).map(|x| (factor * (x * x) as f64).exp()).collect();
-    let sum: f64 = phi.iter().sum();
-    phi.iter().map(|v| v / sum).collect()
+    let scale = MAX_SIZE as f64 / max_dim as f64;
+    let dim = |value: u32| ((value as f64 * scale).round() as u32).max(1);
+    crate::preview::downsample_area(image, (dim(image.width), dim(image.height)))
 }
 
 /// The metering patterns [`measure_raw_autoexposure_ev`] knows.
-pub const METERING_METHODS: [&str; 7] =
-    ["average", "median", "center_weighted", "partial", "matrix", "multi_zone", "highlight_weighted"];
+pub const METERING_METHODS: [&str; 7] = [
+    "average",
+    "median",
+    "center_weighted",
+    "partial",
+    "matrix",
+    "multi_zone",
+    "highlight_weighted",
+];
 
 /// Auto-exposure compensation on film raw, upstream experimental's
 /// `measure_raw_autoexposure_ev` (`utils/autoexposure.py`): the field is the
@@ -161,7 +84,13 @@ pub fn measure_raw_autoexposure_ev(raw: &ImageBuf, method: &str, target: f64) ->
         .par_chunks_exact(3)
         .map(|p| raw_field_value([to_f64(p[0]), to_f64(p[1]), to_f64(p[2])]))
         .collect();
-    measure_field_autoexposure_ev(&field, raw.width as usize, raw.height as usize, method, target)
+    measure_field_autoexposure_ev(
+        &field,
+        raw.width as usize,
+        raw.height as usize,
+        method,
+        target,
+    )
 }
 
 /// The metering field value of one raw pixel: the channel mean, summed in
@@ -421,7 +350,11 @@ pub(crate) fn prepare_input_from(
         .data
         .par_iter()
         .map(|&v| {
-            let mut v = if decode { from_f64(cctf.decode(to_f64(v))) } else { v };
+            let mut v = if decode {
+                from_f64(cctf.decode(to_f64(v)))
+            } else {
+                v
+            };
             if let Some(scale) = scale {
                 v *= scale;
             }
@@ -454,13 +387,12 @@ pub fn expose(
 
     let mut raw = {
         // Consume the input so optical scratch does not overlap an RGB copy.
-        let rgb = prepare_input(image, params, autoexposure_ev)
-            .expect("Invalid Prep settings or pixels");
+        let rgb =
+            prepare_input(image, params, autoexposure_ev).expect("Invalid Prep settings or pixels");
 
         // RGB → film raw exposure; the simplified fallback treats RGB values
         // as proportional to raw exposure.
-        rgb_to_film_raw(&rgb, params, backend, tc_lut, front_illuminant)
-            .unwrap_or(rgb)
+        rgb_to_film_raw(&rgb, params, backend, tc_lut, front_illuminant).unwrap_or(rgb)
     };
     crate::pipeline::dump_if_env("SPEKTRAFILM_DUMP_FILM_RAW", &raw);
 
@@ -657,7 +589,11 @@ pub fn process(
     let autoexposure_ev = if params.camera.auto_exposure {
         let preview = metering_preview(&image);
         let raw = encoded_rgb_to_film_raw(&preview, params, backend, tc_lut, &ref_illuminant);
-        measure_raw_autoexposure_ev(raw.as_ref().unwrap_or(&preview), &params.camera.auto_exposure_method, 1.0)
+        measure_raw_autoexposure_ev(
+            raw.as_ref().unwrap_or(&preview),
+            &params.camera.auto_exposure_method,
+            1.0,
+        )
     } else {
         0.0
     };
@@ -677,6 +613,35 @@ pub fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn metering_preview_keeps_area_reduction_on_large_raw_frames() {
+        // A realistic 12 MP working frame catches a return to the previous
+        // full-frame, wide-kernel meter. Keep this wall-clock gate in optimized
+        // builds only; debug instrumentation makes timing too variable.
+        if cfg!(debug_assertions) {
+            return;
+        }
+
+        let (width, height) = (4000, 3000);
+        let mut image = ImageBuf::new(width, height);
+        for (index, pixel) in image.data.chunks_exact_mut(3).enumerate() {
+            let value = from_f32((index % 251) as f32 / 250.0);
+            pixel.fill(value);
+        }
+
+        let started = Instant::now();
+        let preview = metering_preview(std::hint::black_box(&image));
+        let elapsed = started.elapsed();
+
+        assert_eq!((preview.width, preview.height), (256, 192));
+        std::hint::black_box(&preview.data);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "12 MP RAW exposure metering took {elapsed:?}; expected area-downsample performance under 500 ms"
+        );
+    }
 
     #[test]
     fn metering_methods_are_the_ones_meter_field_knows() {

@@ -28,7 +28,7 @@ fn full_and_banded_pixels_are_exact_across_phases_crops_wb_and_rotations() {
                 raw.active_area = Some(active);
                 raw.crop_area = Some(Rect::new(Point::new(ax + cx, ay + cy), Dim2::new(active.d.w - cx - 1, active.d.h - cy - 2)));
                 for mode in RawWhiteBalanceMode::ALL {
-                    let wb = RawWhiteBalance { mode, temperature: 3200.0, tint: 0.85 };
+                    let wb = RawWhiteBalance { mode, temperature: 3200.0, tint: 0.85, ..Default::default() };
                     let full = crate::develop_decoded(raw.clone(), wb).unwrap();
                     for target in [(19, 31), (1, 1), (full.width, full.height)] {
                         let expected = if target == (full.width, full.height) { full.clone() } else { downsample_reference(&full, target) };

@@ -255,7 +255,8 @@ mod tests {
 
         if let Some(gpu) = spektrafilm_gpu::wgpu_backend::WgpuBackend::new() {
             use spektrafilm_gpu::ComputeBackend;
-            let gpu_out = gpu.hanatos2025_rgb_to_raw(&img, &tc_lut, "sRGB", &ILLUMINANT_D55, false, true);
+            let gpu_out =
+                gpu.hanatos2025_rgb_to_raw(&img, &tc_lut, "sRGB", &ILLUMINANT_D55, false, true);
             eprintln!(
                 "GPU raw: [{:.16}, {:.16}, {:.16}]",
                 gpu_out.get(0, 0)[0] as f64,
@@ -377,11 +378,7 @@ mod tests {
         check(
             "cmy_film",
             density_cmy.get(0, 0),
-            [
-                0.6836686495664202,
-                0.7045697619028772,
-                0.86440874161114,
-            ],
+            [0.6836686495664202, 0.7045697619028772, 0.86440874161114],
         );
 
         let log_raw_print = crate::stages::printing::expose_calibrated(
@@ -414,11 +411,7 @@ mod tests {
         check(
             "cmy_print",
             density_print.get(0, 0),
-            [
-                0.6292509597907634,
-                0.5353204737731865,
-                0.5382977975113589,
-            ],
+            [0.6292509597907634, 0.5353204737731865, 0.5382977975113589],
         );
     }
 }

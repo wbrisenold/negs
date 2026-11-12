@@ -85,12 +85,16 @@ pub const UPSAMPLING_METHODS: [UpsamplingMethod; 3] = [
     UpsamplingMethod {
         identifier: "arctic2026beta04",
         file: "arctic2026beta04_reflectance_xy_tc.npy",
-        kind: LutKind::Reflectance { scene_illuminant: "D65" },
+        kind: LutKind::Reflectance {
+            scene_illuminant: "D65",
+        },
     },
     UpsamplingMethod {
         identifier: "mallett2019",
         file: "mallett2019_reflectance_xy_tc.npy",
-        kind: LutKind::Reflectance { scene_illuminant: "D65" },
+        kind: LutKind::Reflectance {
+            scene_illuminant: "D65",
+        },
     },
 ];
 

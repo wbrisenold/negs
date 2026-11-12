@@ -671,7 +671,8 @@ mod raw_wb_tests {
             RawWhiteBalance {
                 mode: RawWhiteBalanceMode::Custom,
                 temperature: 3200.0,
-                tint: 0.85
+                tint: 0.85,
+                ..Default::default()
             }
         );
         assert!(Cli::try_parse_from(base.into_iter().chain(["--raw-wb", "auto"])).is_err());

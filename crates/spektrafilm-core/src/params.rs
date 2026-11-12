@@ -326,7 +326,8 @@ impl HalationParams {
     }
 
     pub fn first_sigma_um(&self) -> [f64; 3] {
-        self.halation_first_sigma_um.unwrap_or(SCHEMA_HALATION_FIRST_SIGMA_UM)
+        self.halation_first_sigma_um
+            .unwrap_or(SCHEMA_HALATION_FIRST_SIGMA_UM)
     }
 }
 
@@ -407,19 +408,23 @@ impl DirCouplersParams {
     /// The gammas in effect: the values set, else the schema's.
     /// `apply_film_specific_params` fills the film's preset first.
     pub fn gamma_samelayer(&self) -> [f64; 3] {
-        self.gamma_samelayer_rgb.unwrap_or(SCHEMA_GAMMA_SAMELAYER_RGB)
+        self.gamma_samelayer_rgb
+            .unwrap_or(SCHEMA_GAMMA_SAMELAYER_RGB)
     }
 
     pub fn gamma_r_to_gb(&self) -> [f64; 2] {
-        self.gamma_interlayer_r_to_gb.unwrap_or(SCHEMA_GAMMA_INTERLAYER_R_TO_GB)
+        self.gamma_interlayer_r_to_gb
+            .unwrap_or(SCHEMA_GAMMA_INTERLAYER_R_TO_GB)
     }
 
     pub fn gamma_g_to_rb(&self) -> [f64; 2] {
-        self.gamma_interlayer_g_to_rb.unwrap_or(SCHEMA_GAMMA_INTERLAYER_G_TO_RB)
+        self.gamma_interlayer_g_to_rb
+            .unwrap_or(SCHEMA_GAMMA_INTERLAYER_G_TO_RB)
     }
 
     pub fn gamma_b_to_rg(&self) -> [f64; 2] {
-        self.gamma_interlayer_b_to_rg.unwrap_or(SCHEMA_GAMMA_INTERLAYER_B_TO_RG)
+        self.gamma_interlayer_b_to_rg
+            .unwrap_or(SCHEMA_GAMMA_INTERLAYER_B_TO_RG)
     }
 }
 
@@ -507,7 +512,14 @@ pub struct FilmBaseParams {
 
 impl Default for FilmBaseParams {
     fn default() -> Self {
-        Self { active: true, scale: 1.0, tilt: 0.0, cyan: 1.0, magenta: 1.0, yellow: 1.0 }
+        Self {
+            active: true,
+            scale: 1.0,
+            tilt: 0.0,
+            cyan: 1.0,
+            magenta: 1.0,
+            yellow: 1.0,
+        }
     }
 }
 
@@ -531,7 +543,13 @@ pub struct PrintBaseParams {
 
 impl Default for PrintBaseParams {
     fn default() -> Self {
-        Self { active: true, scale: 1.0, cyan: 1.0, magenta: 1.0, yellow: 1.0 }
+        Self {
+            active: true,
+            scale: 1.0,
+            cyan: 1.0,
+            magenta: 1.0,
+            yellow: 1.0,
+        }
     }
 }
 
@@ -543,6 +561,10 @@ pub struct FilmRenderingParams {
     /// floor-middle entry. Ignored by colour profiles.
     #[serde(default)]
     pub development_time: Option<f64>,
+    /// Keystone-style post-scan bleach amount, normalized to 0...1. The
+    /// reference control maps 0...80 to an effect amount of 0...0.8.
+    #[serde(default)]
+    pub silver_retention: f32,
     #[serde(default)]
     pub grain: GrainParams,
     #[serde(default)]
@@ -566,6 +588,7 @@ impl Default for FilmRenderingParams {
     fn default() -> Self {
         Self {
             development_time: None,
+            silver_retention: 0.0,
             grain: GrainParams::default(),
             halation: HalationParams::default(),
             dir_couplers: DirCouplersParams::default(),
@@ -665,6 +688,17 @@ pub struct IoParams {
     pub input_color_space: String,
     #[serde(default)]
     pub input_cctf_decoding: bool,
+    /// Apply the chosen scene-referred camera input rendering LUT exactly
+    /// once before the film model. This is an ODT, so exposure is placed
+    /// before it and its Rec.709 output is decoded back to linear light.
+    #[serde(default = "default_true")]
+    pub referent_logc3_enabled: bool,
+    #[serde(default = "default_referent_path")]
+    pub referent_logc3_path: String,
+    /// Set by the loader; rendered JPEG/PNG sources must not be treated as
+    /// scene-referred merely because the Referent option is enabled.
+    #[serde(default)]
+    pub input_scene_referred: bool,
     #[serde(default = "default_srgb")]
     pub output_color_space: String,
     #[serde(default = "default_true")]
@@ -707,6 +741,9 @@ impl Default for IoParams {
             input_interpretation: spektrafilm_io::InputInterpretation::default(),
             input_color_space: "ProPhoto RGB".into(),
             input_cctf_decoding: false,
+            referent_logc3_enabled: true,
+            referent_logc3_path: default_referent_path(),
+            input_scene_referred: false,
             output_color_space: "sRGB".into(),
             output_cctf_encoding: true,
             crop: false,
@@ -727,11 +764,32 @@ impl IoParams {
     /// `colour`: the engine's representation (linear sRGB, unclamped), unless
     /// the values were passed through for these fields (manual mode).
     pub fn apply_input_colour(&mut self, colour: &spektrafilm_io::InputColour) {
+        self.input_scene_referred = colour.scene_referred;
         if colour.linear_srgb {
             self.input_color_space = "sRGB".into();
             self.input_cctf_decoding = false;
         }
     }
+}
+
+fn default_referent_path() -> String {
+    const LUT_NAME: &str = "Referent_LogC3_to_Rec709.cube";
+
+    // A locally built macOS app may bundle the user's licensed LUT beside its
+    // resources. Resolve that before the standard Resolve installation path;
+    // source and CI builds remain usable without shipping this third-party LUT.
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(contents) = executable.parent().and_then(std::path::Path::parent) {
+            let bundled = contents.join("Resources/LUTs").join(LUT_NAME);
+            if bundled.is_file() {
+                return bundled.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    format!(
+        "/Library/Application Support/Blackmagic Design/DaVinci Resolve/LUT/Luma Production LUTs/Viewing and Output/Referent/{LUT_NAME}"
+    )
 }
 
 /// Params JSON (a whole params object, or one with an `io` object) from
@@ -742,13 +800,16 @@ impl IoParams {
 /// (the defaults carry it), so their saved sessions read files
 /// automatically.
 pub fn infer_input_interpretation(params: &mut serde_json::Value) {
-    let Some(io) = params.get_mut("io").and_then(|io| io.as_object_mut()) else { return };
+    let Some(io) = params.get_mut("io").and_then(|io| io.as_object_mut()) else {
+        return;
+    };
     if !io.contains_key("input_interpretation")
         && (io.contains_key("input_color_space") || io.contains_key("input_cctf_decoding"))
     {
         io.insert(
             "input_interpretation".into(),
-            serde_json::to_value(spektrafilm_io::InputInterpretation::manual()).expect("serializable"),
+            serde_json::to_value(spektrafilm_io::InputInterpretation::manual())
+                .expect("serializable"),
         );
     }
 }
@@ -1002,7 +1063,11 @@ impl RuntimeParams {
                 serde_json::Value::Null => out.push(path.to_owned()),
                 serde_json::Value::Object(map) => {
                     for (key, child) in map {
-                        let path = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
+                        let path = if path.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{path}.{key}")
+                        };
                         walk(child, &path, out);
                     }
                 }
@@ -1111,14 +1176,32 @@ mod input_interpretation_tests {
         let p = parse(json!({"io": {"input_color_space": "sRGB", "input_cctf_decoding": false}}));
         assert_eq!(p.io.input_interpretation.mode, InputMode::Manual);
         assert_eq!(p.io.input_color_space, "sRGB");
-        assert_eq!(parse(json!({"io": {"input_cctf_decoding": true}})).io.input_interpretation.mode, InputMode::Manual);
+        assert_eq!(
+            parse(json!({"io": {"input_cctf_decoding": true}}))
+                .io
+                .input_interpretation
+                .mode,
+            InputMode::Manual
+        );
     }
 
     #[test]
     fn params_without_input_fields_read_files_automatically() {
-        assert_eq!(parse(json!({})).io.input_interpretation.mode, InputMode::Auto);
-        assert_eq!(parse(json!({"io": {"scan_film": true}})).io.input_interpretation.mode, InputMode::Auto);
-        assert_eq!(RuntimeParams::default().io.input_interpretation.mode, InputMode::Auto);
+        assert_eq!(
+            parse(json!({})).io.input_interpretation.mode,
+            InputMode::Auto
+        );
+        assert_eq!(
+            parse(json!({"io": {"scan_film": true}}))
+                .io
+                .input_interpretation
+                .mode,
+            InputMode::Auto
+        );
+        assert_eq!(
+            RuntimeParams::default().io.input_interpretation.mode,
+            InputMode::Auto
+        );
     }
 
     #[test]
@@ -1130,15 +1213,21 @@ mod input_interpretation_tests {
             "input_color_space": "ProPhoto RGB", "input_cctf_decoding": false,
         }}));
         assert_eq!(p.io.input_interpretation.mode, InputMode::Auto);
-        let p = parse(json!({"io": {"input_interpretation": {"mode": "assume", "color_space": "Display P3"}}}));
-        assert_eq!(p.io.input_interpretation, spektrafilm_io::InputInterpretation::assume("Display P3", false));
+        let p = parse(
+            json!({"io": {"input_interpretation": {"mode": "assume", "color_space": "Display P3"}}}),
+        );
+        assert_eq!(
+            p.io.input_interpretation,
+            spektrafilm_io::InputInterpretation::assume("Display P3", false)
+        );
     }
 
     #[test]
     fn lens_correction_is_off_for_params_without_it() {
         let io: IoParams = serde_json::from_str("{}").unwrap();
         assert!(!io.lens_correction.enabled);
-        let io: IoParams = serde_json::from_str(r#"{"lens_correction": {"enabled": true}}"#).unwrap();
+        let io: IoParams =
+            serde_json::from_str(r#"{"lens_correction": {"enabled": true}}"#).unwrap();
         assert!(io.lens_correction.enabled);
     }
 
@@ -1146,7 +1235,10 @@ mod input_interpretation_tests {
     fn loaded_colour_sets_the_pipeline_input() {
         let mut io = IoParams::default();
         io.apply_input_colour(&spektrafilm_io::InputColour::raw("rawler"));
-        assert_eq!((io.input_color_space.as_str(), io.input_cctf_decoding), ("sRGB", false));
+        assert_eq!(
+            (io.input_color_space.as_str(), io.input_cctf_decoding),
+            ("sRGB", false)
+        );
         // Manual pass-through leaves the fields to the params.
         let dir = std::env::temp_dir().join(format!("negs-io-manual-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1161,9 +1253,16 @@ mod input_interpretation_tests {
             &spektrafilm_io::InputInterpretation::manual(),
         )
         .unwrap();
-        let mut io = IoParams { input_color_space: "ACES2065-1".into(), input_cctf_decoding: true, ..IoParams::default() };
+        let mut io = IoParams {
+            input_color_space: "ACES2065-1".into(),
+            input_cctf_decoding: true,
+            ..IoParams::default()
+        };
         io.apply_input_colour(&loaded.colour);
-        assert_eq!((io.input_color_space.as_str(), io.input_cctf_decoding), ("ACES2065-1", true));
+        assert_eq!(
+            (io.input_color_space.as_str(), io.input_cctf_decoding),
+            ("ACES2065-1", true)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -5,6 +5,7 @@ use anyhow::{Result, bail, ensure};
 use rawler::{RawImage, imgop::develop::Intermediate};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use spektrafilm_math::image::ImageBuf;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +40,28 @@ impl RawWhiteBalanceMode {
     }
 }
 
+/// Chromatic adaptation used by the temperature correction in RAW white balance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RawWhiteBalanceMethod {
+    /// CAT02 cone-response adaptation (the historical default).
+    #[default]
+    Cat02,
+    /// Direct diagonal scaling of linear CIE XYZ channels.
+    XyzScaling,
+}
+
+impl RawWhiteBalanceMethod {
+    pub const ALL: [Self; 2] = [Self::Cat02, Self::XyzScaling];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cat02 => "CAT02",
+            Self::XyzScaling => "XYZ Scaling",
+        }
+    }
+}
+
 /// Settings shared by preview and export. Inactive temperature/tint values
 /// are retained for the UI but are ignored unless the mode is Custom.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -47,6 +70,7 @@ pub struct RawWhiteBalance {
     pub mode: RawWhiteBalanceMode,
     pub temperature: f64,
     pub tint: f64,
+    pub method: RawWhiteBalanceMethod,
 }
 
 impl Default for RawWhiteBalance {
@@ -55,6 +79,7 @@ impl Default for RawWhiteBalance {
             mode: RawWhiteBalanceMode::AsShot,
             temperature: 5500.0,
             tint: 1.0,
+            method: RawWhiteBalanceMethod::default(),
         }
     }
 }
@@ -229,9 +254,16 @@ fn whitepoint(t: f64) -> [f64; 3] {
     [x / y, 1.0, (1.0 - x - y) / y]
 }
 
-fn adaptation(source: [f64; 3], target: [f64; 3]) -> Matrix {
+fn adaptation(source: [f64; 3], target: [f64; 3], method: RawWhiteBalanceMethod) -> Matrix {
     if source == target {
         return IDENTITY;
+    }
+    if method == RawWhiteBalanceMethod::XyzScaling {
+        let mut scale = IDENTITY;
+        for i in 0..3 {
+            scale[i][i] = target[i] / source[i];
+        }
+        return scale;
     }
     let s = mv(CAT02, source);
     let t = mv(CAT02, target);
@@ -242,17 +274,17 @@ fn adaptation(source: [f64; 3], target: [f64; 3]) -> Matrix {
     mm(inverse(CAT02), mm(scale, CAT02))
 }
 
-fn adjustment_matrix(temperature: f64, tint: f64) -> Matrix {
+fn adjustment_matrix(temperature: f64, tint: f64, method: RawWhiteBalanceMethod) -> Matrix {
     if temperature == 6504.0 && tint == 1.0 {
         return IDENTITY;
     }
-    let temperature_adjust = adaptation(whitepoint(temperature), whitepoint(6504.0));
+    let temperature_adjust = adaptation(whitepoint(temperature), whitepoint(6504.0), method);
     // Upstream operates in ACES2065-1 (D60). Move our linear sRGB (D65)
     // into the same space, apply its XYZ adaptation and ACES green tint,
     // then return to sRGB. colour.RGB_to_RGB defaults to CAT02 adaptation.
     let d65 = [0.3127 / 0.3290, 1.0, (1.0 - 0.3127 - 0.3290) / 0.3290];
     let d60 = [0.32168 / 0.33767, 1.0, (1.0 - 0.32168 - 0.33767) / 0.33767];
-    let to_aces_xyz = adaptation(d65, d60);
+    let to_aces_xyz = adaptation(d65, d60, method);
     let mut tint_scale = IDENTITY;
     tint_scale[1][1] = tint;
     let tint_xyz = mm(ACES_TO_XYZ, mm(tint_scale, inverse(ACES_TO_XYZ)));
@@ -267,6 +299,116 @@ fn adjustment_matrix(temperature: f64, tint: f64) -> Matrix {
         ),
     )
 }
+
+/// Temperature/tint candidate selected from the RAW-developed source using
+/// RawTherapee's spectral-reference ITCWB approach. The compact reference
+/// table is generated from its 429 measured reflectance spectra.
+#[derive(Clone, Copy, Debug)]
+pub struct ItcwbEstimate {
+    pub temperature: f64,
+    pub tint: f64,
+    pub confidence: f64,
+}
+
+const ITCWB_REFERENCES: &[u8] = include_bytes!("itcwb_reference_xy.bin");
+
+fn reference_xy() -> Vec<[f64; 2]> {
+    let count = u32::from_le_bytes(ITCWB_REFERENCES[0..4].try_into().unwrap()) as usize;
+    (0..count).map(|i| {
+        let offset = 4 + i * 8;
+        [
+            f32::from_le_bytes(ITCWB_REFERENCES[offset..offset + 4].try_into().unwrap()) as f64,
+            f32::from_le_bytes(ITCWB_REFERENCES[offset + 4..offset + 8].try_into().unwrap()) as f64,
+        ]
+    }).collect()
+}
+
+/// Estimate a RAW white balance from the linear, camera-matrix-developed RGB
+/// image. This ports ITCWB's spectral-reference/candidate-search strategy;
+/// it intentionally returns an error for low-information or near-monochrome
+/// frames instead of silently falling back to gray-world.
+pub fn estimate_itcwb(image: &ImageBuf) -> Result<ItcwbEstimate> {
+    estimate_itcwb_with_method(image, RawWhiteBalanceMethod::Cat02)
+}
+
+/// Estimate RAW white balance using the same adaptation method that will be
+/// used when the selected temperature/tint is applied to the developed image.
+pub fn estimate_itcwb_with_method(
+    image: &ImageBuf,
+    method: RawWhiteBalanceMethod,
+) -> Result<ItcwbEstimate> {
+    ensure!(image.width > 0 && image.height > 0, "ITCWB needs a non-empty image");
+    let stride = ((image.pixel_count() / 256).max(1)) * 3;
+    let mut samples = Vec::with_capacity(256);
+    for pixel in image.data.chunks_exact(3).step_by(stride / 3) {
+        let rgb = [pixel[0] as f64, pixel[1] as f64, pixel[2] as f64];
+        let y = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+        if !y.is_finite() || !(0.015..0.95).contains(&y) { continue; }
+        let max = rgb[0].max(rgb[1]).max(rgb[2]);
+        let min = rgb[0].min(rgb[1]).min(rgb[2]);
+        if max - min < y * 0.035 { continue; }
+        samples.push(rgb);
+    }
+    ensure!(samples.len() >= 12, "ITCWB found too little usable color; try a frame with more varied, well-exposed colors");
+
+    let references = reference_xy();
+    ensure!(references.len() == 429, "ITCWB spectral reference table is incomplete");
+    let score = |temperature: f64, tint: f64| -> f64 {
+        let matrix = adjustment_matrix(temperature, tint, method);
+        let mut total_error = 0.0;
+        let mut total_weight = 0.0;
+        for rgb in &samples {
+            let corrected = mv(matrix, *rgb);
+            let xyz = [
+                0.4124564 * corrected[0] + 0.3575761 * corrected[1] + 0.1804375 * corrected[2],
+                0.2126729 * corrected[0] + 0.7151522 * corrected[1] + 0.0721750 * corrected[2],
+                0.0193339 * corrected[0] + 0.1191920 * corrected[1] + 0.9503041 * corrected[2],
+            ];
+            let sum = xyz.iter().sum::<f64>();
+            if !sum.is_finite() || sum <= 1e-9 { continue; }
+            let xy = [xyz[0] / sum, xyz[1] / sum];
+            let saturation = ((max3(corrected) - min3(corrected)) / xyz[1].max(1e-6)).clamp(0.0, 2.0);
+            let weight = saturation.min(0.5) as f64;
+            if weight < 0.025 { continue; }
+            let nearest = references.iter().map(|r| {
+                let dx = xy[0] - r[0]; let dy = xy[1] - r[1]; dx * dx + dy * dy
+            }).fold(f64::INFINITY, f64::min);
+            total_error += nearest * weight;
+            total_weight += weight;
+        }
+        if total_weight == 0.0 { f64::INFINITY } else { (total_error / total_weight).sqrt() }
+    };
+
+    let mut best = (f64::INFINITY, 6504.0, 1.0);
+    for temperature in (2000..=12000).step_by(250) {
+        for tint_step in -6..=6 {
+            let tint = 1.0 + tint_step as f64 * 0.05;
+            let candidate = score(temperature as f64, tint);
+            if candidate < best.0 { best = (candidate, temperature as f64, tint); }
+        }
+    }
+    let coarse = best.0;
+    let low_t = (best.1 - 500.0).max(1667.0) as i32;
+    let high_t = (best.1 + 500.0).min(12500.0) as i32;
+    let low_g = (best.2 - 0.10).max(0.70);
+    let high_g = (best.2 + 0.10).min(1.30);
+    for temperature in (low_t..=high_t).step_by(50) {
+        for tint_step in 0..=20 {
+            let tint = low_g + (high_g - low_g) * tint_step as f64 / 20.0;
+            let candidate = score(temperature as f64, tint);
+            if candidate < best.0 { best = (candidate, temperature as f64, tint); }
+        }
+    }
+    ensure!(best.0.is_finite(), "ITCWB could not find a reliable color match");
+    Ok(ItcwbEstimate {
+        temperature: best.1,
+        tint: best.2,
+        confidence: (1.0 - best.0 / coarse.max(1e-6)).clamp(0.0, 1.0),
+    })
+}
+
+fn max3(v: [f64; 3]) -> f64 { v[0].max(v[1]).max(v[2]) }
+fn min3(v: [f64; 3]) -> f64 { v[0].min(v[1]).min(v[2]) }
 
 /// Apply the corrected upstream post-development WB before the loader's
 /// final negative clamp. A monochrome sensor has no chromatic balance.
@@ -284,7 +426,7 @@ pub(crate) fn finish(
     if temperature == 6504.0 && tint == 1.0 {
         return Ok(());
     }
-    let matrix = adjustment_matrix(temperature, tint);
+    let matrix = adjustment_matrix(temperature, tint, settings.method);
     match image {
         Intermediate::ThreeColor(pixels) => pixels.data.par_iter_mut().for_each(|p| {
             *p = mv(matrix, p.map(f64::from)).map(|v| v as f32);
@@ -311,7 +453,7 @@ pub(crate) fn finish_rgb(
     if temperature == 6504.0 && tint == 1.0 {
         return Ok(());
     }
-    let matrix = adjustment_matrix(temperature, tint);
+    let matrix = adjustment_matrix(temperature, tint, settings.method);
     rgb.par_chunks_exact_mut(3).for_each(|p| {
         let out = mv(matrix, [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]);
         for (v, result) in p.iter_mut().zip(out) {
@@ -324,6 +466,23 @@ pub(crate) fn finish_rgb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xyz_scaling_is_a_direct_diagonal_transform_in_xyz() {
+        let source = [0.96422, 1.0, 0.82521];
+        let target = [0.95047, 1.0, 1.08883];
+        let matrix = adaptation(source, target, RawWhiteBalanceMethod::XyzScaling);
+        for channel in 0..3 {
+            assert!((matrix[channel][channel] - target[channel] / source[channel]).abs() < 1e-12);
+            for other in 0..3 {
+                if other != channel { assert_eq!(matrix[channel][other], 0.0); }
+            }
+        }
+        let mapped_white = mv(matrix, source);
+        for (actual, expected) in mapped_white.into_iter().zip(target) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+    }
 
     #[test]
     fn modes_and_validation() {
@@ -386,7 +545,7 @@ mod tests {
         }
         // sRGB -> ACES; upstream's Von Kries/CAT02 XYZ adaptation
         // (3200 -> 6504 K); ACES green * .85; ACES -> sRGB.
-        let matrix = adjustment_matrix(3200.0, 0.85);
+        let matrix = adjustment_matrix(3200.0, 0.85, RawWhiteBalanceMethod::Cat02);
         for (input, expected) in [
             ([0.12, 0.18, 0.09], [0.05512882, 0.16371677, 0.25686877]),
             ([0.25, 0.05, 0.14], [0.19382519, 0.04054611, 0.35510906]),
@@ -397,8 +556,8 @@ mod tests {
                 assert!((a - b).abs() < 3e-5, "{a} != {b}");
             }
         }
-        assert_eq!(adjustment_matrix(6504.0, 1.0), IDENTITY);
-        let warm = mv(adjustment_matrix(2850.0, 1.0), [0.2; 3]);
+        assert_eq!(adjustment_matrix(6504.0, 1.0, RawWhiteBalanceMethod::Cat02), IDENTITY);
+        let warm = mv(adjustment_matrix(2850.0, 1.0, RawWhiteBalanceMethod::Cat02), [0.2; 3]);
         assert!(warm[2] > warm[0]); // tungsten WB cools a daylight image
     }
 }

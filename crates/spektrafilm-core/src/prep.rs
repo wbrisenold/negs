@@ -26,7 +26,8 @@ pub struct PrepParams {
     /// Absolute scene placement after camera metering/EV, before recovered
     /// controls. Unlike camera EV, this is excluded from print compensation.
     pub exposure_ev: f32,
-    /// Scene-wide RAW-style tone lift before the film, from 0 (off) to 100.
+    /// Scene-wide RAW-style tone change before the film, from -100 (darker)
+    /// through 0 (off) to 100 (shadow lift).
     pub global_tone: f32,
     pub highlights: f32,
     pub shadows: f32,
@@ -83,15 +84,20 @@ impl PrepParams {
     /// path folds into its front pass with the camera's exposure instead of
     /// preparing the frame on the CPU.
     pub fn is_exposure_only(&self) -> bool {
-        self.exposure_ev != 0.0 && (PrepParams { exposure_ev: 0.0, ..*self }).is_identity()
+        self.exposure_ev != 0.0
+            && (PrepParams {
+                exposure_ev: 0.0,
+                ..*self
+            })
+            .is_identity()
     }
 
     pub fn validate(&self) -> Result<(), String> {
         if !self.exposure_ev.is_finite() || !(-3.0..=3.0).contains(&self.exposure_ev) {
             return Err("Invalid Prep exposure_ev; expected a finite value from -3 to 3".into());
         }
-        if !self.global_tone.is_finite() || !(0.0..=100.0).contains(&self.global_tone) {
-            return Err("Invalid Prep global_tone; expected a finite value from 0 to 100".into());
+        if !self.global_tone.is_finite() || !(-100.0..=100.0).contains(&self.global_tone) {
+            return Err("Invalid Prep global_tone; expected a finite value from -100 to 100".into());
         }
         for (name, value, min) in [
             ("highlights", self.highlights, -180.),
@@ -126,7 +132,11 @@ pub struct PreparedKey {
 }
 
 impl PreparedKey {
-    pub fn new(image: &ImageBuf, params: &crate::params::RuntimeParams, autoexposure_ev: f64) -> Self {
+    pub fn new(
+        image: &ImageBuf,
+        params: &crate::params::RuntimeParams,
+        autoexposure_ev: f64,
+    ) -> Self {
         let p = &params.prep;
         Self {
             size: (image.width, image.height),
@@ -135,8 +145,16 @@ impl PreparedKey {
             autoexposure_ev: autoexposure_ev.to_bits(),
             exposure_compensation_ev: params.camera.exposure_compensation_ev.to_bits(),
             prep: [
-                p.exposure_ev, p.global_tone, p.highlights, p.shadows, p.contrast, p.lift, p.gain,
-                p.color_boost, p.saturation, p.midtone_detail,
+                p.exposure_ev,
+                p.global_tone,
+                p.highlights,
+                p.shadows,
+                p.contrast,
+                p.lift,
+                p.gain,
+                p.color_boost,
+                p.saturation,
+                p.midtone_detail,
             ]
             .map(f32::to_bits),
         }
@@ -161,11 +179,19 @@ impl PreparedFrame {
     /// replaces it.
     pub(crate) fn take(&self, key: &PreparedKey) -> Option<(std::sync::Arc<ImageBuf>, u64)> {
         let mut slot = self.0.lock().unwrap();
-        slot.take().filter(|(kept, ..)| kept == key).map(|(_, image, upload)| (image, upload))
+        slot.take()
+            .filter(|(kept, ..)| kept == key)
+            .map(|(_, image, upload)| (image, upload))
     }
     /// Keep `image`, under the image key `take` gave for it or a new one.
-    pub(crate) fn put(&self, key: PreparedKey, image: std::sync::Arc<ImageBuf>, upload: Option<u64>) -> u64 {
-        let upload = upload.unwrap_or_else(|| UPLOAD_KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    pub(crate) fn put(
+        &self,
+        key: PreparedKey,
+        image: std::sync::Arc<ImageBuf>,
+        upload: Option<u64>,
+    ) -> u64 {
+        let upload = upload
+            .unwrap_or_else(|| UPLOAD_KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         *self.0.lock().unwrap() = Some((key, image, upload));
         upload
     }
@@ -309,6 +335,11 @@ fn core(
     if s.global_tone > 0.0 {
         let boost = s.global_tone / 100.0 * 2.0;
         mapped = mapped * (1.0 + boost) / (mapped + boost);
+    } else if s.global_tone < 0.0 {
+        // The positive Resolve-style curve lifts shadows and anchors white.
+        // Its negative counterpart lowers the whole tone level, including
+        // highlights, so the control has usable travel in both directions.
+        mapped *= 2.0f32.powf(s.global_tone / 50.0);
     }
     let ratio = if base.abs() > 0.00001 {
         (mapped / base).clamp(1., 4.)
@@ -443,7 +474,10 @@ mod tests {
         assert_eq!(ok.highlights, -180.0);
         assert!(serde_json::from_str::<PrepParams>(r#"{"gain": 101}"#).is_err());
         assert!(serde_json::from_str::<PrepParams>(r#"{"exposure_ev": 3.5}"#).is_err());
-        assert!(serde_json::from_str::<crate::params::RuntimeParams>(r#"{"prep": {"lift": -101}}"#).is_err());
+        assert!(
+            serde_json::from_str::<crate::params::RuntimeParams>(r#"{"prep": {"lift": -101}}"#)
+                .is_err()
+        );
     }
 
     #[test]
@@ -516,6 +550,7 @@ mod tests {
         ];
         for (p, expected) in cases {
             let s = Settings {
+                global_tone: 0.0,
                 highlights: p[0],
                 shadows: p[1],
                 boost: p[2],

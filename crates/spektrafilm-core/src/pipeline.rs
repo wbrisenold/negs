@@ -8,7 +8,7 @@
 use std::path::Path;
 use web_time::Instant;
 
-
+use rayon::prelude::*;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_io::image_size::SizeError;
 use spektrafilm_math::image::ImageBuf;
@@ -22,7 +22,11 @@ use spektrafilm_math::spectral::TcLut;
 /// same as when the scan clipped.
 pub fn display_range(encoded: bool) -> (Scalar, Scalar) {
     let one = from_f64(1.0);
-    let white = if encoded { spektrafilm_math::precision::srgb_encode(one) } else { one };
+    let white = if encoded {
+        spektrafilm_math::precision::srgb_encode(one)
+    } else {
+        one
+    };
     (from_f64(0.0), white)
 }
 
@@ -37,7 +41,10 @@ pub fn display_range(encoded: bool) -> (Scalar, Scalar) {
 pub fn clip_to_display(image: &mut ImageBuf, encoded: bool) {
     use rayon::prelude::*;
     let (lo, hi) = display_range(encoded);
-    image.data.par_iter_mut().for_each(|v| *v = if v.is_nan() { lo } else { v.clamp(lo, hi) });
+    image
+        .data
+        .par_iter_mut()
+        .for_each(|v| *v = if v.is_nan() { lo } else { v.clamp(lo, hi) });
 }
 
 /// Diagnostic helper: when env var `$var` is set, dump the image's f64
@@ -324,7 +331,8 @@ impl Pipeline {
         if !self.params.camera.auto_exposure {
             return 0.0;
         }
-        static CPU: spektrafilm_gpu::cpu_backend::CpuBackend = spektrafilm_gpu::cpu_backend::CpuBackend;
+        static CPU: spektrafilm_gpu::cpu_backend::CpuBackend =
+            spektrafilm_gpu::cpu_backend::CpuBackend;
         let raw = stages::filming::encoded_rgb_to_film_raw(
             preview,
             &self.params,
@@ -383,18 +391,25 @@ impl Pipeline {
         }
         let log_exposure = &self.film.data.log_exposure;
         let positive = self.film.is_positive();
-        let result =
-            crate::print_morph::morph_density_curves_with_layers(log_exposure, model, &morph, positive)
-                .or_else(|e| {
-                    tracing::error!(error = %e, "film-curve morph failed; using the fitted curves");
-                    let inactive = crate::params::CurvesMorphParams { active: false, ..morph.clone() };
-                    crate::print_morph::morph_density_curves_with_layers(
-                        log_exposure,
-                        model,
-                        &inactive,
-                        positive,
-                    )
-                });
+        let result = crate::print_morph::morph_density_curves_with_layers(
+            log_exposure,
+            model,
+            &morph,
+            positive,
+        )
+        .or_else(|e| {
+            tracing::error!(error = %e, "film-curve morph failed; using the fitted curves");
+            let inactive = crate::params::CurvesMorphParams {
+                active: false,
+                ..morph.clone()
+            };
+            crate::print_morph::morph_density_curves_with_layers(
+                log_exposure,
+                model,
+                &inactive,
+                positive,
+            )
+        });
         match result {
             Ok((total, layers)) => {
                 let n_layers = model.n_layers();
@@ -591,8 +606,9 @@ impl Pipeline {
             }
             spectral_service::LutKind::Reflectance { scene_illuminant } => {
                 front_illuminant = scene_illuminant.into();
-                let scene_xy =
-                    spektrafilm_math::spectral::illuminant_to_xy(&select_illuminant(scene_illuminant));
+                let scene_xy = spektrafilm_math::spectral::illuminant_to_xy(&select_illuminant(
+                    scene_illuminant,
+                ));
                 let tc_lut = spectral_service::compute_reflectance_tc_lut(
                     &spectra_lut,
                     &sensitivity,
@@ -800,6 +816,7 @@ impl Pipeline {
     /// The post adjustments, last, on the scanned photograph, clipped to
     /// what a display holds first.
     fn apply_post(&self, mut image: ImageBuf) -> ImageBuf {
+        self.apply_silver_retention(&mut image);
         let post = &self.params.post;
         if !post.is_identity() {
             clip_to_display(&mut image, self.params.io.output_cctf_encoding);
@@ -811,6 +828,50 @@ impl Pipeline {
             .apply(&mut image);
         }
         image
+    }
+
+    /// Keystone's Color / Bleach stage runs after its Referent output transform.
+    /// Apply the same display-referred operation after Negs' scan/output transform:
+    /// partial desaturation, then a luminance-dependent multiply/screen blend.
+    fn apply_silver_retention(&self, image: &mut ImageBuf) {
+        let strength = self.params.film_render.silver_retention.clamp(0.0, 1.0) as f64;
+        if strength <= 0.0 || !self.film.is_film() || self.film.is_positive() || self.film.is_bw() {
+            return;
+        }
+
+        // Keystone's control tops out at 80, which maps to an effect amount of
+        // 0.8. Negs stores the existing control as a normalized 0...1 value.
+        let amount = strength * 0.8;
+        let encoded = self.params.io.output_cctf_encoding;
+        let output_space = &self.params.io.output_color_space;
+        clip_to_display(image, encoded);
+        crate::stages::scanning::convert_output(image, output_space, "sRGB", encoded);
+
+        let srgb = spektrafilm_math::colorspace::RgbColourspace::output("sRGB").cctf;
+        image.data.par_chunks_exact_mut(3).for_each(|px| {
+            // Keystone's reference operator expects a Rec.709 / Gamma 2.4
+            // display signal. Rec.709 and sRGB share primaries, so convert the
+            // scanned sRGB signal through linear light to that exact working
+            // transfer before applying the recovered formula.
+            let linear = [0, 1, 2].map(|i| {
+                let v = px[i] as f64;
+                if encoded { srgb.decode(v) } else { v }
+            });
+            let display = linear.map(|v| v.max(0.0).powf(1.0 / 2.4));
+            let luma: f64 = 0.2126 * display[0] + 0.7152 * display[1] + 0.0722 * display[2];
+            let base = display.map(|v| v + ((luma - v) * (0.5 * amount)));
+            let overlay = ((luma - 0.45) * 10.0).clamp(0.0, 1.0);
+            for i in 0..3 {
+                let multiply = base[i] * (2.0 * luma);
+                let screen = 1.0 - (1.0 - base[i]) * (2.0 * (1.0 - luma));
+                let bypass = multiply + (screen - multiply) * overlay;
+                let result = display[i] + (bypass - display[i]) * amount;
+                let linear = result.max(0.0).powf(2.4);
+                px[i] = from_f64(if encoded { srgb.encode(linear) } else { linear });
+            }
+        });
+
+        crate::stages::scanning::convert_output(image, "sRGB", output_space, encoded);
     }
 
     /// Everything up to and including the scan, without the post adjustments.
@@ -831,20 +892,9 @@ impl Pipeline {
         let autoexposure_ev = self.frame_autoexposure_ev(&image);
         print_stage_timing(stage_timings, "autoexposure", t);
         let t = Instant::now();
-        let image = self.rescale_working(image)?;
+        let mut image = self.rescale_working(image)?;
         print_stage_timing(stage_timings, "rescale", t);
-        static CPU: spektrafilm_gpu::cpu_backend::CpuBackend = spektrafilm_gpu::cpu_backend::CpuBackend;
-        let mut backend = backend;
-        if let Err(reason) = backend.image_capacity(image.width, image.height) {
-            tracing::warn!(%reason, "GPU capacity exceeded; rendering on CPU");
-            backend = &CPU;
-        }
-        tracing::info!(backend = backend.name(), "pipeline: start");
-
-        // Scanner B&W/slide exposure correction (no-op unless scanner
-        // white/black correction is on for a slide or print scan). Computed
-        // up front so both the GPU-resident and per-stage paths share it.
-        let t = Instant::now();
+        let render_params = self.params.clone();
         let color_ref = crate::color_reference::ColorReference::compute(
             &self.film,
             &self.print,
@@ -853,7 +903,29 @@ impl Pipeline {
             self.print_exposure_factor,
             self.preflash_raw,
         );
-        print_stage_timing(stage_timings, "color_reference", t);
+        let referent_active = render_params.io.referent_logc3_enabled
+            && render_params.io.input_scene_referred;
+        if referent_active {
+            let lut = crate::referent::load_cube(std::path::Path::new(
+                &render_params.io.referent_logc3_path,
+            ))
+            .map_err(spektrafilm_io::image_size::SizeError::InvalidInputTransform)?;
+            // Use the same exposed scene values to select Referent's color
+            // mapping, but remove its display tone curve before the film model.
+            let ev = autoexposure_ev
+                + render_params.camera.exposure_compensation_ev as f64
+                + render_params.prep.exposure_ev as f64
+                + color_ref.filming_exposure_correction.max(f64::MIN_POSITIVE).log2();
+            image = crate::referent::apply_color_only(&image, &lut, ev);
+        }
+        static CPU: spektrafilm_gpu::cpu_backend::CpuBackend =
+            spektrafilm_gpu::cpu_backend::CpuBackend;
+        let mut backend = backend;
+        if let Err(reason) = backend.image_capacity(image.width, image.height) {
+            tracing::warn!(%reason, "GPU capacity exceeded; rendering on CPU");
+            backend = &CPU;
+        }
+        tracing::info!(backend = backend.name(), "pipeline: start");
 
         // GPU fast path: dispatch the whole filming→printing→scanning chain
         // (or filming→scanning when scan_film) as a single GPU command
@@ -861,8 +933,9 @@ impl Pipeline {
         // extended resident chain, including camera/scanner lens blur,
         // highlight boost, and enlarger diffusion. Backends that do not
         // implement the resident chain return `None` and fall through.
-        if self.tc_lut.is_some() {
-            let run = |params: &spektrafilm_gpu::FilmChainParams<'_>| backend.try_run_film_chain(params);
+        if self.tc_lut.is_some() && !referent_active {
+            let run =
+                |params: &spektrafilm_gpu::FilmChainParams<'_>| backend.try_run_film_chain(params);
             match self.try_gpu_resident(&image, None, backend, &color_ref, autoexposure_ev, run) {
                 Ok(Some(out)) => {
                     tracing::info!("pipeline: gpu-resident fast path complete");
@@ -882,7 +955,7 @@ impl Pipeline {
         let log_raw = stages::filming::expose(
             image,
             &self.film,
-            &self.params,
+            &render_params,
             backend,
             self.tc_lut.as_ref(),
             &select_illuminant(&self.front_illuminant),
@@ -892,7 +965,7 @@ impl Pipeline {
         print_stage_timing(stage_timings, "filming_expose", t);
         dump_if_env("SPEKTRAFILM_DUMP_FILM_LOG_RAW", &log_raw);
         let t = Instant::now();
-        let filmed = stages::filming::develop(log_raw, &self.film, &self.params, backend);
+        let filmed = stages::filming::develop(log_raw, &self.film, &render_params, backend);
         print_stage_timing(stage_timings, "filming_develop", t);
         tracing::info!("pipeline: filming complete");
         dump_if_env("SPEKTRAFILM_DUMP_FILM_DENSITY", &filmed);
@@ -902,7 +975,7 @@ impl Pipeline {
             let result = stages::scanning::process(
                 filmed,
                 &self.film,
-                &self.params,
+                &render_params,
                 backend,
                 &color_ref,
                 &self.output_gamut,
@@ -916,7 +989,7 @@ impl Pipeline {
                 filmed,
                 &self.film,
                 &self.print,
-                &self.params,
+                &render_params,
                 backend,
                 &self.print_illuminant,
                 self.print_exposure_factor,
@@ -930,7 +1003,7 @@ impl Pipeline {
             let result = stages::scanning::process(
                 printed,
                 &self.print,
-                &self.params,
+                &render_params,
                 backend,
                 &color_ref,
                 &self.output_gamut,
@@ -948,7 +1021,8 @@ impl Pipeline {
     /// ([`crate::tone_curve`]), so the params should be per-pixel; auto
     /// exposure isn't applied.
     pub fn process_taps(&self, image: ImageBuf) -> (ImageBuf, Option<ImageBuf>, ImageBuf) {
-        static CPU: spektrafilm_gpu::cpu_backend::CpuBackend = spektrafilm_gpu::cpu_backend::CpuBackend;
+        static CPU: spektrafilm_gpu::cpu_backend::CpuBackend =
+            spektrafilm_gpu::cpu_backend::CpuBackend;
         let backend: &dyn ComputeBackend = &CPU;
         let color_ref = crate::color_reference::ColorReference::compute(
             &self.film,
@@ -958,34 +1032,65 @@ impl Pipeline {
             self.print_exposure_factor,
             self.preflash_raw,
         );
+        let render_params = self.params.clone();
+        let image = if render_params.io.referent_logc3_enabled
+            && render_params.io.input_scene_referred
+        {
+            if let Ok(lut) = crate::referent::load_cube(std::path::Path::new(
+                &render_params.io.referent_logc3_path,
+            )) {
+                let ev = render_params.camera.exposure_compensation_ev as f64
+                    + render_params.prep.exposure_ev as f64
+                    + color_ref.filming_exposure_correction.max(f64::MIN_POSITIVE).log2();
+                crate::referent::apply_color_only(&image, &lut, ev)
+            } else {
+                image
+            }
+        } else {
+            image
+        };
         let log_film = stages::filming::expose(
             image,
             &self.film,
-            &self.params,
+            &render_params,
             backend,
             self.tc_lut.as_ref(),
             &select_illuminant(&self.front_illuminant),
             color_ref.filming_exposure_correction,
             0.0,
         );
-        let filmed = stages::filming::develop(log_film.clone(), &self.film, &self.params, backend);
-        if self.params.io.scan_film {
-            let scan = stages::scanning::process(filmed, &self.film, &self.params, backend, &color_ref, &self.output_gamut);
+        let filmed = stages::filming::develop(log_film.clone(), &self.film, &render_params, backend);
+        if render_params.io.scan_film {
+            let scan = stages::scanning::process(
+                filmed,
+                &self.film,
+                &render_params,
+                backend,
+                &color_ref,
+                &self.output_gamut,
+            );
             return (log_film, None, scan);
         }
         let log_paper = stages::printing::expose_calibrated(
             filmed,
             &self.film,
             &self.print,
-            &self.params,
+            &render_params,
             backend,
             &self.print_illuminant,
             self.print_exposure_factor,
             self.preflash_raw,
             color_ref.printing_exposure_correction,
         );
-        let printed = stages::printing::develop(&log_paper, &self.print, &self.params, backend);
-        let scan = stages::scanning::process(printed, &self.print, &self.params, backend, &color_ref, &self.output_gamut);
+        let printed = stages::printing::develop(&log_paper, &self.print, &render_params, backend);
+        let scan = stages::scanning::process(
+            printed,
+            &self.print,
+            &render_params,
+            backend,
+            &color_ref,
+            &self.output_gamut,
+        );
         (log_film, Some(log_paper), scan)
     }
 
@@ -994,7 +1099,8 @@ impl Pipeline {
     /// the auto-exposure EV metered on it (0 with auto exposure off), as
     /// [`Self::autoexposure_ev`] meters it. On the CPU.
     pub fn metering_film_raw(&self, preview: &ImageBuf) -> (ImageBuf, f64) {
-        static CPU: spektrafilm_gpu::cpu_backend::CpuBackend = spektrafilm_gpu::cpu_backend::CpuBackend;
+        static CPU: spektrafilm_gpu::cpu_backend::CpuBackend =
+            spektrafilm_gpu::cpu_backend::CpuBackend;
         let raw = stages::filming::encoded_rgb_to_film_raw(
             preview,
             &self.params,
@@ -1004,7 +1110,11 @@ impl Pipeline {
         )
         .unwrap_or_else(|| preview.clone());
         let ev = if self.params.camera.auto_exposure {
-            stages::filming::measure_raw_autoexposure_ev(&raw, &self.params.camera.auto_exposure_method, 1.0)
+            stages::filming::measure_raw_autoexposure_ev(
+                &raw,
+                &self.params.camera.auto_exposure_method,
+                1.0,
+            )
         } else {
             0.0
         };
@@ -1016,8 +1126,13 @@ impl Pipeline {
     /// histogram when Prep reshapes the tones (more than its uniform
     /// exposure), so [`Self::metering_film_raw`]'s stops can't simply be
     /// shifted. `autoexposure_ev` is the EV metered before Prep. On the CPU.
-    pub fn metering_film_raw_prepared(&self, preview: &ImageBuf, autoexposure_ev: f64) -> Result<ImageBuf, String> {
-        static CPU: spektrafilm_gpu::cpu_backend::CpuBackend = spektrafilm_gpu::cpu_backend::CpuBackend;
+    pub fn metering_film_raw_prepared(
+        &self,
+        preview: &ImageBuf,
+        autoexposure_ev: f64,
+    ) -> Result<ImageBuf, String> {
+        static CPU: spektrafilm_gpu::cpu_backend::CpuBackend =
+            spektrafilm_gpu::cpu_backend::CpuBackend;
         let rgb = stages::filming::prepare_input(preview.clone(), &self.params, autoexposure_ev)?;
         Ok(stages::filming::rgb_to_film_raw(
             &rgb,
@@ -1039,7 +1154,8 @@ impl Pipeline {
         image: &ImageBuf,
         backend: &dyn ComputeBackend,
     ) -> Option<ImageBuf> {
-        let run = |params: &spektrafilm_gpu::FilmChainParams<'_>| backend.try_run_film_chain(params);
+        let run =
+            |params: &spektrafilm_gpu::FilmChainParams<'_>| backend.try_run_film_chain(params);
         let out = self.borrowed_resident(image, None, backend, run)?;
         let out = self.finish_resident(out, backend);
         Some(self.apply_post(out))
@@ -1059,8 +1175,9 @@ impl Pipeline {
         output: spektrafilm_gpu::ChainOutput,
         on_mapped: Box<dyn FnOnce() + Send>,
     ) -> Option<Box<dyn spektrafilm_gpu::PendingFilmChain>> {
-        let submit =
-            |params: &spektrafilm_gpu::FilmChainParams<'_>| backend.submit_film_chain(params, output, on_mapped);
+        let submit = |params: &spektrafilm_gpu::FilmChainParams<'_>| {
+            backend.submit_film_chain(params, output, on_mapped)
+        };
         self.borrowed_resident(image, image_key, backend, submit)
     }
 
@@ -1072,9 +1189,9 @@ impl Pipeline {
         backend: &dyn ComputeBackend,
     ) -> spektrafilm_gpu::ChainResult {
         match pending.finish() {
-            spektrafilm_gpu::ChainResult::Scan(out) => {
-                spektrafilm_gpu::ChainResult::Scan(self.apply_post(self.finish_resident(out, backend)))
-            }
+            spektrafilm_gpu::ChainResult::Scan(out) => spektrafilm_gpu::ChainResult::Scan(
+                self.apply_post(self.finish_resident(out, backend)),
+            ),
             display => display,
         }
     }
@@ -1084,9 +1201,12 @@ impl Pipeline {
     /// is what `preview::display_rgba` makes of the finished, post-adjusted
     /// scan: an sRGB output, encoded on the GPU if at all.
     pub fn display_on_gpu(&self, backend: &dyn ComputeBackend) -> bool {
-        let output = spektrafilm_math::colorspace::RgbColourspace::output(&self.params.io.output_color_space);
+        let output = spektrafilm_math::colorspace::RgbColourspace::output(
+            &self.params.io.output_color_space,
+        );
         backend.resident_chain_applies_post_scan()
             && output.name == spektrafilm_math::colorspace::SRGB.name
+            && self.params.film_render.silver_retention == 0.0
             && (!self.params.io.output_cctf_encoding || self.gpu_encodes_output())
     }
 
@@ -1095,8 +1215,12 @@ impl Pipeline {
     pub fn display_post(&self) -> Option<spektrafilm_gpu::DisplayPost> {
         let post = &self.params.post;
         (!post.is_identity()).then(|| {
-            crate::post::PostProcess::new(post, self.params.io.output_cctf_encoding, &self.params.io.output_color_space)
-                .display()
+            crate::post::PostProcess::new(
+                post,
+                self.params.io.output_cctf_encoding,
+                &self.params.io.output_color_space,
+            )
+            .display()
         })
     }
 
@@ -1126,7 +1250,8 @@ impl Pipeline {
             self.preflash_raw,
         );
         let autoexposure_ev = self.frame_autoexposure_ev(image);
-        self.try_gpu_resident(image, image_key, backend, &color_ref, autoexposure_ev, run).ok()?
+        self.try_gpu_resident(image, image_key, backend, &color_ref, autoexposure_ev, run)
+            .ok()?
     }
 
     /// Resize the working image to the requested size, mirroring Python's
@@ -1164,14 +1289,22 @@ impl Pipeline {
         // Other Prep changes the upload, including through its whole-frame spatial base.
         // A source-image cache key cannot identify these newly prepared pixels;
         // a kept prepared frame has its own, so a Lab edit doesn't upload it again.
-        let mut image_key = image_key.filter(|_| !self.params.io.input_cctf_decoding && !prep_active);
+        let mut image_key =
+            image_key.filter(|_| !self.params.io.input_cctf_decoding && !prep_active);
         let image = if prep_active {
             let key = crate::prep::PreparedKey::new(image, &self.params, autoexposure_ev);
-            let cached = self.prepared_frame.as_ref().and_then(|frame| frame.take(&key));
+            let cached = self
+                .prepared_frame
+                .as_ref()
+                .and_then(|frame| frame.take(&key));
             let upload = cached.as_ref().map(|(_, upload)| *upload);
             prepared = match cached {
                 Some((image, _)) => image,
-                None => std::sync::Arc::new(stages::filming::prepare_input_from(image, &self.params, autoexposure_ev)?),
+                None => std::sync::Arc::new(stages::filming::prepare_input_from(
+                    image,
+                    &self.params,
+                    autoexposure_ev,
+                )?),
             };
             if let Some(frame) = &self.prepared_frame {
                 image_key = Some(frame.put(key, prepared.clone(), upload));
@@ -1201,7 +1334,8 @@ impl Pipeline {
                 exposure_scale_f64 *= autoexposure_ev.exp2();
             }
             if self.params.camera.exposure_compensation_ev != 0.0 {
-                exposure_scale_f64 *= 2.0f64.powf(self.params.camera.exposure_compensation_ev as f64);
+                exposure_scale_f64 *=
+                    2.0f64.powf(self.params.camera.exposure_compensation_ev as f64);
             }
             if fold_prep_exposure {
                 exposure_scale_f64 *= (self.params.prep.exposure_ev as f64).exp2();
@@ -1226,7 +1360,9 @@ impl Pipeline {
         // Front pass: TC LUT lookup, with the same exposure fold as the CPU
         // `expose` dispatch.
         let front = {
-            let Some(tc_lut) = self.tc_lut.as_ref() else { return Ok(None) };
+            let Some(tc_lut) = self.tc_lut.as_ref() else {
+                return Ok(None);
+            };
             let ref_illuminant = select_illuminant(&self.front_illuminant);
             let mut rgb_to_adapted = spektrafilm_math::spectral::build_rgb_to_adapted_xyz(
                 &self.params.io.input_color_space,
@@ -1237,7 +1373,8 @@ impl Pipeline {
             spektrafilm_gpu::FrontPass::Hanatos2025 {
                 tc_lut,
                 rgb_to_adapted_xyz: rgb_to_adapted,
-                guard: self.params.settings.spectral_boundary == crate::params::SpectralBoundary::Guard,
+                guard: self.params.settings.spectral_boundary
+                    == crate::params::SpectralBoundary::Guard,
             }
         };
 
@@ -1326,8 +1463,7 @@ impl Pipeline {
         // The illuminant, normalization and white come from the f64 tables, as
         // in the CPU scan; the GPU rounds them, and the CMFs, to f32 once.
         let viewing_illu =
-            select_illuminant_f64(&scan_profile.info.viewing_illuminant)
-                .into_owned();
+            select_illuminant_f64(&scan_profile.info.viewing_illuminant).into_owned();
         let n_wl = if self.params.io.scan_film {
             film_channel_density.len()
         } else {
@@ -1645,7 +1781,9 @@ mod tests {
     /// bit for bit, so integer exports don't change with the unclipped scan.
     #[test]
     fn display_clip_of_encoded_matches_clipping_before_encoding() {
-        let values = [-0.3, -1e-7, 0.0, 1e-4, 0.0031308, 0.5, 0.99999, 1.0, 1.0000001, 1.5, 40.0];
+        let values = [
+            -0.3, -1e-7, 0.0, 1e-4, 0.0031308, 0.5, 0.99999, 1.0, 1.0000001, 1.5, 40.0,
+        ];
         let data = values.iter().flat_map(|&v| [from_f64(v); 3]).collect();
         let image = ImageBuf::from_data(values.len() as u32, 1, data);
         let before: Vec<Scalar> = image
@@ -1659,6 +1797,12 @@ mod tests {
         assert_eq!(encoded.data, before);
         let mut linear = image.clone();
         clip_to_display(&mut linear, false);
-        assert!(linear.data.iter().zip(&image.data).all(|(c, v)| *c == v.clamp(from_f64(0.0), from_f64(1.0))));
+        assert!(
+            linear
+                .data
+                .iter()
+                .zip(&image.data)
+                .all(|(c, v)| *c == v.clamp(from_f64(0.0), from_f64(1.0)))
+        );
     }
 }

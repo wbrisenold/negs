@@ -194,16 +194,18 @@ pub(super) fn base_luma(
     let (mut b, mut a) = (b?, a?);
     drop(square);
     drop(small);
-    a.par_chunks_mut(16384).zip(b.par_chunks_mut(16384)).try_for_each(|(aa, bb)| {
-        cancelled(cancel)?;
-        for (a, b) in aa.iter_mut().zip(bb) {
-            // Variance(...,true) selects varianceClampedNegativeKernel.
-            let variance = (*a - *b * *b).max(0.0);
-            *a = variance / (variance + 0.01).max(0.0001);
-            *b = *b - *a * *b;
-        }
-        Ok::<_, String>(())
-    })?;
+    a.par_chunks_mut(16384)
+        .zip(b.par_chunks_mut(16384))
+        .try_for_each(|(aa, bb)| {
+            cancelled(cancel)?;
+            for (a, b) in aa.iter_mut().zip(bb) {
+                // Variance(...,true) selects varianceClampedNegativeKernel.
+                let variance = (*a - *b * *b).max(0.0);
+                *a = variance / (variance + 0.01).max(0.0001);
+                *b = *b - *a * *b;
+            }
+            Ok::<_, String>(())
+        })?;
     let (mean_a, mean_b) = rayon::join(
         || box_mean(&a, lw, lh, radius, cancel),
         || box_mean(&b, lw, lh, radius, cancel),

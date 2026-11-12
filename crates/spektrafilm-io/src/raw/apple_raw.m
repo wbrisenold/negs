@@ -46,7 +46,7 @@ static NSArray<CIRAWDecoderVersion> *decoder_versions(int major) {
 // caller can correct it in sensor coordinates first and orient it afterwards.
 // `decoder_major` (9 or 8) selects that Core Image decoder generation.
 int sf_apple_raw_decode(const char *path, int decoder_major, int orient, int as_shot,
-                        int lens_correction, int defer_orientation, SFAppleRaw *out) {
+                        int lens_correction, int defer_orientation, float decode_scale, SFAppleRaw *out) {
     @autoreleasepool {
         @try {
             NSURL *url = CFBridgingRelease(CFURLCreateFromFileSystemRepresentation(
@@ -72,7 +72,7 @@ int sf_apple_raw_decode(const char *path, int decoder_major, int orient, int as_
             if (![raw.decoderVersion isEqualToString:selected])
                 return fail(out, 1, @"Apple RAW did not accept the requested decoder version");
             raw.draftModeEnabled = NO;
-            raw.scaleFactor = 1;
+            raw.scaleFactor = isfinite(decode_scale) ? fminf(1.0f, fmaxf(0.05f, decode_scale)) : 1.0f;
             out->orientation = (uint32_t)raw.orientation;
             if (out->orientation < 1 || out->orientation > 8) out->orientation = 1;
             if (defer_orientation && !raw.isLensCorrectionSupported) orient = 0;

@@ -9,7 +9,10 @@ use std::path::Path;
 
 /// The catalog of `stocks` (profile names under `data/profiles`), sorted by
 /// display name.
-pub fn catalog(data: &Path, stocks: impl IntoIterator<Item = String>) -> Result<Value, profile::ProfileError> {
+pub fn catalog(
+    data: &Path,
+    stocks: impl IntoIterator<Item = String>,
+) -> Result<Value, profile::ProfileError> {
     let mut profiles = Vec::new();
     for stock in stocks {
         let p = profile::load_profile_by_name(data, &stock)?;
@@ -41,5 +44,7 @@ pub fn catalog(data: &Path, stocks: impl IntoIterator<Item = String>) -> Result<
         }));
     }
     profiles.sort_by_key(|p| p["name"].as_str().unwrap_or_default().to_lowercase());
-    Ok(json!({"profiles": profiles, "defaults": RuntimeParams::default(), "nullable_paths": RuntimeParams::nullable_paths()}))
+    Ok(
+        json!({"profiles": profiles, "defaults": RuntimeParams::default(), "nullable_paths": RuntimeParams::nullable_paths()}),
+    )
 }

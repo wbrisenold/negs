@@ -33,7 +33,7 @@ pub use colour::{InputColour, InputInterpretation, InputMode};
 pub use metadata::{ImageMetadata, read_metadata};
 pub use save::save_image;
 pub use raw::LensCorrection;
-pub use white_balance::{RawWhiteBalance, RawWhiteBalanceMode};
+pub use white_balance::{ItcwbEstimate, RawWhiteBalance, RawWhiteBalanceMethod, RawWhiteBalanceMode, estimate_itcwb, estimate_itcwb_with_method};
 
 use std::path::Path;
 
@@ -132,12 +132,36 @@ pub fn load_image_colour(
     lens: LensCorrection,
     interpretation: &InputInterpretation,
 ) -> Result<LoadedImage> {
+    load_image_colour_scaled(path, formats, wb, lens, interpretation, 1.0)
+}
+
+/// As `load_image_colour`, with a reduced Apple RAW decode for interactive previews.
+/// Non-RAW formats and the default full-resolution decode are unchanged.
+pub fn load_image_colour_scaled(
+    path: &Path,
+    formats: Formats,
+    wb: RawWhiteBalance,
+    lens: LensCorrection,
+    interpretation: &InputInterpretation,
+    decode_scale: f32,
+) -> Result<LoadedImage> {
     let ext = extension(path);
     if is_raw_extension(&ext) {
+        // The macOS Apple RAW developer is accurate, but its initialization
+        // and full sensor read are expensive even when CIRAWFilter.scaleFactor
+        // requests a small display frame. Use Rawler for reduced editor frames;
+        // full-resolution development and export retain the native Apple path.
+        let decoder = if decode_scale < 1.0 {
+            raw::RawDecoderPreference::Rawler
+        } else {
+            raw::RawDecoderPreference::Auto
+        };
         let decoded = raw::decode_raw(
             path,
-            raw::RawDecodeOptions { white_balance: wb, apply_orientation: true, lens_correction: lens },
-            raw::RawDecoderPreference::Auto,
+            raw::RawDecodeOptions {
+                white_balance: wb, apply_orientation: true, lens_correction: lens, decode_scale,
+            },
+            decoder,
         )?;
         return Ok(LoadedImage {
             image: decoded.image,

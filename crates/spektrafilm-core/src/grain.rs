@@ -44,7 +44,9 @@ impl GrainPreset {
                 .filter_map(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
                 .collect();
             let last = *values.last()?;
-            Some(std::array::from_fn(|i| values.get(i).copied().unwrap_or(last)))
+            Some(std::array::from_fn(|i| {
+                values.get(i).copied().unwrap_or(last)
+            }))
         };
         Self {
             rms_granularity: field("rms_granularity"),
@@ -60,7 +62,9 @@ impl GrainPreset {
             rms_granularity: self.rms_granularity.or(other.rms_granularity),
             density_min: self.density_min.or(other.density_min),
             uniformity: self.uniformity.or(other.uniformity),
-            particle_scale_sublayers: self.particle_scale_sublayers.or(other.particle_scale_sublayers),
+            particle_scale_sublayers: self
+                .particle_scale_sublayers
+                .or(other.particle_scale_sublayers),
         }
     }
 }
@@ -74,11 +78,15 @@ struct Presets {
 fn presets() -> &'static Presets {
     static PRESETS: OnceLock<Presets> = OnceLock::new();
     PRESETS.get_or_init(|| {
-        let root: toml::Table = PRESETS_TOML.parse().expect("data/presets/grain.toml parses");
+        let root: toml::Table = PRESETS_TOML
+            .parse()
+            .expect("data/presets/grain.toml parses");
         let mut stocks = std::collections::HashMap::new();
         let mut defaults = std::collections::HashMap::new();
         for (name, value) in &root {
-            let Some(table) = value.as_table() else { continue };
+            let Some(table) = value.as_table() else {
+                continue;
+            };
             if name == "defaults" {
                 for (channel_model, polarities) in table {
                     for (polarity, leaf) in polarities.as_table().into_iter().flatten() {
@@ -104,11 +112,20 @@ fn presets() -> &'static Presets {
 /// exactly as upstream returns early.
 pub fn stock_preset(film: &Profile) -> GrainPreset {
     let presets = presets();
-    let Some(stock) = film.info.stock.as_deref().and_then(|s| presets.stocks.get(s)) else {
+    let Some(stock) = film
+        .info
+        .stock
+        .as_deref()
+        .and_then(|s| presets.stocks.get(s))
+    else {
         return GrainPreset::default();
     };
     let channel_model = if film.is_bw() { "bw" } else { "color" };
-    let polarity = if film.is_positive() { "positive" } else { "negative" };
+    let polarity = if film.is_positive() {
+        "positive"
+    } else {
+        "negative"
+    };
     let defaults = presets
         .defaults
         .get(&(channel_model.to_string(), polarity.to_string()))
@@ -129,8 +146,14 @@ pub fn grain_settings(film: &Profile, params: &GrainParams) -> GrainSettings {
             .rms_granularity
             .or(preset.rms_granularity)
             .unwrap_or(SCHEMA_RMS_GRANULARITY)),
-        density_min: bw(params.density_min.or(preset.density_min).unwrap_or(SCHEMA_DENSITY_MIN)),
-        uniformity: bw(params.uniformity.or(preset.uniformity).unwrap_or(SCHEMA_UNIFORMITY)),
+        density_min: bw(params
+            .density_min
+            .or(preset.density_min)
+            .unwrap_or(SCHEMA_DENSITY_MIN)),
+        uniformity: bw(params
+            .uniformity
+            .or(preset.uniformity)
+            .unwrap_or(SCHEMA_UNIFORMITY)),
         particle_scale_sublayers: params
             .particle_scale_sublayers
             .or(preset.particle_scale_sublayers)
@@ -197,7 +220,10 @@ mod tests {
         assert_eq!(s.particle_scale_sublayers, [1.0, 0.4, 0.25]);
         // B&W positive defaults, broadcast from channel 0.
         let s = grain_settings(&film("kodak_trix"), &g);
-        assert_eq!((s.rms_granularity, s.density_min, s.uniformity), ([44.0; 3], [0.003; 3], [0.6; 3]));
+        assert_eq!(
+            (s.rms_granularity, s.density_min, s.uniformity),
+            ([44.0; 3], [0.003; 3], [0.6; 3])
+        );
         // No preset: upstream returns early and the schema defaults stand.
         let s = grain_settings(&film("kodak_verita_200d"), &g);
         assert_eq!(s.rms_granularity, [6.0, 8.0, 10.0]);
@@ -213,11 +239,20 @@ mod tests {
         assert_eq!(lanes, ([9.0; 3], [0.03; 3], [0.97; 3]));
         let s = grain_settings(&film("cinestill_800t"), &g);
         let t = grain_settings(&film("kodak_vision3_500t"), &g);
-        assert_eq!((s.rms_granularity, s.uniformity), (t.rms_granularity, t.uniformity));
+        assert_eq!(
+            (s.rms_granularity, s.uniformity),
+            (t.rms_granularity, t.uniformity)
+        );
         assert_eq!(s.particle_scale_sublayers, t.particle_scale_sublayers);
         // A value in the params overrides the preset.
-        let g = GrainParams { rms_granularity: Some([1.0, 2.0, 3.0]), ..GrainParams::default() };
-        assert_eq!(grain_settings(&film("kodak_portra_400"), &g).rms_granularity, [1.0, 2.0, 3.0]);
+        let g = GrainParams {
+            rms_granularity: Some([1.0, 2.0, 3.0]),
+            ..GrainParams::default()
+        };
+        assert_eq!(
+            grain_settings(&film("kodak_portra_400"), &g).rms_granularity,
+            [1.0, 2.0, 3.0]
+        );
     }
 
     #[test]
@@ -232,7 +267,11 @@ mod tests {
         };
         for name in ["kodak_portra_400", "fujifilm_provia_100f", "kodak_doublex"] {
             let load = |n: &str| crate::profile::load_profile_by_name(&data, n).unwrap();
-            let paper = if name == "kodak_doublex" { "kodak_2302" } else { "kodak_portra_endura" };
+            let paper = if name == "kodak_doublex" {
+                "kodak_2302"
+            } else {
+                "kodak_portra_endura"
+            };
             let mut params = RuntimeParams::default();
             let plain = crate::pipeline::Pipeline::new(load(name), load(paper), params.clone());
             params.film_render.density_curves_morph = morph.clone();
@@ -261,7 +300,10 @@ mod tests {
                     }
                 }
             }
-            assert!(moved > 1e-2, "{name}: the morph doesn't reach the grain layers");
+            assert!(
+                moved > 1e-2,
+                "{name}: the morph doesn't reach the grain layers"
+            );
         }
     }
 }

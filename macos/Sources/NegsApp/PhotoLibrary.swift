@@ -1,9 +1,59 @@
 import AppKit
 import Observation
 import UniformTypeIdentifiers
+import Vision
+
+// Adapted from Whittle's BurstClusterEngine, Copyright (c) 2026 Surendran
+// Balachandran, MIT licensed. Source: https://github.com/surendranb/whittle
 
 extension UTType {
     static let negsProject = UTType(filenameExtension: "negproject", conformingTo: .json) ?? .json
+}
+
+/// Reused temporal and single-linkage grouping from Whittle's MIT-licensed
+/// `ClusterEngine` (https://github.com/surendranb/whittle).
+private struct BurstTimedItem: Equatable {
+    let id: String
+    let date: Date?
+}
+
+private enum BurstClusterEngine {
+    static func temporalGroups(_ items: [BurstTimedItem], maxGap: TimeInterval) -> [[BurstTimedItem]] {
+        let dated = items.filter { $0.date != nil }.sorted { $0.date! < $1.date! }
+        guard let first = dated.first else { return [] }
+        var groups: [[BurstTimedItem]] = []
+        var current = [first]
+        for item in dated.dropFirst() {
+            if item.date!.timeIntervalSince(current.last!.date!) <= maxGap {
+                current.append(item)
+            } else {
+                groups.append(current)
+                current = [item]
+            }
+        }
+        groups.append(current)
+        return groups
+    }
+
+    static func visualSubclusters(
+        _ ids: [String], threshold: Double,
+        distance: (String, String) -> Double?
+    ) -> [[String]] {
+        var clusters: [[String]] = []
+        for id in ids {
+            if let index = clusters.indices.first(where: { index in
+                clusters[index].contains { member in
+                    guard let measured = distance(id, member) else { return false }
+                    return measured <= threshold
+                }
+            }) {
+                clusters[index].append(id)
+            } else {
+                clusters.append([id])
+            }
+        }
+        return clusters
+    }
 }
 
 enum LibraryFlag: String, CaseIterable, Codable, Identifiable, Sendable {
@@ -62,6 +112,36 @@ enum LibrarySort: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+enum CullFilterChip: CaseIterable, Hashable, Sendable {
+    case eyesOpen, sharp, exposure, aesthetics, composition, aiScore, topPicks, burstLeads, rejects
+    var title: String {
+        switch self {
+        case .eyesOpen: "Eyes Open"
+        case .sharp: "Sharpness 70+"
+        case .exposure: "Exposure 70+"
+        case .aesthetics: "Aesthetics 70+"
+        case .composition: "Composition 70+"
+        case .aiScore: "Cull Score 70+"
+        case .topPicks: "Top Picks"
+        case .burstLeads: "Burst Leads"
+        case .rejects: "Rejects"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .eyesOpen: "eye"
+        case .sharp: "viewfinder"
+        case .exposure: "sun.max"
+        case .aesthetics: "sparkles"
+        case .composition: "viewfinder.rectangular"
+        case .aiScore: "sparkles"
+        case .topPicks: "rosette"
+        case .burstLeads: "square.stack.3d.up"
+        case .rejects: "xmark.circle"
+        }
+    }
+}
+
 enum CullDecision: String, Codable, Sendable {
     case topPick, review, reject
     var title: String {
@@ -73,13 +153,27 @@ enum CullDecision: String, Codable, Sendable {
     }
 }
 
+enum TopPickUnit: String, CaseIterable, Identifiable {
+    case images, percent
+    var id: String { rawValue }
+    var title: String { self == .images ? "images per scene" : "% per scene" }
+}
+
 /// Local Vision results plus transparent, deterministic technical signals.
 /// A missing aesthetic score means this macOS version did not provide Apple's
 /// on-device aesthetics request; it is never replaced with a guessed value.
 struct CullAnalysis: Codable, Hashable, Sendable {
-    var version: Int = 1
+    var version: Int = 4
     var score: Int
     var sharpness: Int
+    var faceSharpness: Int? = nil
+    var faceCaptureQuality: Int? = nil
+    var faceExposure: Int? = nil
+    var exposure: Int? = nil
+    var clippedHighlightsPercent: Double? = nil
+    var crushedShadowsPercent: Double? = nil
+    var sceneFingerprint: Data? = nil
+    var captureDate: Date? = nil
     var aesthetics: Int?
     var composition: Int?
     var eyesOpen: Bool?
@@ -89,7 +183,8 @@ struct CullAnalysis: Codable, Hashable, Sendable {
     var reasons: [String]
 
     var hardReject: Bool {
-        !failed && (eyesOpen == false || sharpness < 18 || score < 28 || utilityImage)
+        !failed && (eyesOpen == false || sharpness < 18 || (faceSharpness ?? 100) < 28
+                    || (exposure ?? 100) < 18 || (faceExposure ?? 100) < 16 || score < 28 || utilityImage)
     }
 }
 
@@ -206,11 +301,15 @@ private struct LibraryProjectDocument: Codable, Sendable {
 /// stay in their folders; the catalog stores bookmarks and sidecar metadata.
 @MainActor @Observable final class PhotoLibrary {
     private(set) var folders: [LibraryFolder] = []
-    private(set) var photos: [LibraryPhoto] = []
+    private(set) var photos: [LibraryPhoto] = [] {
+        didSet { sceneGroupsCache = nil; topPicksCache = nil; burstLeadsCache = nil }
+    }
     private(set) var albums: [LibraryAlbum] = []
     private(set) var smartCollections: [SmartLibraryCollection] = []
     private(set) var projects: [LibraryProject] = []
     var filter: LibraryFilter = .all
+    /// Shared culling filters stay active as the user moves between Library and Edit.
+    var cullFilters = Set<CullFilterChip>()
     var sort: LibrarySort = .name
     var searchText = ""
     var selectedFolderID: UUID?
@@ -218,6 +317,20 @@ private struct LibraryProjectDocument: Codable, Sendable {
     var selectedSmartCollectionID: UUID?
     var selectedProjectID: UUID?
     var selectedPhotoURL: URL?
+    var topPickUnit: TopPickUnit = TopPickUnit(rawValue: UserDefaults.standard.string(forKey: "negs.library.topPickUnit") ?? "images") ?? .images {
+        didSet {
+            let maximum = topPickUnit == .percent ? 100 : 10000
+            if topPickValue > maximum { topPickValue = maximum }
+            UserDefaults.standard.set(topPickUnit.rawValue, forKey: "negs.library.topPickUnit")
+        }
+    }
+    var topPickValue: Int = max(1, UserDefaults.standard.object(forKey: "negs.library.topPickValue") as? Int ?? 4) {
+        didSet {
+            let bounded = min(max(topPickValue, 1), topPickUnit == .percent ? 100 : 10000)
+            if bounded != topPickValue { topPickValue = bounded; return }
+            UserDefaults.standard.set(topPickValue, forKey: "negs.library.topPickValue")
+        }
+    }
     private(set) var loaded = false
     private(set) var refreshing = false
     private(set) var analyzingCull = false
@@ -226,13 +339,23 @@ private struct LibraryProjectDocument: Codable, Sendable {
     private(set) var error: String?
     @ObservationIgnored private var scopedFolders: [UUID: URL] = [:]
     @ObservationIgnored private var loadStarted = false
+    @ObservationIgnored private var sceneGroupsCache: (scope: Set<URL>, groups: [[LibraryPhoto]])?
+    @ObservationIgnored private var topPicksCache: (unit: TopPickUnit, value: Int, scope: Set<URL>, urls: Set<URL>)?
+    @ObservationIgnored private var burstLeadsCache: (scope: Set<URL>, urls: Set<URL>)?
+
+    private static let sceneDistanceThreshold = 0.45
+
+    init() {
+        let maximum = topPickUnit == .percent ? 100 : 10000
+        topPickValue = min(max(topPickValue, 1), maximum)
+    }
 
     private static var storeURL: URL {
         AppDataLocations.supportDirectory.appendingPathComponent("photo-library.json")
     }
 
-    var visiblePhotos: [LibraryPhoto] {
-        let smartFilter = smartCollections.first { $0.id == selectedSmartCollectionID }?.filter
+    /// The active folder/project/album/search scope before its Library category filter.
+    var scopePhotos: [LibraryPhoto] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let projectPaths = projects.first { $0.id == selectedProjectID }?.photoPaths
         let result = photos.filter { photo in
@@ -242,7 +365,7 @@ private struct LibraryProjectDocument: Codable, Sendable {
             let textMatches = query.isEmpty || photo.file.name.lowercased().contains(query)
                 || (folder?.name.lowercased().contains(query) ?? false)
             let projectMatches = projectPaths?.contains(photo.file.url.standardizedFileURL.path) ?? true
-            return projectMatches && photo.matches(smartFilter ?? filter) && albumMatches && folderMatches && textMatches
+            return projectMatches && albumMatches && folderMatches && textMatches
         }
         switch sort {
         case .name:
@@ -254,22 +377,149 @@ private struct LibraryProjectDocument: Codable, Sendable {
         case .cullScore:
             return result.sorted { ($0.cull?.score ?? -1) > ($1.cull?.score ?? -1) }
         case .sharpness:
-            return result.sorted { ($0.cull?.sharpness ?? -1) > ($1.cull?.sharpness ?? -1) }
+            return result.sorted { ($0.cull?.faceSharpness ?? $0.cull?.sharpness ?? -1) > ($1.cull?.faceSharpness ?? $1.cull?.sharpness ?? -1) }
         case .aesthetics:
             return result.sorted { ($0.cull?.aesthetics ?? -1) > ($1.cull?.aesthetics ?? -1) }
         }
     }
 
-    /// Keeps the recommendation deliberately selective: only the best quarter
-    /// of analyzed, technically acceptable frames can be promoted to Top Pick.
-    var topPickURLs: Set<URL> {
-        let eligible = photos.filter { $0.cull != nil && !($0.cull?.hardReject ?? true) }
-            .sorted {
-                let a = $0.cull?.score ?? -1, b = $1.cull?.score ?? -1
-                return a == b ? $0.file.url.path < $1.file.url.path : a > b
+    var visiblePhotos: [LibraryPhoto] {
+        let category = smartCollections.first { $0.id == selectedSmartCollectionID }?.filter ?? filter
+        let locationScoped = selectedFolderID != nil || selectedProjectID != nil
+        // Offline assets are actionable only from their owning source folder
+        // or a project that contains them. Never surface them globally.
+        guard category != .missing || locationScoped else { return [] }
+        return scopePhotos.filter { $0.matches(category) && (locationScoped || !$0.missing) }
+    }
+
+    /// The same Library and AI filters, applied to a caller's current scope.
+    func filteredPhotos(from visible: [LibraryPhoto]? = nil) -> [LibraryPhoto] {
+        let candidates = visible ?? visiblePhotos
+        let top = cullFilters.contains(.topPicks) ? Set(topPickURLs(in: candidates)) : []
+        let burstLeads = cullFilters.contains(.burstLeads) ? burstLeadURLs(in: candidates) : []
+        return candidates.filter { photo in
+            cullFilters.allSatisfy { filter in
+                switch filter {
+                case .eyesOpen: photo.cull?.eyesOpen == true
+                case .sharp: (photo.cull?.faceSharpness ?? photo.cull?.sharpness ?? -1) >= 70
+                case .exposure: (photo.cull?.exposure ?? -1) >= 70
+                case .aesthetics: (photo.cull?.aesthetics ?? -1) >= 70
+                case .composition: (photo.cull?.composition ?? -1) >= 70
+                case .aiScore: (photo.cull?.score ?? -1) >= 70
+                case .topPicks: top.contains(photo.file.url)
+                case .burstLeads: burstLeads.contains(photo.file.url)
+                case .rejects: photo.cull?.hardReject == true
+                }
             }
-        let limit = max(1, Int(ceil(Double(eligible.count) * 0.25)))
-        return Set(eligible.prefix(limit).filter { ($0.cull?.score ?? 0) >= 55 }.map(\.file.url))
+        }
+    }
+
+    /// Optional burst review powered by Whittle's MIT-licensed clustering
+    /// implementation. Undated or unanalysed images are always preserved.
+    private func burstLeadURLs(in candidates: [LibraryPhoto]) -> Set<URL> {
+        let scope = Set(candidates.map(\.file.url))
+        if let burstLeadsCache, burstLeadsCache.scope == scope { return burstLeadsCache.urls }
+        let dated = candidates.compactMap { photo -> (LibraryPhoto, Date)? in
+            guard let date = photo.cull?.captureDate,
+                  photo.cull?.failed == false,
+                  photo.cull?.sceneFingerprint != nil else { return nil }
+            return (photo, date)
+        }
+        let groups = BurstClusterEngine.temporalGroups(
+            dated.map { BurstTimedItem(id: $0.0.file.url.path, date: $0.1) }, maxGap: 10
+        )
+        let byPath = Dictionary(uniqueKeysWithValues: dated.map { ($0.0.file.url.path, $0.0) })
+        var retained = Set(candidates.filter {
+            $0.cull?.failed != false || $0.cull?.captureDate == nil || $0.cull?.sceneFingerprint == nil
+        }.map(\.file.url))
+
+        for group in groups {
+            let paths = group.map(\.id)
+            var fingerprints: [String: VNFeaturePrintObservation] = [:]
+            for path in paths {
+                guard let data = byPath[path]?.cull?.sceneFingerprint,
+                      let print = try? NSKeyedUnarchiver.unarchivedObject(
+                        ofClass: VNFeaturePrintObservation.self, from: data) else { continue }
+                fingerprints[path] = print
+            }
+            let clusters = BurstClusterEngine.visualSubclusters(paths, threshold: 0.6) { first, second in
+                guard let firstPrint = fingerprints[first], let secondPrint = fingerprints[second] else { return nil }
+                return Self.sceneDistance(firstPrint, secondPrint)
+            }
+            for cluster in clusters {
+                let ranked = cluster.compactMap { byPath[$0] }.sorted {
+                    let a = $0.cull?.score ?? -1, b = $1.cull?.score ?? -1
+                    return a == b ? $0.file.url.path < $1.file.url.path : a > b
+                }
+                if cluster.count > 1, let lead = ranked.first { retained.insert(lead.file.url) }
+                else { ranked.forEach { retained.insert($0.file.url) } }
+            }
+        }
+        burstLeadsCache = (scope, retained)
+        return retained
+    }
+
+    var detectedScenes: [[LibraryPhoto]] {
+        detectedScenes(in: visiblePhotos)
+    }
+
+    func detectedScenes(in visiblePhotos: [LibraryPhoto]) -> [[LibraryPhoto]] {
+        let scope = Set(visiblePhotos.map(\.file.url))
+        if let sceneGroupsCache, sceneGroupsCache.scope == scope { return sceneGroupsCache.groups }
+        // Keep every successfully analyzed frame in the ranking. Hard rejects
+        // still rank low, but a configured Top N must mean N frames when a
+        // scene contains N analyzed photos. Rank only the current Library view,
+        // so photos in another folder cannot consume this folder's top slots.
+        let eligible = visiblePhotos.filter { $0.cull != nil && !($0.cull?.failed ?? true) }
+            .sorted { $0.file.url.path < $1.file.url.path }
+        var scenes: [[LibraryPhoto]] = []
+        var exemplars: [VNFeaturePrintObservation] = []
+        var legacyScene: [LibraryPhoto] = []
+        for photo in eligible {
+            guard let data = photo.cull?.sceneFingerprint,
+                  let fingerprint = try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: data) else {
+                legacyScene.append(photo)
+                continue
+            }
+            let match = exemplars.indices.first { Self.sceneDistance(fingerprint, exemplars[$0]) <= Self.sceneDistanceThreshold }
+            guard let match else {
+                scenes.append([photo])
+                exemplars.append(fingerprint)
+                continue
+            }
+            scenes[match].append(photo)
+        }
+        if !legacyScene.isEmpty { scenes.append(legacyScene) }
+        sceneGroupsCache = (scope, scenes)
+        return scenes
+    }
+
+    /// Select the best configured number or share per scene, or across the whole view.
+    var topPickURLs: Set<URL> {
+        topPickURLs(in: visiblePhotos)
+    }
+
+    func topPickURLs(in visiblePhotos: [LibraryPhoto]) -> Set<URL> {
+        let scope = Set(visiblePhotos.map(\.file.url))
+        if let topPicksCache, topPicksCache.unit == topPickUnit,
+           topPicksCache.value == topPickValue, topPicksCache.scope == scope {
+            return topPicksCache.urls
+        }
+        let eligible = visiblePhotos.filter { $0.cull != nil && !($0.cull?.failed ?? true) }
+        let ranked = eligible.sorted {
+            let a = $0.cull?.score ?? -1, b = $1.cull?.score ?? -1
+            return a == b ? $0.file.url.path < $1.file.url.path : a > b
+        }
+        let limit = topPickUnit == .images ? topPickValue : Int(ceil(Double(ranked.count) * Double(topPickValue) / 100))
+        let picks = Set(ranked.prefix(limit).map(\.file.url))
+        topPicksCache = (topPickUnit, topPickValue, scope, picks)
+        return picks
+    }
+
+    private static func sceneDistance(_ first: VNFeaturePrintObservation, _ second: VNFeaturePrintObservation) -> Double {
+        var distance: Float = .infinity
+        guard (try? first.computeDistance(&distance, to: second)) != nil else { return .infinity }
+        return Double(distance)
     }
 
     var selectedPhoto: LibraryPhoto? {
@@ -277,7 +527,14 @@ private struct LibraryProjectDocument: Codable, Sendable {
         return photos.first { $0.file.url == selectedPhotoURL }
     }
 
-    func count(for filter: LibraryFilter) -> Int { photos.reduce(0) { $0 + ($1.matches(filter) ? 1 : 0) } }
+    func count(for filter: LibraryFilter) -> Int {
+        let locationScoped = selectedFolderID != nil || selectedProjectID != nil
+        if filter == .missing {
+            guard locationScoped else { return 0 }
+            return scopePhotos.reduce(0) { $0 + ($1.missing ? 1 : 0) }
+        }
+        return photos.reduce(0) { $0 + ($1.matches(filter) && !$1.missing ? 1 : 0) }
+    }
     func count(for project: LibraryProject) -> Int { project.photoPaths.count }
 
     func load() async {
@@ -333,14 +590,9 @@ private struct LibraryProjectDocument: Codable, Sendable {
         selectedFolderID = nil
         selectedAlbumID = nil
         selectedSmartCollectionID = nil
+        selectedProjectID = nil
         filter = .all
         await refresh()
-        if let selectedProjectID, let index = projects.firstIndex(where: { $0.id == selectedProjectID }) {
-            for photo in photos where selectedFolderIDs.contains(photo.folderID) {
-                projects[index].photoPaths.insert(photo.file.url.standardizedFileURL.path)
-            }
-            persist()
-        }
     }
 
     func removeFolder(_ id: UUID) {
@@ -501,6 +753,18 @@ private struct LibraryProjectDocument: Codable, Sendable {
         } else {
             projects[index].photoPaths.insert(path)
         }
+        persist()
+    }
+
+    func add(_ photos: [LibraryPhoto], to projectID: UUID) {
+        guard let index = projects.firstIndex(where: { $0.id == projectID }) else { return }
+        projects[index].photoPaths.formUnion(photos.map { $0.file.url.standardizedFileURL.path })
+        persist()
+    }
+
+    func remove(_ photos: [LibraryPhoto], from projectID: UUID) {
+        guard let index = projects.firstIndex(where: { $0.id == projectID }) else { return }
+        projects[index].photoPaths.subtract(photos.map { $0.file.url.standardizedFileURL.path })
         persist()
     }
 

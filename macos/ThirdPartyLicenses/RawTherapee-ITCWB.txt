@@ -1,0 +1,23 @@
+RawTherapee ITCWB spectral reference data and method
+
+The ITCWB reference chromaticities bundled at
+crates/spektrafilm-io/src/itcwb_reference_xy.bin are derived from the 429
+measured reflectance spectra in RawTherapee's rtengine/colortemp.cc. The
+candidate search follows the spectral-reference white-balance approach used
+by RawTherapee's Illuminant Temperature Correlation white balance (ITCWB).
+
+Copyright (C) RawTherapee contributors. The source implementation and its
+reference data are available under GNU GPL version 3 or, at your option, any
+later version:
+https://github.com/RawTherapee/RawTherapee/blob/dev/rtengine/colortemp.cc
+
+Negs is distributed under GPL-3.0-only, which is compatible with this
+GPL-3.0-or-later material. The table-generation script uses the Colour
+Science Python package's CIE 1931 2-degree standard observer and D65
+illuminant data. Colour Science is BSD-3-Clause licensed:
+https://github.com/colour-science/colour
+
+This is a Rust implementation of the ITCWB spectral-reference method, not a
+line-for-line port of RawTherapee's C++ implementation. Its reduced scoring
+search intentionally reports failure when a frame lacks sufficient varied
+color data, and photographers should review the estimate visually.

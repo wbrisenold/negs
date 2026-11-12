@@ -9,8 +9,8 @@
 //! experimental 28bf883's optional smooth inscribed hull.
 
 use rustfft::{FftPlanner, num_complex::Complex};
-use std::sync::{Arc, Mutex};
 use spektrafilm_math::spectral::{self, CMF_X_F64, CMF_Y_F64, CMF_Z_F64, TcLut};
+use std::sync::{Arc, Mutex};
 
 use crate::gamut_compression::reinhard_knee;
 use crate::params::InputGamutCompressParams;
@@ -242,7 +242,11 @@ impl InputGamutCompress {
         const ENTRIES: usize = 8;
         let key: Key = (
             ref_xy.map(f64::to_bits),
-            [self.knee.0.to_bits(), self.knee.1.to_bits(), self.knee.2.to_bits()],
+            [
+                self.knee.0.to_bits(),
+                self.knee.1.to_bits(),
+                self.knee.2.to_bits(),
+            ],
             self.hull_detail.map(f64::to_bits),
             size,
         );
@@ -259,17 +263,20 @@ impl InputGamutCompress {
         let mut coords = vec![(0.0, 0.0); size * size];
         // Each cell is independent; rows in parallel.
         use rayon::prelude::*;
-        coords.par_chunks_mut(size).enumerate().for_each(|(i, row)| {
-            for (j, slot) in row.iter_mut().enumerate() {
-                // Step 1: tc cell → CIE xy.
-                let (x, y) = spectral::tc_to_xy(i as f64 * inv, j as f64 * inv);
-                // Step 2: compress.
-                let cxy = compress_xy_radial([x, y], ref_xy, self.knee, boundary);
-                // Step 3: compressed xy → tc, as grid coordinates.
-                let (tx, ty) = spectral::xy_to_tc(cxy[0], cxy[1]);
-                *slot = (tx * (size as f64 - 1.0), ty * (size as f64 - 1.0));
-            }
-        });
+        coords
+            .par_chunks_mut(size)
+            .enumerate()
+            .for_each(|(i, row)| {
+                for (j, slot) in row.iter_mut().enumerate() {
+                    // Step 1: tc cell → CIE xy.
+                    let (x, y) = spectral::tc_to_xy(i as f64 * inv, j as f64 * inv);
+                    // Step 2: compress.
+                    let cxy = compress_xy_radial([x, y], ref_xy, self.knee, boundary);
+                    // Step 3: compressed xy → tc, as grid coordinates.
+                    let (tx, ty) = spectral::xy_to_tc(cxy[0], cxy[1]);
+                    *slot = (tx * (size as f64 - 1.0), ty * (size as f64 - 1.0));
+                }
+            });
         let coords = Arc::new(coords);
         let mut cache = CACHE.lock().unwrap();
         if cache.len() >= ENTRIES {
@@ -317,7 +324,8 @@ mod tests {
 
     /// Cache hits in `sample_coords`, so the bit-identity test can show it
     /// compared cached results, not only fresh ones.
-    pub(super) static CACHE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    pub(super) static CACHE_HITS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     #[derive(Deserialize)]
     struct HullFixture {
@@ -359,7 +367,10 @@ mod tests {
                 );
             }
             // Python's remap centres on the white it is given.
-            let spec = InputGamutCompressParams { center: "reference".into(), ..case.spec.clone() };
+            let spec = InputGamutCompressParams {
+                center: "reference".into(),
+                ..case.spec.clone()
+            };
             let compressor = InputGamutCompress::from_params(&spec).unwrap();
             let actual = compressor.remap(&synthetic_lut(16), case.white);
             assert_eq!(actual.data.len(), case.remapped_lut.len());
@@ -494,16 +505,18 @@ mod tests {
         let inv = 1.0 / (size as f64 - 1.0);
         let mut data = vec![0.0f64; size * size * ch];
         use rayon::prelude::*;
-        data.par_chunks_mut(size * ch).enumerate().for_each(|(i, row)| {
-            for j in 0..size {
-                let (x, y) = spectral::tc_to_xy(i as f64 * inv, j as f64 * inv);
-                let cxy = compress_xy_radial([x, y], ref_xy, g.knee, boundary);
-                let (tx, ty) = spectral::xy_to_tc(cxy[0], cxy[1]);
-                let sample =
-                    bilinear_sample(lut, tx * (size as f64 - 1.0), ty * (size as f64 - 1.0));
-                row[j * ch..j * ch + ch].copy_from_slice(&sample[..ch]);
-            }
-        });
+        data.par_chunks_mut(size * ch)
+            .enumerate()
+            .for_each(|(i, row)| {
+                for j in 0..size {
+                    let (x, y) = spectral::tc_to_xy(i as f64 * inv, j as f64 * inv);
+                    let cxy = compress_xy_radial([x, y], ref_xy, g.knee, boundary);
+                    let (tx, ty) = spectral::xy_to_tc(cxy[0], cxy[1]);
+                    let sample =
+                        bilinear_sample(lut, tx * (size as f64 - 1.0), ty * (size as f64 - 1.0));
+                    row[j * ch..j * ch + ch].copy_from_slice(&sample[..ch]);
+                }
+            });
         TcLut {
             size,
             channels: ch,
@@ -525,7 +538,12 @@ mod tests {
     #[test]
     #[ignore]
     fn cached_remap_is_bit_identical_to_uncached_more_films() {
-        check_cached_remap(&["kodak_portra_400", "kodak_vision3_500t", "fujifilm_velvia_50", "kodak_aerochrome_1443"]);
+        check_cached_remap(&[
+            "kodak_portra_400",
+            "kodak_vision3_500t",
+            "fujifilm_velvia_50",
+            "kodak_aerochrome_1443",
+        ]);
     }
 
     fn check_cached_remap(films: &[&str]) {
@@ -539,7 +557,12 @@ mod tests {
             let sens: Vec<[f64; 3]> = profile
                 .log_sensitivity_f64()
                 .iter()
-                .map(|row| row.map(|v| { let x = 10f64.powf(v); if x.is_nan() { 0.0 } else { x } }))
+                .map(|row| {
+                    row.map(|v| {
+                        let x = 10f64.powf(v);
+                        if x.is_nan() { 0.0 } else { x }
+                    })
+                })
                 .collect();
             luts.push(crate::spectral_service::compute_tc_lut(&spectra, &sens));
         }
@@ -553,12 +576,17 @@ mod tests {
         };
         for size in [2usize, 17, 64] {
             let data = (0..size * size * 3).map(|_| rand() * 4.0).collect();
-            luts.push(TcLut { size, channels: 3, data });
+            luts.push(TcLut {
+                size,
+                channels: 3,
+                data,
+            });
         }
         let mut whites: Vec<[f64; 2]> = ["D55", "D65", "D50", "BB3200", "TH-KG3", "T"]
             .iter()
             .map(|name| {
-                let (x, y) = spectral::illuminant_to_xy(&crate::illuminants::select_illuminant(name));
+                let (x, y) =
+                    spectral::illuminant_to_xy(&crate::illuminants::select_illuminant(name));
                 [x, y]
             })
             .collect();
@@ -566,12 +594,20 @@ mod tests {
         let mut settings = Vec::new();
         for boundary in ["inscribed_hull", "locus"] {
             for center in ["reference", "D65"] {
-                settings.push(InputGamutCompressParams { boundary: boundary.into(), center: center.into(), ..Default::default() });
+                settings.push(InputGamutCompressParams {
+                    boundary: boundary.into(),
+                    center: center.into(),
+                    ..Default::default()
+                });
             }
         }
         for _ in 0..6 {
             settings.push(InputGamutCompressParams {
-                knee: [(rand() * 0.95) as f32, (0.2 + rand() * 2.0) as f32, (0.3 + rand() * 3.0) as f32],
+                knee: [
+                    (rand() * 0.95) as f32,
+                    (0.2 + rand() * 2.0) as f32,
+                    (0.3 + rand() * 3.0) as f32,
+                ],
                 hull_detail: 1.0 + rand() * 40.0,
                 ..Default::default()
             });
@@ -580,12 +616,22 @@ mod tests {
         // the default knee (a key that drops either part must fail here).
         for _ in 0..3 {
             settings.push(InputGamutCompressParams {
-                knee: [(rand() * 0.95) as f32, (0.2 + rand() * 2.0) as f32, (0.3 + rand() * 3.0) as f32],
+                knee: [
+                    (rand() * 0.95) as f32,
+                    (0.2 + rand() * 2.0) as f32,
+                    (0.3 + rand() * 3.0) as f32,
+                ],
                 ..Default::default()
             });
-            settings.push(InputGamutCompressParams { hull_detail: 1.0 + rand() * 40.0, ..Default::default() });
+            settings.push(InputGamutCompressParams {
+                hull_detail: 1.0 + rand() * 40.0,
+                ..Default::default()
+            });
         }
-        settings.push(InputGamutCompressParams { algorithm: "off".into(), ..Default::default() });
+        settings.push(InputGamutCompressParams {
+            algorithm: "off".into(),
+            ..Default::default()
+        });
         let mut cases = Vec::new();
         for (l, _) in luts.iter().enumerate() {
             for (w, _) in whites.iter().enumerate() {
@@ -611,13 +657,20 @@ mod tests {
             let want = remap_uncached(&g, lut, white);
             let got = g.remap(lut, white);
             assert_eq!((got.size, got.channels), (want.size, want.channels));
-            let same = got.data.iter().zip(&want.data).all(|(a, b)| a.to_bits() == b.to_bits());
+            let same = got
+                .data
+                .iter()
+                .zip(&want.data)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
             assert!(same, "lut {l} white {white:?} settings {:?}", settings[p]);
             compared += got.data.len();
         }
         let hits = CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed) - hits_before;
         // 7 whites × 16 active settings, hit by every film LUT but the first.
         assert!(hits >= 7 * 16 * (films.len() - 1), "only {hits} cache hits");
-        eprintln!("compared {compared} values in {} remaps, {hits} cache hits", 2 * cases.len());
+        eprintln!(
+            "compared {compared} values in {} remaps, {hits} cache hits",
+            2 * cases.len()
+        );
     }
 }

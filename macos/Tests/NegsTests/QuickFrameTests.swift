@@ -31,6 +31,14 @@ final class QuickFrameStepTests: XCTestCase {
         XCTAssertEqual(step(interacting: true, scale: 1), .settled)
     }
 
+    func testRawPreviewQualityScaleIs38PercentAndNeverUpscales() {
+        XCTAssertEqual(EditorModel.initialRawPreviewScale, 0.38, accuracy: 0.0001)
+        XCTAssertEqual(EditorModel.rawPreviewScale(requested: nil), 0.38, accuracy: 0.0001)
+        XCTAssertEqual(EditorModel.rawPreviewScale(requested: 0.8), 0.38, accuracy: 0.0001)
+        XCTAssertEqual(EditorModel.rawPreviewScale(requested: 0.25), 0.25, accuracy: 0.0001)
+        XCTAssertEqual(step(interacting: true, scale: EditorModel.rawPreviewScale(requested: 1)), .drag(0.38))
+    }
+
     func testReuseKeyIgnoresOnlyPostAndThePreviewPath() {
         let command: [String: JSONValue] = [
             "command": .string("render"), "film": .string("a"), "preview_path": .string("/x"),
@@ -97,10 +105,9 @@ final class QuickFrameStepTests: XCTestCase {
         let model = EditorModel()
         models.append(model)
         let defaults = UserDefaults.standard
-        let saved = ["autoPlaceNewImages", "freshEditsForNewPhotos"].map { ($0, defaults.object(forKey: $0)) }
+        let saved = ["autoPlaceNewImages"].map { ($0, defaults.object(forKey: $0)) }
         restoreDefaults.append { for (key, value) in saved { defaults.set(value, forKey: key) } }
         model.autoPlaceNewImages = match
-        model.freshEditsForNewPhotos = true
         model.canvasScale.fixed = scale
         await model.start(paths: paths(), restoration: Task { nil })
         model.open(try testPhoto())

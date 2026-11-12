@@ -191,6 +191,13 @@ jobs:
           cargo build --locked --release -p spektrafilm-native --target ${{ matrix.target }}
           cargo build --locked --release -p spektrafilm-cli --bin spektrafilm --target ${{ matrix.target }}
           cargo build --locked --release -p spektrafilm-cli --bin spektrafilm-f64 --features precision-f64 --target ${{ matrix.target }}
+      - name: Guard Intel RAW exposure-meter performance
+        if: matrix.target == 'x86_64-apple-darwin'
+        env:
+          CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER: arch -x86_64
+        run: |
+          cargo test --locked --release --target x86_64-apple-darwin -p spektrafilm-core --lib metering_preview_keeps_area_reduction_on_large_raw_frames
+          cargo test --locked --release --target x86_64-apple-darwin -p spektrafilm-core --lib interactive_preview_at_editor_quality_keeps_expected_detail
       - uses: actions/upload-artifact@v4
         with:
           name: build-macos-${{ matrix.target }}

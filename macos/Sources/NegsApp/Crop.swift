@@ -265,6 +265,9 @@ enum CropGeometry {
     /// The locked ratio is taller than wide (for presets; custom uses its sides).
     private(set) var portrait: Bool
     private(set) var custom: CGSize
+    /// When a border is active, presets describe the finished canvas, including its mat.
+    var includeBorderInAspect = true
+    @ObservationIgnored private let border: BorderSettings
     /// Degrees clockwise, as `CropSettings.angle`.
     private(set) var angle: Double
     /// The developed photograph as shown, in pixels, and its rotation.
@@ -286,6 +289,7 @@ enum CropGeometry {
 
     init(start: EditState, photo: CGSize, rotation: Int, source: CGSize = .zero) {
         self.start = start; self.source = source
+        self.border = start.border
         let settings = start.crop
         rect = settings.rect; aspect = settings.aspect; custom = settings.custom; angle = settings.angle
         self.photo = photo; self.rotation = rotation
@@ -318,9 +322,17 @@ enum CropGeometry {
 
     /// Width over height of the locked ratio, as shown; nil for freeform.
     var ratio: CGFloat? {
-        if aspect == .custom { return custom.width > 0 && custom.height > 0 ? custom.width / custom.height : nil }
-        guard let ratio = aspect.ratio(photo: photo) else { return nil }
-        return portrait ? 1 / ratio : ratio
+        let canvasRatio: CGFloat
+        if aspect == .custom {
+            guard custom.width > 0, custom.height > 0 else { return nil }
+            canvasRatio = custom.width / custom.height
+        } else {
+            guard let ratio = aspect.ratio(photo: photo) else { return nil }
+            canvasRatio = portrait ? 1 / ratio : ratio
+        }
+        guard includeBorderInAspect, border.enabled, border.style != .film35 else { return canvasRatio }
+        let solved = photographRatio(forCanvas: max(canvasRatio, 1 / canvasRatio))
+        return canvasRatio < 1 ? 1 / solved : solved
     }
 
     /// The rectangle in pixels of the photograph as shown.
@@ -350,6 +362,11 @@ enum CropGeometry {
     func choose(_ aspect: CropAspect) {
         self.aspect = aspect
         if aspect == .original { portrait = photo.height > photo.width }
+        refit()
+    }
+    func setIncludeBorderInAspect(_ include: Bool) {
+        guard includeBorderInAspect != include else { return }
+        includeBorderInAspect = include
         refit()
     }
     func orient(portrait: Bool) {
@@ -389,6 +406,25 @@ enum CropGeometry {
         let current = shown
         let fitted = CropGeometry.fit(ratio: ratio, around: CGPoint(x: current.midX, y: current.midY), in: photo)
         shown = CropGeometry.inscribe(fitted, angle: angle, photo: photo)
+    }
+
+    /// Solve the crop ratio whose outside border canvas matches the selected
+    /// print ratio. Crop geometry is long-edge normalized like BorderSettings.
+    private func photographRatio(forCanvas target: CGFloat) -> CGFloat {
+        guard target.isFinite, target >= 1 else { return target }
+        func outputRatio(_ photoRatio: CGFloat) -> CGFloat {
+            let long: CGFloat = 10_000
+            let photo = CGSize(width: long, height: long / photoRatio)
+            let canvas = border.canvas(for: photo)
+            return max(canvas.width, canvas.height) / min(canvas.width, canvas.height)
+        }
+        var low: CGFloat = 1, high = max(target * 2, target + 1)
+        for _ in 0..<36 {
+            let mid = (low + high) / 2
+            if outputRatio(mid) < target { low = mid } else { high = mid }
+        }
+        let solved = (low + high) / 2
+        return solved
     }
 }
 
@@ -683,6 +719,12 @@ struct CropInspector: View {
                 }
                 .pickerStyle(.segmented)
                 .disabled(!session.aspect.turns)
+                if model.border.enabled && model.border.style != .film35 {
+                    Toggle("Include border in preset", isOn: Binding(
+                        get: { session.includeBorderInAspect }, set: session.setIncludeBorderInAspect
+                    ))
+                        .help("The selected ratio describes the finished image including its border. The photo is cropped to fit inside it.")
+                }
             }
             Section("Straighten") {
                 VStack(alignment: .leading, spacing: 2) {
@@ -711,7 +753,7 @@ struct CropInspector: View {
                     let size = exportedSize
                     Text(verbatim: "\(Int(size.width.rounded())) × \(Int(size.height.rounded())) px").monospacedDigit()
                 }
-                .help("The exported photograph’s size, before the border.")
+                    .help("The exported photograph’s size, before the border.")
                 if let working = session.projectedWorking, session.source.width > 0 {
                     let scale = working.width / session.source.width
                     Text(scale >= 1 ? "Image Size develops the whole frame \(scale.formatted(FloatingPointFormatStyle<Double>.number.precision(.fractionLength(1))))× the source." : "Image Size develops the whole frame at \(EditorModel.percent(scale)) of the source.")
@@ -727,7 +769,9 @@ struct CropInspector: View {
                     .disabled(!session.modified)
                     .help("Show the whole, unturned photograph again.")
             } footer: {
-                Text("Drag the corners or edges to crop, or drag inside to move it. Drag the dial below the photograph to straighten it. Press Return to apply or Escape to cancel. The border is added after cropping.")
+                Text(model.border.enabled && model.border.style != .film35 && session.includeBorderInAspect
+                     ? "Preset ratios describe the finished canvas. The photo crop leaves room for the active border. Drag to reposition the crop; press Return to apply or Escape to cancel."
+                     : "Drag the corners or edges to crop, or drag inside to move it. Drag the dial below the photograph to straighten it. Press Return to apply or Escape to cancel. The border is added after cropping.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

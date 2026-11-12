@@ -1,6 +1,7 @@
 //! Platform-independent RAW development contract. Backends return upright (or
-//! explicitly unoriented), full-resolution, scene-linear sRGB, without an upper
-//! clamp or photographic tone curve. Preview and export share this entry point.
+//! explicitly unoriented), scene-linear sRGB, without an upper clamp or
+//! photographic tone curve. Interactive previews may request a reduced RAW
+//! decode; settled renders and exports use full resolution.
 
 use std::{fmt, path::Path, str::FromStr};
 
@@ -58,6 +59,8 @@ pub struct RawDecodeOptions {
     pub white_balance: RawWhiteBalance,
     pub apply_orientation: bool,
     pub lens_correction: LensCorrection,
+    /// Linear scale for a disposable interactive decode; 1 keeps full RAW resolution.
+    pub decode_scale: f32,
 }
 
 impl Default for RawDecodeOptions {
@@ -66,6 +69,7 @@ impl Default for RawDecodeOptions {
             white_balance: RawWhiteBalance::default(),
             apply_orientation: true,
             lens_correction: LensCorrection::default(),
+            decode_scale: 1.0,
         }
     }
 }
@@ -304,6 +308,7 @@ mod tests {
                 mode: crate::RawWhiteBalanceMode::Custom,
                 temperature: f64::NAN,
                 tint: 1.0,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -359,6 +364,7 @@ mod tests {
                     mode: RawWhiteBalanceMode::Custom,
                     temperature: 6504.0,
                     tint: 1.0,
+                    ..Default::default()
                 },
                 ..options
             },
@@ -374,6 +380,7 @@ mod tests {
                     mode: RawWhiteBalanceMode::Custom,
                     temperature: 3200.0,
                     tint: 0.8,
+                    ..Default::default()
                 },
                 ..options
             },

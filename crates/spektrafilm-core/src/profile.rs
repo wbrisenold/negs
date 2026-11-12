@@ -765,11 +765,20 @@ mod tests {
         let p = data_profile("ilford_hp5_plus").expect("bundled HP5 Plus profile");
         assert_eq!(p.data.development_time, vec![6.5, 9.5, 14.0]);
         assert_eq!(p.data.development_index(None), 0);
-        assert_eq!(p.data.base_density, base_density_column(&p.data.base_density_rows, 0));
+        assert_eq!(
+            p.data.base_density,
+            base_density_column(&p.data.base_density_rows, 0)
+        );
         let want: Vec<f64> = p.data.density_curves.iter().map(|r| r[0]).collect();
         let r = resolve_for_render(p.clone(), None);
         assert_eq!(r.data.development_time, vec![6.5]);
-        assert!(r.data.density_curves.iter().zip(&want).all(|(row, w)| row[0] == *w));
+        assert!(
+            r.data
+                .density_curves
+                .iter()
+                .zip(&want)
+                .all(|(row, w)| row[0] == *w)
+        );
         let r = resolve_for_render(p, Some(14.0));
         assert_eq!(r.data.development_time, vec![14.0]);
         let doublex = data_profile("kodak_doublex").expect("bundled Double-X");

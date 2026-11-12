@@ -63,11 +63,20 @@ mod tests {
         let image = ImageBuf::from_data(60, 40, vec![from_f64(1.75); 60 * 40 * 3]);
         let mut params = RuntimeParams::default();
         params.io.photo_long_side_px = Some(60);
-        let crop = Crop { x: 0.2, y: 0.25, width: 0.5, height: 0.5, angle: 0.0 };
+        let crop = Crop {
+            x: 0.2,
+            y: 0.25,
+            width: 0.5,
+            height: 0.5,
+            angle: 0.0,
+        };
         let (working, size) = prepare(image, &mut params, Some(&crop)).unwrap();
         assert_eq!((working.width, working.height), (120, 80));
         assert_eq!(size.photo, (60, 40));
-        assert_eq!((params.io.upscale_factor, params.io.photo_long_side_px), (1.0, None));
+        assert_eq!(
+            (params.io.upscale_factor, params.io.photo_long_side_px),
+            (1.0, None)
+        );
         // Highlights survive the enlargement.
         assert!(working.data.iter().all(|&v| (v as f64 - 1.75).abs() < 1e-5));
         // Prepared params ask for nothing more.

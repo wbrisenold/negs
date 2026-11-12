@@ -7,9 +7,9 @@ pub mod data;
 pub mod data_fs;
 pub mod enlarger;
 pub mod exposure_placement;
-pub mod illuminants;
 pub mod gamut_compression;
 pub mod grain;
+pub mod illuminants;
 pub mod image_size;
 pub mod input_gamut;
 pub mod lut_export;
@@ -27,3 +27,4 @@ pub mod stages;
 pub mod tone_curve;
 
 pub mod preview;
+pub mod referent;

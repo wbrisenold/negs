@@ -132,18 +132,24 @@ fn calibration_thresholds(white: [f64; 3]) -> Result<WhiteThresholds, String> {
     })
 }
 /// A pending trial render; boxed so the solve's steps can await it.
-pub type Rendering<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + 'a>>;
+pub type Rendering<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + 'a>>;
 
 /// How [`place_exposure_with`] renders its trials: `pipeline` on `image`,
 /// as [`Pipeline::process`] does. A browser awaits the GPU's readback.
 pub trait Renderer {
-    fn render<'a>(&'a mut self, pipeline: &'a Pipeline, image: ImageBuf) -> Rendering<'a, ImageBuf>;
+    fn render<'a>(&'a mut self, pipeline: &'a Pipeline, image: ImageBuf)
+    -> Rendering<'a, ImageBuf>;
 }
 
 /// Renders on `backend` at once, as [`place_exposure`] does.
 struct Now<'b>(&'b dyn ComputeBackend);
 impl Renderer for Now<'_> {
-    fn render<'a>(&'a mut self, pipeline: &'a Pipeline, image: ImageBuf) -> Rendering<'a, ImageBuf> {
+    fn render<'a>(
+        &'a mut self,
+        pipeline: &'a Pipeline,
+        image: ImageBuf,
+    ) -> Rendering<'a, ImageBuf> {
         Box::pin(std::future::ready(Ok(pipeline.process(image, self.0))))
     }
 }
@@ -152,7 +158,10 @@ impl Renderer for Now<'_> {
 /// whose renders all are.
 fn now<T>(future: impl std::future::Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);
-    match future.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+    match future
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    {
         std::task::Poll::Ready(value) => value,
         std::task::Poll::Pending => unreachable!("a synchronous placement render was pending"),
     }
@@ -355,7 +364,12 @@ pub fn place_exposure(
     reference: &ImageBuf,
     backend: &dyn ComputeBackend,
 ) -> Result<PlacementAnalysis, String> {
-    now(place_exposure_with(pipeline, source, reference, &mut Now(backend)))
+    now(place_exposure_with(
+        pipeline,
+        source,
+        reference,
+        &mut Now(backend),
+    ))
 }
 
 /// [`place_exposure`] with its trials rendered by `renderer`, which may
@@ -411,7 +425,13 @@ pub async fn place_exposure_with(
         reference.height,
         thresholds,
     )?;
-    let mut trials = Placement { meter, source, thresholds, cache: Default::default(), renderer };
+    let mut trials = Placement {
+        meter,
+        source,
+        thresholds,
+        cache: Default::default(),
+        renderer,
+    };
     let solution = solve_with(&target, &mut trials).await?;
     let source = trials.source;
     Ok(PlacementAnalysis {
@@ -450,7 +470,10 @@ impl Trials for Placement<'_> {
                 return Ok(d.clone());
             }
             self.meter.params.prep.exposure_ev = ev;
-            let output = self.renderer.render(&self.meter, self.source.clone()).await?;
+            let output = self
+                .renderer
+                .render(&self.meter, self.source.clone())
+                .await?;
             let output = display_srgb(output, &self.meter);
             let d = distribution(&rgba(&output), output.width, output.height, self.thresholds)?;
             self.cache.insert(key, d.clone());

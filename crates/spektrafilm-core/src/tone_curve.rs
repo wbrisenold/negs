@@ -50,7 +50,10 @@ pub struct ToneCurve {
 }
 
 fn triples(image: &ImageBuf, scale: f64) -> Vec<[f64; 3]> {
-    image.pixels().map(|p| [0, 1, 2].map(|c| p[c] as f64 * scale)).collect()
+    image
+        .pixels()
+        .map(|p| [0, 1, 2].map(|c| p[c] as f64 * scale))
+        .collect()
 }
 
 /// `count` greys, evenly spaced in film exposure over [`STOPS`], through
@@ -110,7 +113,8 @@ mod tests {
         let dir = data_dir();
         let film = profile::load_profile_by_name(&dir, "kodak_portra_400").unwrap();
         let print = profile::load_profile_by_name(&dir, "kodak_portra_endura").unwrap();
-        let pipeline = Pipeline::new_with_spectral(film, print, tone_params(&params), &dir).unwrap();
+        let pipeline =
+            Pipeline::new_with_spectral(film, print, tone_params(&params), &dir).unwrap();
         tone_curve(&pipeline, 65)
     }
 
@@ -119,11 +123,21 @@ mod tests {
         let curve = curve(RuntimeParams::default());
         let mid = 32;
         for c in 0..3 {
-            assert!(curve.film[mid][c].abs() < 0.05, "film {:?}", curve.film[mid]);
-            assert!(curve.paper.as_ref().unwrap()[mid][c].abs() < 0.05, "paper {:?}", curve.paper.as_ref().unwrap()[mid]);
+            assert!(
+                curve.film[mid][c].abs() < 0.05,
+                "film {:?}",
+                curve.film[mid]
+            );
+            assert!(
+                curve.paper.as_ref().unwrap()[mid][c].abs() < 0.05,
+                "paper {:?}",
+                curve.paper.as_ref().unwrap()[mid]
+            );
         }
         let luma = |rgb: [f64; 3]| 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
-        assert!(luma(curve.rgb[20]) < luma(curve.rgb[32]) && luma(curve.rgb[32]) < luma(curve.rgb[44]));
+        assert!(
+            luma(curve.rgb[20]) < luma(curve.rgb[32]) && luma(curve.rgb[32]) < luma(curve.rgb[44])
+        );
         // Brighter scene: a denser negative, less light on the paper.
         assert!(curve.paper.as_ref().unwrap()[44][1] < curve.paper.as_ref().unwrap()[20][1]);
     }

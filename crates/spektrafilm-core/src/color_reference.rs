@@ -32,10 +32,10 @@ use spektrafilm_math::interp::fast_interp_image_f64;
 use spektrafilm_math::precision::from_f64;
 use spektrafilm_math::spectral::{self, CMF_Y_F64};
 
+use crate::illuminants::select_illuminant_f64;
 use crate::params::RuntimeParams;
 use crate::profile::Profile;
 use crate::stages::printing::compute_single_pixel_raw;
-use crate::illuminants::select_illuminant_f64;
 
 /// Pre-computed scanner exposure correction for the active stocks/params.
 #[derive(Clone, Copy, Debug)]
@@ -238,7 +238,8 @@ impl ColorReference {
             );
             let mut out = [0.0f64; 3];
             for c in 0..3 {
-                out[c] = ((raw[c] * print_exposure_factor + preflash_raw[c]).max(0.0) + 1e-10).log10();
+                out[c] =
+                    ((raw[c] * print_exposure_factor + preflash_raw[c]).max(0.0) + 1e-10).log10();
             }
             out
         };
@@ -588,6 +589,9 @@ mod parity_tests {
         assert!((m - 1.2983743459314119).abs() < 1e-6, "m = {m}");
         assert!((q - -0.0044160680268989895).abs() < 1e-7, "q = {q}");
         let correction = cref.printing_exposure_correction;
-        assert!((correction - 1.1058804587422928).abs() < 1e-6, "printing_exposure_correction = {correction}");
+        assert!(
+            (correction - 1.1058804587422928).abs() < 1e-6,
+            "printing_exposure_correction = {correction}"
+        );
     }
 }

@@ -73,7 +73,8 @@ impl Default for InputInterpretation {
 }
 
 /// The colour spaces offered as [`InputMode::Assume`] overrides.
-pub const ASSUMABLE: [&str; 5] = ["sRGB", "Display P3", "Adobe RGB (1998)", "ProPhoto RGB", "ITU-R BT.2020"];
+pub const LOGC3_AWG3: &str = "ARRI LogC3 / AWG3";
+pub const ASSUMABLE: [&str; 6] = ["sRGB", "Display P3", "Adobe RGB (1998)", "ProPhoto RGB", "ITU-R BT.2020", LOGC3_AWG3];
 
 impl InputInterpretation {
     pub fn assume(color_space: &str, linear: bool) -> Self {
@@ -85,7 +86,10 @@ impl InputInterpretation {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.mode == InputMode::Assume && RgbColourspace::find(&self.color_space).is_none() {
+        if self.mode == InputMode::Assume
+            && self.color_space != LOGC3_AWG3
+            && RgbColourspace::find(&self.color_space).is_none()
+        {
             bail!("Unknown input colour space: {}", self.color_space);
         }
         Ok(())
@@ -179,6 +183,24 @@ enum Decode {
     Gray(Trc),
     /// A lookup-table profile to PCS XYZ, then to linear sRGB.
     Lut(icc::Lut),
+    /// ARRI LogC3 EI 800 in AWG3, decoded to scene-linear sRGB.
+    LogC3,
+}
+
+const AWG3_CHROMATICITIES: [[f64; 2]; 4] = [
+    [0.3127, 0.3290], // D65 white
+    [0.6840, 0.3130], // red
+    [0.2210, 0.8480], // green
+    [0.0861, -0.1020], // blue
+];
+
+fn decode_logc3_ei800(encoded: f64) -> f64 {
+    let cut = 5.367655 * 0.010591 + 0.092809;
+    if encoded > cut {
+        (10.0_f64.powf((encoded - 0.385537) / 0.247190) - 0.052272) / 5.555556
+    } else {
+        (encoded - 0.092809) / 5.367655
+    }
 }
 
 impl Decode {
@@ -384,6 +406,12 @@ pub fn convert(image: image::DynamicImage, info: &FileColour, interpretation: &I
     let automatic_summary = summary(auto.source, &auto.encoding);
     let decision = match interpretation.mode {
         InputMode::Auto => auto,
+        InputMode::Assume if interpretation.color_space == LOGC3_AWG3 => Decision {
+            decode: Decode::LogC3,
+            source: InputSource::Override,
+            encoding: "ARRI LogC3 EI 800 / AWG3".into(),
+            warning: None,
+        },
         InputMode::Assume => {
             let (cs, linear) = (space(&interpretation.color_space), interpretation.linear);
             let decode = Decode::named(cs, linear);
@@ -407,6 +435,7 @@ pub fn convert(image: image::DynamicImage, info: &FileColour, interpretation: &I
         },
     };
     let linear_srgb = decision.decode != Decode::Passthrough;
+    let scene_referred = decision.decode == Decode::LogC3;
     let mut image = apply(image, &decision.decode)?;
     // Float files can hold NaN or infinity, which no backend can render
     // consistently (GPU shaders may assume finite maths).
@@ -427,7 +456,7 @@ pub fn convert(image: image::DynamicImage, info: &FileColour, interpretation: &I
         automatic: automatic_summary,
         summary,
         warning,
-        scene_referred: false,
+        scene_referred,
         linear_srgb,
     }))
 }
@@ -495,6 +524,19 @@ fn apply(image: image::DynamicImage, decode: &Decode) -> Result<ImageBuf> {
                 let device: Vec<f64> = p.iter().map(|&v| f64::from(v)).collect();
                 let v = colorspace::mat3_vec_f64(&to_srgb, lut.eval(&device));
                 o.copy_from_slice(&v.map(from_f64));
+            });
+            out
+        }
+        Decode::LogC3 => {
+            let encoded = image.to_rgb32f().into_raw();
+            drop(image);
+            let awg3_to_srgb = chromaticities_to_srgb(AWG3_CHROMATICITIES)
+                .expect("ARRI Wide Gamut 3 primaries are valid");
+            let mut out: Vec<Scalar> = vec![from_f64(0.0); encoded.len()];
+            out.par_chunks_exact_mut(3).zip(encoded.par_chunks_exact(3)).for_each(|(o, p)| {
+                let linear_awg3 = std::array::from_fn(|i| decode_logc3_ei800(f64::from(p[i])));
+                let linear_srgb = colorspace::mat3_vec_f64(&awg3_to_srgb, linear_awg3);
+                o.copy_from_slice(&linear_srgb.map(from_f64));
             });
             out
         }

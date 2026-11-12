@@ -37,12 +37,139 @@ pub struct PostParams {
     /// Scales colourfulness at constant luminance; -100 is monochrome.
     #[serde(default)]
     pub saturation: f32,
+    /// Inferred color separation controls; the original DCTL source is opaque.
+    #[serde(default)]
+    pub color_separation: ColorSeparationParams,
+    #[serde(default)]
+    pub film_compression: FilmCompressionParams,
+    #[serde(default)]
+    pub film_expand: FilmExpandParams,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FilmCompressionParams {
+    #[serde(default)] pub enabled: bool,
+    #[serde(default)] pub impact: f32,
+    #[serde(default = "compression_white_default")] pub white_point: f32,
+    #[serde(default = "compression_range_default")] pub range: f32,
+    #[serde(default)] pub color_density: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FilmExpandParams {
+    #[serde(default)] pub enabled: bool,
+    #[serde(default)] pub blacks: f32,
+    #[serde(default)] pub whites: f32,
+    #[serde(default = "expand_mode_default")] pub mode: FilmExpandMode,
+    #[serde(default = "expand_impact_default")] pub impact: f32,
+}
+
+fn compression_white_default() -> f32 { 100.0 }
+fn compression_range_default() -> f32 { 50.0 }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum FilmExpandMode {
+    #[default]
+    Luminance,
+    #[serde(rename = "RGB")]
+    Rgb,
+}
+
+fn expand_mode_default() -> FilmExpandMode { FilmExpandMode::Luminance }
+fn expand_impact_default() -> f32 { 1.0 }
+
+impl Default for FilmCompressionParams {
+    fn default() -> Self { Self { enabled: false, impact: 0.0, white_point: 100.0, range: 50.0, color_density: 50.0 } }
+}
+impl Default for FilmExpandParams {
+    fn default() -> Self { Self { enabled: false, blacks: 0.0, whites: 100.0, mode: expand_mode_default(), impact: 1.0 } }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ColorSeparationParams {
+    #[serde(default)] pub strength: f32,
+    #[serde(default = "default_target_hue")] pub target_hue: f32,
+    #[serde(default = "default_complementary_hue")] pub complementary_hue: f32,
+    #[serde(default = "default_target_saturation")] pub target_saturation: f32,
+    #[serde(default)] pub luminance_mask: f32,
+    #[serde(default)] pub neutral_protection: f32,
+    #[serde(default)] pub method: f32,
+    #[serde(default)] pub color_wash: bool,
+}
+
+fn default_target_hue() -> f32 { 35.0 }
+fn default_complementary_hue() -> f32 { 215.0 }
+fn default_target_saturation() -> f32 { 20.0 }
+
+impl Default for ColorSeparationParams {
+    fn default() -> Self {
+        Self { strength: 0.0, target_hue: 35.0, complementary_hue: 215.0,
+            target_saturation: 20.0, luminance_mask: 0.0, neutral_protection: 70.0,
+            method: 50.0, color_wash: false }
+    }
 }
 
 impl PostParams {
     pub fn is_identity(&self) -> bool {
-        *self == Self::default()
+        self.brightness == 0.0 && self.contrast == 0.0 && self.whites == 0.0
+            && self.blacks == 0.0 && self.saturation == 0.0
+            && self.color_separation.strength == 0.0
+            && !self.film_compression.enabled && !self.film_expand.enabled
     }
+}
+
+fn hue_distance(a: f32, b: f32) -> f32 {
+    let d = (a - b).rem_euclid(360.0);
+    d.min(360.0 - d)
+}
+
+fn rgb_to_hsv(c: [f32; 3]) -> [f32; 3] {
+    let max = c[0].max(c[1]).max(c[2]);
+    let min = c[0].min(c[1]).min(c[2]);
+    let d = max - min;
+    let h = if d <= 1e-8 { 0.0 }
+        else if max == c[0] { 60.0 * ((c[1] - c[2]) / d).rem_euclid(6.0) }
+        else if max == c[1] { 60.0 * ((c[2] - c[0]) / d + 2.0) }
+        else { 60.0 * ((c[0] - c[1]) / d + 4.0) };
+    [h, if max <= 1e-8 { 0.0 } else { d / max }, max]
+}
+
+fn hsv_to_rgb(hsv: [f32; 3]) -> [f32; 3] {
+    let [h, s, v] = hsv;
+    let chroma = v * s;
+    let x = chroma * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let m = v - chroma;
+    let rgb = if h < 60.0 { [chroma, x, 0.0] }
+        else if h < 120.0 { [x, chroma, 0.0] }
+        else if h < 180.0 { [0.0, chroma, x] }
+        else if h < 240.0 { [0.0, x, chroma] }
+        else if h < 300.0 { [x, 0.0, chroma] }
+        else { [chroma, 0.0, x] };
+    rgb.map(|v| (v + m).clamp(0.0, 1.0))
+}
+
+/// Independent approximation of the published control set: isolate the
+/// chosen and complementary hue bands, then move them apart or wash toward
+/// the selected hue. It is not a reconstruction of the unavailable DCTL.
+fn apply_color_separation(rgb: [f32; 3], p: ColorSeparationParams) -> [f32; 3] {
+    if p.strength <= 0.0 { return rgb; }
+    let mut hsv = rgb_to_hsv(rgb);
+    let sat = hsv[1];
+    let protection = (1.0 - p.neutral_protection.clamp(0.0, 100.0) / 100.0)
+        .max(sat / 0.18).min(1.0);
+    let sat_mask = ((sat - p.target_saturation.clamp(0.0, 100.0) / 100.0) / 0.35).clamp(0.0, 1.0);
+    let lum_center = (0.5 + p.luminance_mask.clamp(-100.0, 100.0) / 200.0).clamp(0.0, 1.0);
+    let lum_mask = (1.0 - (hsv[2] - lum_center).abs() / 0.5).clamp(0.0, 1.0);
+    let target = (-0.5 * (hue_distance(hsv[0], p.target_hue) / 55.0).powi(2)).exp();
+    let complement = (-0.5 * (hue_distance(hsv[0], p.complementary_hue) / 55.0).powi(2)).exp();
+    let amount = p.strength.clamp(0.0, 100.0) / 100.0 * protection * sat_mask
+        * (0.35 + 0.65 * lum_mask);
+    let method = p.method.clamp(0.0, 100.0) / 100.0;
+    let hue_pull = if p.color_wash { target } else { target - complement };
+    let hue_delta = hue_distance(p.target_hue, p.complementary_hue);
+    let hue_delta = if ((p.target_hue - p.complementary_hue).rem_euclid(360.0)) > 180.0 { -hue_delta } else { hue_delta };
+    hsv[0] = (hsv[0] + hue_pull * amount * (1.0 - method) * hue_delta * 0.18).rem_euclid(360.0);
+    hsv[1] = (hsv[1] + (target + complement) * amount * method * 0.35).clamp(0.0, 1.0);
+    hsv_to_rgb(hsv)
 }
 
 /// sRGB-encoded middle grey (18% reflectance), the contrast pivot.
@@ -78,10 +205,18 @@ struct Transfer(&'static RgbColourspace);
 
 impl Transfer {
     fn decode(&self, v: f64) -> f64 {
-        if self.0.name == "sRGB" { srgb_decode(v) } else { self.0.cctf.decode(v) }
+        if self.0.name == "sRGB" {
+            srgb_decode(v)
+        } else {
+            self.0.cctf.decode(v)
+        }
     }
     fn encode(&self, v: f64) -> f64 {
-        if self.0.name == "sRGB" { srgb_encode(v) } else { self.0.cctf.encode(v) }
+        if self.0.name == "sRGB" {
+            srgb_encode(v)
+        } else {
+            self.0.cctf.encode(v)
+        }
     }
 }
 
@@ -131,6 +266,9 @@ pub struct PostProcess {
     encode: Vec<f32>,
     /// Linear luminance → adjusted linear luminance, sampled on √Y.
     tone: Vec<f32>,
+    color_separation: ColorSeparationParams,
+    film_compression: FilmCompressionParams,
+    film_expand: FilmExpandParams,
 }
 
 impl PostProcess {
@@ -150,6 +288,9 @@ impl PostProcess {
             decode: samples(&|v| space.decode(v)),
             encode: samples(&|s| space.encode(s * s)),
             tone: samples(&|s| srgb_decode(tone(params, srgb_encode(s * s)))),
+            color_separation: params.color_separation,
+            film_compression: params.film_compression,
+            film_expand: params.film_expand,
         }
     }
 
@@ -187,6 +328,49 @@ impl PostProcess {
             }
         }
         c = c.map(|v| (y2 + (v - y2) * f).clamp(0.0, 1.0));
+        // Hue is a perceptual control selected from the displayed scan. Run
+        // the hue-band operation in the output's encoded RGB space so its
+        // angle matches the hue seen in the image and in the picker. The
+        // surrounding tone work stays linear and the separation result is
+        // decoded before returning to the rest of the pipeline.
+        if (self.film_expand.enabled && self.film_expand.impact > 0.0)
+            || (self.film_compression.enabled && self.film_compression.impact > 0.0)
+            || self.color_separation.strength > 0.0
+        {
+        let mut display = c.map(|v| lookup(&self.encode, v.max(0.0).sqrt()));
+        if self.film_expand.enabled && self.film_expand.impact > 0.0 {
+            let p = &self.film_expand;
+            let black = p.blacks.clamp(-20.0, 30.0) / 100.0;
+            let white = p.whites.clamp(30.0, 120.0) / 100.0;
+            let span = (white - black).max(1e-6);
+            let amount = p.impact.clamp(0.0, 1.0);
+                let expanded = if p.mode == FilmExpandMode::Rgb {
+                display.map(|v| ((v - black) / span).clamp(0.0, 1.0))
+            } else {
+                let y = self.luma[0] * display[0] + self.luma[1] * display[1] + self.luma[2] * display[2];
+                let y2 = ((y - black) / span).clamp(0.0, 1.0);
+                if y <= 1e-8 { [y2; 3] } else { display.map(|v| (v * y2 / y).clamp(0.0, 1.0)) }
+            };
+            display = std::array::from_fn(|i| display[i] + (expanded[i] - display[i]) * amount);
+        }
+        if self.film_compression.enabled && self.film_compression.impact > 0.0 {
+            let p = self.film_compression;
+            let y = self.luma[0] * display[0] + self.luma[1] * display[1] + self.luma[2] * display[2];
+            let start = p.white_point.clamp(50.0, 120.0) / 100.0;
+            let range = (p.range.clamp(0.0, 100.0) / 100.0 * 0.5).max(0.01);
+            let compressed = if y <= start { y } else { start + range * (1.0 - (-(y - start) / range).exp()) };
+            let amount = p.impact.clamp(0.0, 100.0) / 100.0;
+            let target = y + (compressed - y) * amount;
+            if y > 1e-8 {
+                let density = 1.0 + p.color_density.clamp(0.0, 100.0) / 100.0 * amount;
+                display = display.map(|v| (target + (v - y) * target / y * density).clamp(0.0, 1.0));
+            }
+        }
+        if self.color_separation.strength > 0.0 {
+            display = apply_color_separation(display, self.color_separation);
+        }
+        c = display.map(|v| lookup(&self.decode, v));
+        }
         if self.encoded {
             c.map(|v| lookup(&self.encode, v.sqrt()))
         } else {
@@ -204,6 +388,30 @@ impl PostProcess {
             decode: self.decode.clone(),
             encode: self.encode.clone(),
             tone: self.tone.clone(),
+            color_separation: spektrafilm_gpu::DisplayColorSeparation {
+                strength: self.color_separation.strength,
+                target_hue: self.color_separation.target_hue,
+                complementary_hue: self.color_separation.complementary_hue,
+                target_saturation: self.color_separation.target_saturation,
+                luminance_mask: self.color_separation.luminance_mask,
+                neutral_protection: self.color_separation.neutral_protection,
+                method: self.color_separation.method,
+                color_wash: self.color_separation.color_wash,
+            },
+            film_compression: spektrafilm_gpu::DisplayFilmCompression {
+                enabled: self.film_compression.enabled,
+                impact: if self.film_compression.enabled { self.film_compression.impact / 100.0 } else { 0.0 },
+                white_point: self.film_compression.white_point / 100.0,
+                range: self.film_compression.range / 100.0,
+                color_density: self.film_compression.color_density / 100.0,
+            },
+            film_expand: spektrafilm_gpu::DisplayFilmExpand {
+                enabled: self.film_expand.enabled,
+                blacks: self.film_expand.blacks / 100.0,
+                whites: self.film_expand.whites / 100.0,
+                rgb_mode: self.film_expand.mode == FilmExpandMode::Rgb,
+                impact: if self.film_expand.enabled { self.film_expand.impact } else { 0.0 },
+            },
         }
     }
 
@@ -340,8 +548,18 @@ mod tests {
             p.contrast = 25.0;
             p.whites = -10.0;
         });
-        let colours = [[0.8f32, 0.3, 0.2], [0.2, 0.5, 0.7], [0.46, 0.46, 0.46], [0.9, 0.85, 0.1], [0.05, 0.04, 0.03]];
-        let srgb = ImageBuf::from_data(5, 1, colours.iter().flatten().map(|&v| from_f32(v)).collect());
+        let colours = [
+            [0.8f32, 0.3, 0.2],
+            [0.2, 0.5, 0.7],
+            [0.46, 0.46, 0.46],
+            [0.9, 0.85, 0.1],
+            [0.05, 0.04, 0.03],
+        ];
+        let srgb = ImageBuf::from_data(
+            5,
+            1,
+            colours.iter().flatten().map(|&v| from_f32(v)).collect(),
+        );
         let mut prophoto = srgb.clone();
         convert_output(&mut prophoto, "sRGB", "ProPhoto RGB", true);
         let a = PostProcess::new(&edit, true, "sRGB").applied(&srgb);
@@ -349,7 +567,12 @@ mod tests {
         convert_output(&mut b, "ProPhoto RGB", "sRGB", true);
         for (x, y) in a.data.iter().zip(&b.data) {
             // f32 tables and arithmetic, and two conversions.
-            assert!((to_f32(*x) - to_f32(*y)).abs() < 2e-3, "{:?} vs {:?}", a.data, b.data);
+            assert!(
+                (to_f32(*x) - to_f32(*y)).abs() < 2e-3,
+                "{:?} vs {:?}",
+                a.data,
+                b.data
+            );
         }
     }
 }
