@@ -666,6 +666,23 @@ impl Default for CurvesMorphParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderLook {
+    Off,
+    ReferentColorOnly,
+    ReferentOutput,
+    #[serde(alias = "hasselblad_hncs_learned")]
+    HasselbladHncs,
+    /// Smooth global-lightness variant that omits the upstream local CLAHE.
+    HasselbladHncsSmooth,
+    ReferentColorHncs,
+    #[serde(alias = "referent_output_hncs_learned_tone")]
+    ReferentOutputHncsTone,
+    /// Referent output transform followed by smooth global HNCS-style tone.
+    ReferentOutputHncsSmoothTone,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IoParams {
     /// Input RAW development only; independent of scanner white correction.
@@ -688,11 +705,13 @@ pub struct IoParams {
     pub input_color_space: String,
     #[serde(default)]
     pub input_cctf_decoding: bool,
-    /// Apply the chosen scene-referred camera input rendering LUT exactly
-    /// once before the film model. This is an ODT, so exposure is placed
-    /// before it and its Rec.709 output is decoded back to linear light.
+    /// Legacy switch for sidecars that predate `render_look`.
     #[serde(default = "default_true")]
     pub referent_logc3_enabled: bool,
+    /// Explicit look/rendering choice. `None` reads older sidecars through the
+    /// legacy Referent toggle until the user chooses a mode.
+    #[serde(default)]
+    pub render_look: Option<RenderLook>,
     #[serde(default = "default_referent_path")]
     pub referent_logc3_path: String,
     /// Set by the loader; rendered JPEG/PNG sources must not be treated as
@@ -742,6 +761,7 @@ impl Default for IoParams {
             input_color_space: "ProPhoto RGB".into(),
             input_cctf_decoding: false,
             referent_logc3_enabled: true,
+            render_look: None,
             referent_logc3_path: default_referent_path(),
             input_scene_referred: false,
             output_color_space: "sRGB".into(),
@@ -760,6 +780,20 @@ impl Default for IoParams {
 }
 
 impl IoParams {
+    pub fn effective_render_look(&self) -> RenderLook {
+        match self.render_look {
+            Some(RenderLook::Off) => RenderLook::Off,
+            Some(RenderLook::ReferentColorOnly) => RenderLook::ReferentColorOnly,
+            Some(RenderLook::ReferentColorHncs) => RenderLook::ReferentColorHncs,
+            Some(RenderLook::HasselbladHncs) => RenderLook::HasselbladHncs,
+            Some(RenderLook::HasselbladHncsSmooth) => RenderLook::HasselbladHncsSmooth,
+            Some(RenderLook::ReferentOutput) => RenderLook::ReferentOutput,
+            Some(RenderLook::ReferentOutputHncsTone) => RenderLook::ReferentOutputHncsTone,
+            Some(RenderLook::ReferentOutputHncsSmoothTone) => RenderLook::ReferentOutputHncsSmoothTone,
+            _ => RenderLook::ReferentOutput,
+        }
+    }
+
     /// Sets the pipeline's input fields for an image the loader read as
     /// `colour`: the engine's representation (linear sRGB, unclamped), unless
     /// the values were passed through for these fields (manual mode).

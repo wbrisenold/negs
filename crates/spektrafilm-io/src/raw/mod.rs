@@ -61,6 +61,8 @@ pub struct RawDecodeOptions {
     pub lens_correction: LensCorrection,
     /// Linear scale for a disposable interactive decode; 1 keeps full RAW resolution.
     pub decode_scale: f32,
+    /// Optional upper bound for a reduced read, in pixels on the long side.
+    pub max_long_side: u32,
 }
 
 impl Default for RawDecodeOptions {
@@ -70,6 +72,7 @@ impl Default for RawDecodeOptions {
             apply_orientation: true,
             lens_correction: LensCorrection::default(),
             decode_scale: 1.0,
+            max_long_side: 0,
         }
     }
 }
@@ -95,6 +98,11 @@ pub trait RawDecoder: Send + Sync {
 
 pub struct RawImage {
     pub image: ImageBuf,
+    /// Camera-reported RAW WB gains in R/G1/B/G2 order, when available.
+    pub as_shot_white_balance: Option<[Option<f32>; 4]>,
+    /// The size of the whole read, upright as `image`, when this is a reduced
+    /// one ([`RawDecodeOptions::max_long_side`]); None when it is the whole.
+    pub reduced_from: Option<(u32, u32)>,
     /// The decoder can apply [`LensCorrection`] to this file, whether or not
     /// it was requested.
     pub lens_correction_supported: bool,
@@ -114,6 +122,8 @@ impl RawDecoder for RawlerDecoder {
         let raw = crate::load_raw_rawler(path, options.apply_orientation, options.white_balance, options.lens_correction)?;
         Ok(RawImage {
             image: raw.image,
+            as_shot_white_balance: raw.as_shot_white_balance,
+            reduced_from: None,
             lens_correction_supported: raw.lens.is_some(),
             decoder_version: None,
         })
@@ -122,6 +132,9 @@ impl RawDecoder for RawlerDecoder {
 
 pub struct DecodedRaw {
     pub image: ImageBuf,
+    pub as_shot_white_balance: Option<[Option<f32>; 4]>,
+    /// As [`RawImage::reduced_from`].
+    pub reduced_from: Option<(u32, u32)>,
     pub decoder: &'static str,
     pub lens_correction_supported: bool,
     pub decoder_version: Option<String>,
@@ -131,6 +144,8 @@ impl DecodedRaw {
     fn new(raw: RawImage, decoder: &dyn RawDecoder) -> Self {
         Self {
             image: raw.image,
+            as_shot_white_balance: raw.as_shot_white_balance,
+            reduced_from: raw.reduced_from,
             decoder: decoder.name(),
             lens_correction_supported: raw.lens_correction_supported,
             decoder_version: raw.decoder_version,
@@ -140,8 +155,9 @@ impl DecodedRaw {
 
 /// Ordered compatibility attempts. Every failure is retained if all versions
 /// decline; fatal errors stop immediately rather than hiding damaged input or
-/// an exhausted allocation behind a different decoder.
-#[cfg(any(test, all(target_os = "macos", feature = "apple-raw")))]
+/// an exhausted allocation behind a different decoder. `AppleRawDecoder`
+/// follows this order for RAW 9 and 8 from one filter.
+#[cfg(test)]
 fn decode_compatible(
     decoders: &[&dyn RawDecoder],
     path: &Path,
@@ -234,6 +250,8 @@ mod tests {
                 2 => bail!("render failed"),
                 _ => Ok(RawImage {
                     image: ImageBuf::new(1, 1),
+                    as_shot_white_balance: None,
+                    reduced_from: None,
                     lens_correction_supported: false,
                     decoder_version: None,
                 }),
@@ -444,6 +462,91 @@ mod tests {
         let ours = upright.image.oriented(orientation);
         assert_eq!((ours.width, ours.height), (apple.width, apple.height));
         assert!(ours.data == apple.data, "orientation {orientation} differs from Apple's");
+        Ok(())
+    }
+
+    /// A read limited in size is a smaller copy of the same picture: the same
+    /// shape and the same colours region by region, and it reports the whole
+    /// read's size. No limit, or one the sensor is within, is the whole read.
+    #[cfg(all(target_os = "macos", feature = "apple-raw"))]
+    #[test]
+    #[ignore = "requires a local camera RAW: set SPEKTRAFILM_RAW_TEST_FILE"]
+    fn apple_raw_reduced_read_matches_the_whole_one() -> Result<()> {
+        let path = std::env::var_os("SPEKTRAFILM_RAW_TEST_FILE")
+            .context("SPEKTRAFILM_RAW_TEST_FILE is required")?;
+        let path = Path::new(&path);
+        for lens_correction in [LensCorrection { enabled: false }, LensCorrection { enabled: true }] {
+            let whole = AppleRawDecoder.decode(path, RawDecodeOptions { lens_correction, ..Default::default() })?;
+            let full = &whole.image;
+            assert!(whole.reduced_from.is_none());
+            let reduced = AppleRawDecoder.decode(
+                path,
+                RawDecodeOptions { lens_correction, max_long_side: 1200, ..Default::default() },
+            )?;
+            assert_eq!(reduced.reduced_from, Some((full.width, full.height)));
+            assert_eq!(reduced.lens_correction_supported, whole.lens_correction_supported);
+            let small = &reduced.image;
+            assert_eq!(small.width.max(small.height), 1200);
+            let aspect = |w: u32, h: u32| w as f64 / h as f64;
+            assert!((aspect(full.width, full.height) - aspect(small.width, small.height)).abs() < 0.01);
+            let region = |image: &ImageBuf, cx: u32, cy: u32| -> [f64; 3] {
+                let (x0, x1) = (image.width * cx / 8, image.width * (cx + 1) / 8);
+                let (y0, y1) = (image.height * cy / 8, image.height * (cy + 1) / 8);
+                let mut total = [0.0f64; 3];
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let i = (y as usize * image.width as usize + x as usize) * 3;
+                        for (c, total) in total.iter_mut().enumerate() {
+                            *total += image.data[i + c] as f64;
+                        }
+                    }
+                }
+                let n = ((x1 - x0) * (y1 - y0)) as f64;
+                total.map(|t| t / n)
+            };
+            for cy in 0..8 {
+                for cx in 0..8 {
+                    let (a, b) = (region(full, cx, cy), region(small, cx, cy));
+                    for c in 0..3 {
+                        assert!((a[c] - b[c]).abs() < 0.01, "region {cx},{cy} channel {c}: {} and {}", a[c], b[c]);
+                    }
+                }
+            }
+            let wide = AppleRawDecoder.decode(
+                path,
+                RawDecodeOptions { lens_correction, max_long_side: 100_000, ..Default::default() },
+            )?;
+            assert!(wide.reduced_from.is_none());
+            assert!(wide.image.data == full.data);
+        }
+        Ok(())
+    }
+
+    /// Ticket 39: choosing RAW 9 or 8 from one filter decodes each file as
+    /// trying 9 and then 8 did: the same generation, pixels and facts.
+    #[cfg(all(target_os = "macos", feature = "apple-raw"))]
+    #[test]
+    #[ignore = "requires local camera RAW files in SPEKTRAFILM_TEST_RAWS"]
+    fn apple_raw_chooses_the_generation_trying_9_then_8_did() -> Result<()> {
+        let paths = std::env::var_os("SPEKTRAFILM_TEST_RAWS").context("set SPEKTRAFILM_TEST_RAWS")?;
+        for path in std::env::split_paths(&paths) {
+            for options in [
+                RawDecodeOptions::default(),
+                RawDecodeOptions { lens_correction: LensCorrection { enabled: true }, max_long_side: 1200, ..Default::default() },
+            ] {
+                let started = std::time::Instant::now();
+                let tried = decode_compatible(&[&apple::AppleRawVersion(9), &apple::AppleRawVersion(8)], &path, options)?;
+                let tried_time = started.elapsed();
+                let started = std::time::Instant::now();
+                let chosen = AppleRawDecoder.decode(&path, options)?;
+                eprintln!("{}: {:?}, tried 9 then 8 {tried_time:?}, chosen {:?}", path.display(), chosen.decoder_version, started.elapsed());
+                assert_eq!(chosen.decoder_version, tried.decoder_version, "{}", path.display());
+                assert_eq!((chosen.image.width, chosen.image.height), (tried.image.width, tried.image.height));
+                assert!(chosen.image.data == tried.image.data, "{}", path.display());
+                assert_eq!(chosen.reduced_from, tried.reduced_from);
+                assert_eq!(chosen.lens_correction_supported, tried.lens_correction_supported);
+            }
+        }
         Ok(())
     }
 }

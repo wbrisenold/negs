@@ -10,10 +10,21 @@ import QuartzCore
 /// turns round. SPEKTRAFILM_BENCHMARK_SHOTS names a folder for a screenshot
 /// in the middle of each speed and after the last.
 ///
-/// SPEKTRAFILM_BENCHMARK_GRID_FILL: waits for the first edited thumbnail the
-/// background helper makes, copies it to every other edited item's name,
-/// and quits, so a later run scrolls with every edited thumbnail on disk
-/// without developing them all. Compiled only with -DSPEKTRAFILM_BENCHMARK.
+/// SPEKTRAFILM_BENCHMARK_GRID_FILL: waits for the first thumbnail the
+/// background helper makes, copies it to every other item's name, and
+/// quits, so a later run scrolls with every thumbnail on disk without
+/// developing them all.
+///
+/// SPEKTRAFILM_BENCHMARK_THUMBNAILS: opens the grid in the same window and
+/// times the background helper developing the folder's thumbnails: until
+/// the cells first on screen have theirs, each tenth of the folder, and the
+/// whole, with the app's memory. Quits once every photograph has one, or
+/// after a minute without a new one.
+///
+/// SPEKTRAFILM_BENCHMARK_GRID_POSITION: leaves the session's photograph for
+/// the grid as a double-click does, while the inspector slides away, and
+/// reports whether the photograph is on screen. Compiled only with
+/// -DSPEKTRAFILM_BENCHMARK.
 @MainActor final class GridBenchmark: NSObject {
     private let model: EditorModel
     private let segments: [(speed: Double, seconds: Double)]
@@ -24,6 +35,7 @@ import QuartzCore
     private var segment = 0, segmentStart = 0.0, lastTimestamp = 0.0, direction = 1.0, position = 0.0, shot = false
     private var intervals: [Double] = [], nominal: [Double] = [], busy: [Double] = []
     private var awake = CFAbsoluteTimeGetCurrent(), measuring = false
+    private var segmentCells = (requests: 0, hits: 0)
     private var peak = 0, startFootprint = 0
     private static var running: GridBenchmark?
 
@@ -31,6 +43,11 @@ import QuartzCore
         let environment = ProcessInfo.processInfo.environment
         guard !LaunchBenchmark.enabled else { return }
         if environment["SPEKTRAFILM_BENCHMARK_GRID_FILL"] != nil { return fill(model) }
+        if environment["SPEKTRAFILM_BENCHMARK_THUMBNAILS"] != nil { return thumbnails(model) }
+        if environment["SPEKTRAFILM_BENCHMARK_GRID_POSITION"] != nil { return position(model) }
+        if environment["SPEKTRAFILM_BENCHMARK_OPEN_NEXT"] != nil {
+            return openNext(model, shots: environment["SPEKTRAFILM_BENCHMARK_SHOTS"].map { URL(fileURLWithPath: $0) })
+        }
         guard let spec = environment["SPEKTRAFILM_BENCHMARK_GRID"] else { return }
         let segments = spec.split(separator: ",").compactMap { part -> (Double, Double)? in
             let values = part.split(separator: ":").compactMap { Double($0) }
@@ -84,7 +101,7 @@ import QuartzCore
                 case 2 where Date().timeIntervalSince(self.phaseStart) > 2:
                     // Settled at the top: scroll.
                     let documentHeight = self.scrollView?.documentView?.frame.height ?? 0
-                    Self.report("grid \(Int(self.scrollView?.contentView.bounds.width ?? 0))×\(Int(self.scrollView?.contentView.bounds.height ?? 0)) pt, \(model.gridColumns) columns, document \(Int(documentHeight)) pt high")
+                    Self.report("grid \(Int(self.scrollView?.contentView.bounds.width ?? 0))×\(Int(self.scrollView?.contentView.bounds.height ?? 0)) pt, \(model.gridLayout?.rows.count ?? 0) rows, document \(Int(documentHeight)) pt high")
                     self.startFootprint = Self.footprint(); self.peak = self.startFootprint
                     self.phase = 3
                     self.startSegment(0)
@@ -102,6 +119,7 @@ import QuartzCore
 
     private func startSegment(_ index: Int) {
         segment = index; shot = false
+        segmentCells = PhotoThumbnails.cellCounts.withLock { $0 }
         intervals = []; nominal = []; busy = []
         lastTimestamp = 0
         guard let view = scrollView else { return }
@@ -155,6 +173,7 @@ import QuartzCore
 
     private func finishSegment() {
         let (speed, seconds) = segments[segment]
+        let cells = PhotoThumbnails.cellCounts.withLock { $0 }
         let frame = nominal.sorted()[nominal.count / 2]
         // A frame the display showed without a new one from the app.
         let missed = intervals.reduce(0) { $0 + max(0, Int(($1 / frame).rounded()) - 1) }
@@ -166,10 +185,21 @@ import QuartzCore
         Self.report(String(format: "scroll %.0f pt/s for %.0f s: %d frames at %.1f ms, %d missed (%.1f%%); frame interval p50 %@ p95 %@ p99 %@ worst %@ ms; ",
                            speed, seconds, intervals.count, frame, missed, 100 * Double(missed) / max(expected, 1),
                            pct(sortedIntervals, 50), pct(sortedIntervals, 95), pct(sortedIntervals, 99), pct(sortedIntervals, 100))
-                    + "main run-loop busy p50 \(pct(sortedBusy, 50)) p95 \(pct(sortedBusy, 95)) p99 \(pct(sortedBusy, 99)) worst \(pct(sortedBusy, 100)) ms over \(busy.count) passes")
+                    + "main run-loop busy p50 \(pct(sortedBusy, 50)) p95 \(pct(sortedBusy, 95)) p99 \(pct(sortedBusy, 99)) worst \(pct(sortedBusy, 100)) ms over \(busy.count) passes; "
+                    + "cells' thumbnails \(cells.requests - segmentCells.requests) asked, \(cells.requests - cells.hits - segmentCells.requests + segmentCells.hits) not in memory")
     }
 
     /// The tallest scroll view in the editor window: the grid's.
+    private static func scrollViews() -> [NSScrollView] {
+        guard let root = NSApp.windows.first(where: { $0.isVisible && $0.contentViewController != nil })?.contentView else { return [] }
+        var found: [NSScrollView] = [], stack: [NSView] = [root]
+        while let view = stack.popLast() {
+            if let scroll = view as? NSScrollView { found.append(scroll) }
+            stack.append(contentsOf: view.subviews)
+        }
+        return found
+    }
+
     private static func gridScrollView() -> NSScrollView? {
         guard let root = NSApp.windows.first(where: { $0.isVisible && $0.contentViewController != nil })?.contentView else { return nil }
         var best: NSScrollView?, stack: [NSView] = [root]
@@ -181,20 +211,167 @@ import QuartzCore
         return best
     }
 
+    /// SPEKTRAFILM_BENCHMARK_GRID_POSITION: leaves the session's photograph
+    /// for the grid as a double-click on it does, and reports whether the
+    /// photograph is on screen a moment later and once settled.
+    private static func position(_ model: EditorModel) {
+        var phase = 0, shown = Date()
+        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { timer in
+            MainActor.assumeIsolated {
+                let library = model.library
+                switch phase {
+                case 0 where model.ready && library.summariesLoaded && (model.previewCurrent || model.renderFailed):
+                    if let window = NSApp.windows.first(where: { $0.isVisible && $0.contentViewController != nil }) {
+                        window.setFrame(NSRect(x: 40, y: 40, width: 1400, height: 900), display: true)
+                    }
+                    shown = Date(); phase = -1
+                case -1 where Date().timeIntervalSince(shown) > 1:
+                    // Settled in the photo view, as a user double-clicking is.
+                    model.doubleClickPhotograph(zoomed: false)
+                    shown = Date(); phase = 1
+                case 1 where Date().timeIntervalSince(shown) > 0.12, 2 where Date().timeIntervalSince(shown) > 2:
+                    let shownPhotos = model.shownPhotos
+                    // The grid's own scroll view: its document is as tall as the sheet's layout says.
+                    let grid = scrollViews().first { scroll in
+                        guard let layout = model.gridLayout else { return false }
+                        return abs((scroll.documentView?.frame.height ?? 0) - max(layout.height, scroll.contentView.bounds.height)) < 2
+                    }
+                    guard let scroll = grid, let layout = model.gridLayout, let current = model.selection.current,
+                          let index = shownPhotos.firstIndex(where: { $0.url == current }), layout.frames.indices.contains(index) else {
+                        report("no grid or no current photograph"); timer.invalidate(); return NSApp.terminate(nil)
+                    }
+                    let visible = scroll.contentView.bounds
+                    let cell = layout.frames[index]
+                    report("grid position after \(phase == 1 ? "0.12" : "2") s: grid \(Int(visible.width)) pt wide, photograph \(index + 1) of \(shownPhotos.count), \(layout.rows.count) rows, cell y \(Int(cell.minY))–\(Int(cell.maxY)), visible y \(Int(visible.minY))–\(Int(visible.maxY)) of \(Int(scroll.documentView?.frame.height ?? 0)): \(visible.minY <= cell.minY && cell.maxY <= visible.maxY ? "on screen" : "OFF SCREEN")")
+                    if let shots = ProcessInfo.processInfo.environment["SPEKTRAFILM_BENCHMARK_SHOTS"] { capture(URL(fileURLWithPath: shots).appendingPathComponent("grid-\(phase).png")) }
+                    if phase == 2 { timer.invalidate(); NSApp.terminate(nil) }
+                    phase += 1
+                default: break
+                }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    /// SPEKTRAFILM_BENCHMARK_OPEN_NEXT: once the next five photographs'
+    /// thumbnails are developed (or after a minute), opens each in turn as →
+    /// does, then goes back through them as ← does, and reports when its
+    /// stand-in, its placeholder (its kept develop, else the camera's
+    /// preview) and the develop first showed; with SPEKTRAFILM_BENCHMARK_SHOTS,
+    /// a screenshot at the stand-in, the placeholder and the develop.
+    private static func openNext(_ model: EditorModel, shots: URL?) {
+        var phase = 0, started = Date(), opened = 0, kept = false
+        var standIn: Double?, placeholder: Double?, developed: Double?
+        let timer = Timer(timeInterval: 1.0 / 240, repeats: true) { timer in
+            MainActor.assumeIsolated {
+                let library = model.library, store = model.editedThumbnails
+                let elapsed = Date().timeIntervalSince(started) * 1000
+                switch phase {
+                case 0 where model.ready && library.summariesLoaded && model.thumbnailStamp != nil && model.previewCurrent:
+                    if let window = NSApp.windows.first(where: { $0.isVisible && $0.contentViewController != nil }) {
+                        window.setFrame(NSRect(x: 40, y: 40, width: 1400, height: 900), display: true)
+                    }
+                    phase = 1; started = Date()
+                case 1:
+                    let items = library.items
+                    guard let open = model.sourceItem, let index = items.firstIndex(where: { $0.url == open }) else { return }
+                    let next = items[(index + 1)..<min(index + 6, items.count)]
+                    let ready = next.allSatisfy { file in
+                        model.thumbnailLook(for: file.url).flatMap { store.key(for: file, look: $0) }.map(store.contains) ?? false
+                    }
+                    guard ready || elapsed > 60_000 else { return }
+                    report("next thumbnails \(ready ? "ready" : "NOT all ready") after \(Int(elapsed)) ms")
+                    phase = 2
+                case 2:
+                    standIn = nil; placeholder = nil; developed = nil
+                    let step = opened < 5 ? 1 : -1
+                    if let open = model.sourceItem, let index = library.items.firstIndex(where: { $0.url == open }),
+                       library.items.indices.contains(index + step) {
+                        kept = model.keptRender(of: library.items[index + step].url)?() != nil
+                    }
+                    started = Date()
+                    model.step(by: step)
+                    opened += 1
+                    phase = 3
+                case 3:
+                    if standIn == nil, model.standIn != nil {
+                        standIn = elapsed
+                        if let shots { capture(shots.appendingPathComponent("open-\(opened)-standin.png"), wait: false) }
+                    }
+                    if placeholder == nil, model.placeholder != nil {
+                        placeholder = elapsed
+                        if let shots { capture(shots.appendingPathComponent("open-\(opened)-placeholder.png"), wait: false) }
+                    }
+                    if developed == nil, model.image != nil { developed = elapsed }
+                    guard model.previewCurrent, !model.brightnessMatchPending, developed != nil else { return }
+                    if let shots { capture(shots.appendingPathComponent("open-\(opened)-developed.png")) }
+                    func ms(_ value: Double?) -> String { value.map { "\(Int($0)) ms" } ?? "never" }
+                    report("opened \(model.sourceItem?.lastPathComponent ?? "?") (\(kept ? "develop kept" : "nothing kept")): stand-in \(ms(standIn)), placeholder \(ms(placeholder)), develop \(ms(developed))")
+                    if opened == 10 { timer.invalidate(); NSApp.terminate(nil) } else { phase = 2 }
+                default: break
+                }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
     private static func fill(_ model: EditorModel) {
         let timer = Timer(timeInterval: 0.25, repeats: true) { timer in
             MainActor.assumeIsolated {
                 let library = model.library, store = model.editedThumbnails
                 guard library.summariesLoaded, let made = model.thumbnailVersions.keys.first,
-                      let madeFile = library.items.first(where: { $0.url == made }), let look = library.looks[made],
+                      let madeFile = library.items.first(where: { $0.url == made }), let look = model.thumbnailLook(for: made),
                       let source = store.key(for: madeFile, look: look).map(store.url(for:)) else { return }
                 timer.invalidate()
                 var copied = 0
+                // Every item, edited or not: each has a developed thumbnail once the folder's filled.
                 for file in library.items where file.url != made {
-                    guard let look = library.looks[file.url], let key = store.key(for: file, look: look), !store.contains(key) else { continue }
+                    guard let look = model.thumbnailLook(for: file.url), let key = store.key(for: file, look: look), !store.contains(key) else { continue }
                     if (try? FileManager.default.copyItem(at: source, to: store.url(for: key))) != nil { copied += 1 }
                 }
-                report("filled \(copied) edited thumbnails from \(made.lastPathComponent)")
+                report("filled \(copied) thumbnails from \(made.lastPathComponent)")
+                NSApp.terminate(nil)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private static func thumbnails(_ model: EditorModel) {
+        let launched = Date()
+        var shown: Date?, screen: Set<URL> = [], screenDone = false, tenth = 1
+        var lastMade = 0, lastChange = Date(), peak = 0
+        let timer = Timer(timeInterval: 0.25, repeats: true) { timer in
+            MainActor.assumeIsolated {
+                let library = model.library
+                guard let start = shown else {
+                    guard model.ready, library.summariesLoaded, model.thumbnailStamp != nil, model.previewCurrent || model.renderFailed else { return }
+                    if let window = NSApp.windows.first(where: { $0.isVisible && $0.contentViewController != nil }) {
+                        window.setFrame(NSRect(x: 40, y: 40, width: 1400, height: 900), display: true)
+                    }
+                    model.showGrid()
+                    shown = Date()
+                    report("grid shown \(Int(Date().timeIntervalSince(launched) * 1000)) ms after launch, \(library.items.count) items, \(library.looks.count) edited")
+                    return
+                }
+                let elapsed = Date().timeIntervalSince(start), versions = model.thumbnailVersions
+                let made = versions.count, total = library.items.count
+                peak = max(peak, footprint())
+                // The cells the grid laid out first (before then, the strip's).
+                if screen.isEmpty, elapsed > 2 { screen = model.thumbnailsOnScreen }
+                if !screenDone, !screen.isEmpty, screen.allSatisfy({ versions[$0] != nil }) {
+                    screenDone = true
+                    report("the \(screen.count) first on screen in \(Int(elapsed * 1000)) ms")
+                }
+                while tenth <= 10, made * 10 >= total * tenth {
+                    report(String(format: "%d of %d in %.1f s, %.0f ms each, %.0f MB", made, total, elapsed, elapsed * 1000 / Double(max(made, 1)), Double(footprint()) / 1e6))
+                    tenth += 1
+                }
+                if made != lastMade { lastMade = made; lastChange = Date() }
+                let finished = library.items.allSatisfy { versions[$0.url] != nil }
+                guard finished || Date().timeIntervalSince(lastChange) > 60 else { return }
+                if !finished { report("stopped at \(made) of \(total): a minute without a new one") }
+                report(String(format: "memory: peak %.0f MB, %.0f MB at the end", Double(peak) / 1e6, Double(footprint()) / 1e6))
+                timer.invalidate()
                 NSApp.terminate(nil)
             }
         }

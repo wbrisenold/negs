@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// The edit view shows one photograph; the grid shows the folder.
@@ -17,14 +18,9 @@ struct LibrarySelection: Equatable, Sendable {
     private(set) var lead: URL?
     /// The selection a range is added to: as it was when the anchor was set.
     private var base: Set<URL> = []
-    /// Photographs a rating or flag just changed: they stay shown, even if
-    /// the filter now leaves them out, until the selection changes. Rating a
-    /// run of photographs never makes the selection jump.
+    /// Ratings or flags just changed stay visible until the selection moves.
     private(set) var kept: Set<URL> = []
-
-    /// The photographs a filter must still show.
     var visible: Set<URL> { current.map { kept.union([$0]) } ?? kept }
-
     /// Plain click: only `photo`, and it's current.
     mutating func select(_ photo: URL) {
         current = photo; selected = [photo]; anchor = photo; lead = photo; base = [photo]; kept = []
@@ -37,10 +33,20 @@ struct LibrarySelection: Equatable, Sendable {
         selected = Set(photos); base = selected
     }
 
-    /// ⌘-click: adds or removes `photo`. The current photograph stays.
-    mutating func toggle(_ photo: URL) {
-        guard current != nil else { return select(photo) }
-        guard photo != current else { return }
+    /// ⌘-click: adds or removes `photo`. The current photograph stays,
+    /// unless it's the one removed and `order` is given (the grid): then
+    /// the next selected photograph to its right becomes current, or the
+    /// nearest to its left. The only one selected stays.
+    mutating func toggle(_ photo: URL, in order: [URL]? = nil) {
+        guard let current else { return select(photo) }
+        guard photo != current else {
+            guard let order, let index = order.firstIndex(of: current),
+                  let next = order[(index + 1)...].first(where: selected.contains)
+                    ?? order[..<index].last(where: selected.contains) else { return }
+            selected.remove(current); self.current = next; kept = []
+            anchor = next; lead = next; base = selected
+            return
+        }
         if selected.contains(photo) { selected.remove(photo) } else { selected.insert(photo) }
         anchor = photo; lead = photo; base = selected; kept = []
     }
@@ -64,6 +70,7 @@ struct LibrarySelection: Equatable, Sendable {
 
     /// ⌘A: everything shown.
     mutating func selectAll(_ shown: [URL]) {
+        if current == nil, let first = shown.first { select(first) }
         guard let current else { return }
         selected = Set(shown).union([current]); anchor = current; lead = current; base = selected; kept = []
     }
@@ -89,66 +96,120 @@ struct LibrarySelection: Equatable, Sendable {
         if let lead, !selected.contains(lead) { self.lead = current }
     }
 
-    /// Keeps `photos` shown until the selection changes.
-    mutating func keep(_ photos: some Sequence<URL>) { kept.formUnion(photos) }
-
     /// The selected photographs in `order`.
     func ordered(_ order: [URL]) -> [URL] { order.filter { selected.contains($0) } }
+    mutating func keep(_ photos: some Sequence<URL>) { kept.formUnion(photos) }
 }
 
-/// The grid's layout, worked out rather than measured, so moving up or down
-/// a row and the rubber band know where every cell is.
-struct GridMetrics: Equatable {
-    /// The photograph's box; the name sits under it.
-    let cell: CGFloat
-    let columns: Int
-    let inset: CGFloat
-    static let spacing: CGFloat = 14
-    static let padding: CGFloat = 20
-    static let nameHeight: CGFloat = 20
-    /// The film strip's thumbnail proportions.
-    static let aspect: CGFloat = 68.0 / 96.0
+/// The sheet's layout (§4.6): thumbnails packed edge to edge in rows with
+/// gaps of 6, each at its own proportions, every full row stretched or
+/// shrunk a little to the sheet's width, and the last row left short at the
+/// chosen height. Worked out rather than measured, so moving up or down a
+/// row, the rubber band and the scroll position know where every cell is.
+struct SheetLayout: Equatable {
+    struct Row: Equatable {
+        let range: Range<Int>
+        let y: CGFloat
+        let height: CGFloat
+    }
+
+    static let gap = Theme.Size.gridGap
+    /// The grid's padding: 24 at the top and bottom, room for a box (round
+    /// 20) on the first and last rows, whose ends run up to 24 pt past the
+    /// picture; 16 at the sides.
+    static let top: CGFloat = 24, side: CGFloat = 16, bottom: CGFloat = 24
+    /// The chosen row height (the foot's Size), 176 by default.
     static let sizes: ClosedRange<Double> = 100...360
-    static let defaultSize: Double = 180
+    static let defaultSize = Double(Theme.Size.gridThumbnail)
 
-    init(width: CGFloat, cell: CGFloat) {
-        self.cell = cell
-        let usable = max(width - 2 * Self.padding, cell)
-        columns = max(1, Int((usable + Self.spacing) / (cell + Self.spacing)))
-        let row = CGFloat(columns) * cell + CGFloat(columns - 1) * Self.spacing
-        inset = max(Self.padding, (width - row) / 2)
-    }
+    let width: CGFloat
+    let frames: [CGRect]
+    let rows: [Row]
+    /// The whole grid's height, padding included.
+    let height: CGFloat
 
-    var imageHeight: CGFloat { (cell * Self.aspect).rounded() }
-    var rowHeight: CGFloat { imageHeight + Self.nameHeight }
-
-    func rows(_ count: Int) -> Int { (count + columns - 1) / columns }
-    func height(_ count: Int) -> CGFloat {
-        let rows = rows(count)
-        return 2 * Self.padding + CGFloat(rows) * rowHeight + CGFloat(max(rows - 1, 0)) * Self.spacing
-    }
-
-    /// Where the `index`th cell sits, name included.
-    func frame(_ index: Int) -> CGRect {
-        let row = index / columns, column = index % columns
-        return CGRect(x: inset + CGFloat(column) * (cell + Self.spacing),
-                      y: Self.padding + CGFloat(row) * (rowHeight + Self.spacing), width: cell, height: rowHeight)
-    }
-
-    /// The cells `rect` touches, of `count`.
-    func indices(in rect: CGRect, count: Int) -> [Int] {
-        guard count > 0, rect.maxY >= Self.padding else { return [] }
-        let stride = rowHeight + Self.spacing
-        let first = max(0, Int((rect.minY - Self.padding) / stride))
-        let last = min(rows(count) - 1, Int((rect.maxY - Self.padding) / stride))
-        guard first <= last else { return [] }
-        var hit: [Int] = []
-        for row in first...last {
-            for column in 0..<columns {
-                let index = row * columns + column
-                if index < count, frame(index).intersects(rect) { hit.append(index) }
+    /// `ratios`: each photograph's width ÷ height, in order.
+    init(ratios: [CGFloat], width: CGFloat, target: CGFloat) {
+        let usable = max(width - 2 * Self.side, 1)
+        let target = max(target, 1)
+        var frames: [CGRect] = [], rows: [Row] = []
+        frames.reserveCapacity(ratios.count)
+        var y = Self.top, start = 0
+        func ratio(_ index: Int) -> CGFloat { min(max(ratios[index], 0.1), 10) }
+        while start < ratios.count {
+            var end = start, sum: CGFloat = 0, full = false
+            while end < ratios.count {
+                let next = sum + ratio(end)
+                let gaps = Self.gap * CGFloat(end - start)
+                guard next * target + gaps >= usable else { sum = next; end += 1; continue }
+                full = true
+                // Take this one too if that leaves the row nearer the
+                // chosen height than stopping short of it does.
+                if end == start || abs(log((usable - gaps) / next / target)) <= abs(log((usable - gaps + Self.gap) / sum / target)) {
+                    sum = next; end += 1
+                }
+                break
             }
+            let count = end - start
+            let height = (full ? (usable - Self.gap * CGFloat(count - 1)) / sum : target).rounded()
+            var x = Self.side
+            for index in start..<end {
+                // Whole points; a full row's last cell ends flush at the right.
+                let cellWidth = full && index == end - 1 ? Self.side + usable - x : max(1, (ratio(index) * height).rounded())
+                frames.append(CGRect(x: x, y: y, width: cellWidth, height: height))
+                x += cellWidth + Self.gap
+            }
+            rows.append(Row(range: start..<end, y: y, height: height))
+            y += height + Self.gap
+            start = end
         }
-        return hit
+        self.width = width
+        self.frames = frames
+        self.rows = rows
+        height = rows.isEmpty ? Self.top + Self.bottom : y - Self.gap + Self.bottom
+    }
+
+    /// Whether a photograph is drawn as selected, boxed in yellow: the
+    /// current one and each one selected.
+    static func drawnSelected(_ url: URL, selection: LibrarySelection) -> Bool {
+        url == selection.current || selection.selected.contains(url)
+    }
+
+    /// The row holding the `index`th photograph.
+    func row(of index: Int) -> Int? {
+        guard frames.indices.contains(index) else { return nil }
+        var low = 0, high = rows.count - 1
+        while low < high {
+            let middle = (low + high + 1) / 2
+            if rows[middle].range.lowerBound <= index { low = middle } else { high = middle - 1 }
+        }
+        return low
+    }
+
+    /// The photograph `by` rows up (−) or down (+) from `index`: the one
+    /// nearest it across, as in Finder. Nil past the first or last row.
+    func vertical(from index: Int, by: Int) -> Int? {
+        guard let row = row(of: index), rows.indices.contains(row + by) else { return nil }
+        let x = frames[index].midX
+        return rows[row + by].range.min { abs(frames[$0].midX - x) < abs(frames[$1].midX - x) }
+    }
+
+    /// The cells `rect` touches.
+    func indices(in rect: CGRect) -> [Int] {
+        // Rubber-band updates arrive repeatedly while dragging. Locate the
+        // affected rows logarithmically instead of rescanning every row in a
+        // large folder on each pointer event.
+        func partition(_ test: (Row) -> Bool) -> Int {
+            var low = 0, high = rows.count
+            while low < high {
+                let middle = (low + high) / 2
+                if test(rows[middle]) { high = middle } else { low = middle + 1 }
+            }
+            return low
+        }
+        let first = partition { $0.y + $0.height >= rect.minY }
+        let end = partition { $0.y > rect.maxY }
+        guard first < end else { return [] }
+        return rows[first..<end].flatMap { row in row.range.filter { frames[$0].intersects(rect) } }
     }
 }

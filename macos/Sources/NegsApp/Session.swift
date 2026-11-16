@@ -110,6 +110,7 @@ struct SidecarRestore: Equatable, Sendable {
     var flag: PhotoSidecar.Flag?
     /// Nil when it stores no edits: the photograph opens as a new one.
     var edits: SavedEdits?
+    var versions: [SavedEditVersion] = []
     /// Why the sidecar isn't used; it is then never written over.
     var problem: String?
 
@@ -125,9 +126,10 @@ struct SidecarRestore: Equatable, Sendable {
             guard let variant = sidecar.variants.first(where: { $0.id == id }) ?? sidecar.variants.first else { return restore }
             restore.variant = variant.id; restore.newVariant = false
             restore.rating = variant.rating; restore.flag = variant.flag
-            if let edits = variant.edits {
+            if variant.edits != nil || variant.versions != nil {
                 let table = try SidecarDefaults.load(version: sidecar.defaultsVersion, data: data)
-                restore.edits = try PhotoSidecar.decodeEdits(edits, table: table)
+                restore.versions = try PhotoSidecar.decodeVersions(variant.versions, table: table)
+                if let edits = variant.edits { restore.edits = try PhotoSidecar.decodeEdits(edits, table: table) }
             }
             return restore
         } catch let problem as PhotoSidecar.Problem {

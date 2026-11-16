@@ -87,6 +87,7 @@ pub fn preview_pipeline_cache_key(
         "input_color_space": params.io.input_color_space,
         "input_cctf_decoding": params.io.input_cctf_decoding,
         "referent_logc3_enabled": params.io.referent_logc3_enabled,
+        "render_look": params.io.render_look,
         "referent_logc3_path": params.io.referent_logc3_path,
         "input_scene_referred": params.io.input_scene_referred,
         "input_gamut": params.io.input_gamut_compress,

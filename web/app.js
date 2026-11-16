@@ -804,9 +804,19 @@ const isMotionPicturePrint = (p) => p.paper && (p.name.includes("Vision") || p.n
 function stockGroups(stocks, order, kind) {
   return order.map((title) => ({ title, stocks: stocks.filter((s) => kind(s) === title) })).filter((g) => g.stocks.length);
 }
-function filmGroups() {
+// Settings › Fotufilm films (macOS FotufilmFilms): which films ported from
+// Fotufilm the menu and grid list. Only the lists: an edit or a preset with a
+// hidden film keeps it, and the film in use stays listed.
+const FOTUFILM_FILMS = ["all", "datasheets", "off"];
+let fotufilmFilms = FOTUFILM_FILMS.find((choice) => choice === remembered("fotufilmFilms", "all")) ?? "all";
+const listsFilm = (s) => !s.fotufilm || fotufilmFilms === "all" || (fotufilmFilms === "datasheets" && s.manufacturer_data !== false);
+const listedFilms = () => films().filter((s) => listsFilm(s) || s.id === state.film);
+// The grid has a tile for every film (`all`) and hides the rest.
+const unlistedFilms = () => films().filter((s) => !listsFilm(s) && s.id !== state.film).map((s) => s.id);
+function filmGroups(all = false) {
   const cinemaPrints = new Set(papers().filter(isMotionPicturePrint).map((p) => p.id));
-  return stockGroups(films(), ["Color Negative", "Color Slide", "Motion Picture", "Black & White"],
+  const stocks = all ? films : listedFilms;
+  return stockGroups(stocks(), ["Color Negative", "Color Slide", "Motion Picture", "Black & White"],
     (s) => s.bw ? "Black & White" : s.positive ? "Color Slide" : cinemaPrints.has(s.target_print) ? "Motion Picture" : "Color Negative");
 }
 function paperGroups() {
@@ -827,7 +837,8 @@ const stockValue = (value) => (value.startsWith(FAVORITE) ? value.slice(FAVORITE
 function fillFavorites(which) {
   const select = $(which);
   select.querySelector("optgroup.favorites")?.remove();
-  const ids = favorites(which).filter((id) => stock(id)?.paper === (which === "paper"));
+  const listed = which === "film" ? new Set(listedFilms().map((s) => s.id)) : null;
+  const ids = favorites(which).filter((id) => stock(id)?.paper === (which === "paper") && (!listed || listed.has(id)));
   if (!ids.length) return;
   const og = Object.assign(document.createElement("optgroup"), { label: tr("Favorites"), className: "favorites" });
   for (const id of ids) og.append(new Option(`★ ${stock(id).name}`, FAVORITE + id));
@@ -835,17 +846,30 @@ function fillFavorites(which) {
   select.value = which === "film" ? state.film : state.paper;
 }
 
-function fillStocks() {
-  const fill = (select, groups) => {
-    for (const g of groups) {
-      const og = Object.assign(document.createElement("optgroup"), { label: tr(g.title) });
-      for (const s of g.stocks) og.append(new Option(s.name, s.id));
-      select.append(og);
-    }
-  };
-  fill($("film"), filmGroups());
-  fill($("paper"), paperGroups());
+// The Film menu again, after Settings › Fotufilm films or a film change
+// leaves another set listed.
+let filmMenuListed = "";
+function refillFilms() {
+  const listed = listedFilms().map((s) => s.id).join();
+  if (listed === filmMenuListed) return;
+  filmMenuListed = listed;
+  const select = $("film");
+  for (const og of [...select.querySelectorAll("optgroup")]) og.remove();
+  fillGroups(select, filmGroups());
   fillFavorites("film");
+  folds?.film.hide(unlistedFilms());
+}
+function fillGroups(select, groups) {
+  for (const g of groups) {
+    const og = Object.assign(document.createElement("optgroup"), { label: tr(g.title) });
+    for (const s of g.stocks) og.append(new Option(s.name, s.id));
+    select.append(og);
+  }
+}
+
+function fillStocks() {
+  refillFilms();
+  fillGroups($("paper"), paperGroups());
   fillFavorites("paper");
   labelInfo($("film").closest("label"), Help.FILM);
   labelInfo($("paper-row"), Help.PAPER);
@@ -1844,12 +1868,13 @@ function buildPreviews() {
   // One grid open at a time: opening one folds the other (and a remembered
   // pair opens on the film's).
   if (opened.film && opened.paper) opened.paper = false;
-  folds = { film: fold("film", "Film", filmGroups(), chooseFilm, "Search films"), paper: fold("paper", "Paper", paperGroups(), choosePaper) };
+  folds = { film: fold("film", "Film", filmGroups(true), chooseFilm, "Search films"), paper: fold("paper", "Paper", paperGroups(), choosePaper) };
   for (const [one, other] of [[folds.film, folds.paper], [folds.paper, folds.film]]) {
     one.root.addEventListener("toggle", () => { if (one.root.open) other.root.open = false; });
   }
   folds.film.root.querySelector(".stock-title").after(info("Film", Help.FILM));
   folds.paper.root.querySelector(".stock-title").after(info("Paper", Help.PAPER));
+  folds.film.hide(unlistedFilms());
   $("film").closest("label").after(folds.film.root);
   $("paper-row").after(folds.paper.root);
   $("previews").addEventListener("change", () => setPreviews($("previews").checked));
@@ -1912,10 +1937,12 @@ function crashCheck() {
 
 // ---- Settings ------------------------------------------------------------------
 
-// The gear's sheet: the previews (above), new RAWs' brightness match (the
-// Prep switch also sets it) and the engine (its change handler is below).
+// The gear's sheet: the previews (above), the Fotufilm films, new RAWs'
+// brightness match (the Prep switch also sets it) and the engine (its change
+// handler is below).
 function openSettings() {
   $("previews").checked = previewsOn;
+  $("fotufilm-films").value = fotufilmFilms;
   $("match-new-raws").checked = matchNewRaws();
   $("advanced").checked = advanced;
   $("lang").value = lang;
@@ -1928,6 +1955,14 @@ $("advanced").addEventListener("change", () => {
 });
 $("settings").addEventListener("click", openSettings);
 $("match-new-raws").addEventListener("change", () => remember("matchNewRaws", $("match-new-raws").checked));
+$("fotufilm-films").addEventListener("change", () => {
+  fotufilmFilms = $("fotufilm-films").value;
+  remember("fotufilmFilms", fotufilmFilms);
+  refillFilms();
+  pumpPreviews();
+});
+// A hidden film leaves the lists once another is chosen.
+syncs.push(refillFilms);
 // The interface language (web/i18n.js): a new one is a reload away, its
 // dictionary loading before the page renders.
 $("lang").addEventListener("change", () => {
@@ -1937,11 +1972,16 @@ $("lang").addEventListener("change", () => {
 });
 
 // What tile `id` of `which` renders: the edit with that stock chosen.
-function tileRequest(which, id) {
+function tileRequest(which, id, context = null) {
   const into = { film: state.film, paper: state.paper, params: structuredClone(state.params) };
   (which === "film" ? chooseFilm : choosePaper)(id, into);
-  const request = { film: into.film, paper: into.paper, params: JSON.stringify({ ...into.params, io: { ...into.params.io, rotate_cw: 0 } }) };
-  return { ...request, key: JSON.stringify([request, crop, rotation()]) };
+  const params = JSON.stringify({ ...into.params, io: { ...into.params.io, rotate_cw: 0 } });
+  const film = into.film, paper = into.paper;
+  const cropKey = context?.cropKey ?? JSON.stringify(crop), angle = context?.angle ?? rotation();
+  // `params` is already a serialized snapshot. Embedding it in JSON.stringify
+  // again needlessly walks and escapes the whole edit for every visible tile.
+  // JSON strings escape NUL, so these separators keep the cache key unambiguous.
+  return { film, paper, params, key: `${film}\0${paper}\0${params}\0${cropKey}\0${angle}` };
 }
 
 // The tiles on screen, each with its request and whether its picture is
@@ -1949,9 +1989,10 @@ function tileRequest(which, id) {
 function previewTiles() {
   if (!previewsOn || !folds || !photo) return [];
   const out = [];
+  const context = { cropKey: JSON.stringify(crop), angle: rotation() };
   for (const which of ["film", "paper"]) {
     for (const tile of folds[which].onScreen()) {
-      const request = tileRequest(which, tile.id);
+      const request = tileRequest(which, tile.id, context);
       Stocks.markStale(tile, photo, request.key);
       out.push({ tile, request });
     }

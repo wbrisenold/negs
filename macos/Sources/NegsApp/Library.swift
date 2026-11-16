@@ -156,7 +156,9 @@ struct FolderLibraryFilter: Codable, Equatable, Sendable {
     @ObservationIgnored var sidecarChanged: ((URL) -> Void)?
     /// Told when the filter changes, so the selection can follow it.
     @ObservationIgnored var filterChanged: (() -> Void)?
-    /// Told when items' stored edits changed, so their thumbnails follow.
+    /// Told when items' stored edits changed, items came, or their sidecars
+    /// were first read, so their thumbnails follow: an item without edits
+    /// gets one once it's known to have none.
     @ObservationIgnored var looksChanged: (() -> Void)?
 
     @ObservationIgnored private let defaults: UserDefaults
@@ -258,12 +260,17 @@ struct FolderLibraryFilter: Codable, Equatable, Sendable {
         refreshNow()
     }
 
-    /// The photographs the strip shows: those the filter lets through, and
-    /// always `current`, which never vanishes under the cursor.
-    func shown(current: URL?) -> [PhotoFile] { shown(keeping: current.map { [$0] } ?? []) }
-
     /// The photographs the strip and grid show: those the filter lets
-    /// through, and always `kept` (the current photograph, those just rated).
+    /// through, and always `current`, so a filter chosen while it's open
+    /// never hides it. A rating or flag that leaves it out moves on to the
+    /// next instead (`EditorModel.changeLibrary`).
+    func shown(current: URL?) -> [PhotoFile] {
+        let items = items
+        guard filter.active else { return items }
+        return items.filter { $0.url == current || filter.includes(summary(for: $0.url)) }
+    }
+
+    /// Keep the current photo and items just rated visible through filtering.
     func shown(keeping kept: Set<URL>) -> [PhotoFile] {
         let items = items
         guard filter.active else { return items }
@@ -308,6 +315,10 @@ struct FolderLibraryFilter: Codable, Equatable, Sendable {
     }
 
     private func refresh(_ directory: URL) async {
+        let filesBefore = files, looksBefore = looks, summariesBefore = summaries
+        defer {
+            if self.directory == directory, files != filesBefore || looks != looksBefore || summaries != summariesBefore { looksChanged?() }
+        }
         let scan = Task.detached(priority: .utility) {
             (try PhotoFolder.listing(in: directory), !FolderPhotoLibrary.canWrite(in: directory))
         }
@@ -338,7 +349,7 @@ struct FolderLibraryFilter: Codable, Equatable, Sendable {
         guard !changed.isEmpty else { summariesLoaded = true; return }
         let started = revisions
         let urls = Array(changed.keys)
-        let read = await Task.detached(priority: .utility) { () -> [URL: [LibraryItemRead]] in
+        let request = Task.detached(priority: .utility) { () -> [URL: [LibraryItemRead]] in
             var read: [URL: [LibraryItemRead]] = [:]
             for photo in urls {
                 guard !Task.isCancelled else { break }
@@ -347,10 +358,14 @@ struct FolderLibraryFilter: Codable, Equatable, Sendable {
                 catch { read[photo] = [LibraryItemRead(item: photo, summary: LibrarySummary(problem: error.localizedDescription))] }
             }
             return read
-        }.value
+        }
+        let read = await withTaskCancellationHandler {
+            await request.value
+        } onCancel: {
+            request.cancel()
+        }
         guard self.directory == directory, self.store === store, !Task.isCancelled else { return }
         var updated = summaries
-        let before = looks
         var notify: [URL] = []
         for (photo, items) in read {
             let known = sidecarFiles.keys.contains(photo)
@@ -363,7 +378,6 @@ struct FolderLibraryFilter: Codable, Equatable, Sendable {
         if updated != summaries { summaries = updated }
         summariesLoaded = true
         for photo in notify { sidecarChanged?(photo) }
-        if looks != before { looksChanged?() }
     }
 
     /// Whether sidecars can be written beside `photo`.

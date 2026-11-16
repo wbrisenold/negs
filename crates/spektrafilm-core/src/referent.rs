@@ -11,7 +11,12 @@ use std::{collections::HashMap, fs, path::{Path, PathBuf}, sync::{Arc, Mutex, On
 
 use rayon::prelude::*;
 use spektrafilm_gpu::Lut3D;
-use spektrafilm_math::{image::ImageBuf, precision::{from_f32, to_f32}, lut::trilinear_3d};
+use spektrafilm_math::{
+    colorspace::{self, RgbColourspace},
+    image::ImageBuf,
+    precision::{from_f32, to_f32},
+    lut::trilinear_3d,
+};
 
 const SRGB_TO_AWG3: [[f32; 3]; 3] = [
     [0.631_362_1, 0.270_812_36, 0.097_915_89],
@@ -19,6 +24,8 @@ const SRGB_TO_AWG3: [[f32; 3]; 3] = [
     [0.017_339_19, 0.148_795_57, 0.833_812_4],
 ];
 static CUBE_CACHE: OnceLock<Mutex<HashMap<PathBuf, (u64, u128, Arc<Lut3D>)>>> = OnceLock::new();
+type NeutralToneCurve = Vec<(f32, f32)>; // (scene-linear neutral Y, BT.1886-linear output Y)
+static TONE_CACHE: OnceLock<Mutex<HashMap<usize, (Arc<Lut3D>, Arc<NeutralToneCurve>)>>> = OnceLock::new();
 
 /// Parse a .cube file, normalizing its conventional red-fastest row order to
 /// the core interpolator's red-major layout. Domain remaps are deliberately
@@ -102,14 +109,18 @@ fn parse_triplet(rest: &str, name: &str) -> Result<[f32; 3], String> {
     Ok([a, b, c])
 }
 
-/// Apply only Referent's color remapping to a scene-linear sRGB image.
+/// Apply Referent's color remapping while removing its neutral-axis tone
+/// response from a scene-linear sRGB image.
 ///
 /// `exposure_ev` chooses the LUT's chromatic response at the same exposure
 /// used by the film pipeline; it is not baked into the returned pixels. The
-/// output luminance is restored to the source luminance so the film model
-/// receives scene-referred values rather than Referent's Rec.709 tone curve.
-pub fn apply_color_only(image: &ImageBuf, lut: &Lut3D, exposure_ev: f64) -> ImageBuf {
+/// The tone curve is measured from the LUT's neutral axis in BT.1886-linear
+/// light, then inverted per pixel. This is exact for neutral tones; for colored
+/// pixels it preserves Referent's hue-dependent luma changes as part of its
+/// color mapping instead of forcing every pixel back to source luma.
+pub fn apply_color_only(image: &ImageBuf, lut: &Arc<Lut3D>, exposure_ev: f64) -> ImageBuf {
     let gain = 2.0f64.powf(exposure_ev) as f32;
+    let tone = neutral_tone_curve(lut);
     let mut output = image.clone();
     output.par_pixels_mut().for_each(|px| {
         let source = [to_f32(px[0]), to_f32(px[1]), to_f32(px[2])];
@@ -126,14 +137,15 @@ pub fn apply_color_only(image: &ImageBuf, lut: &Lut3D, exposure_ev: f64) -> Imag
         // BT.1886 display EOTF (gamma 2.4), not the BT.709 scene-light OETF.
         // The latter shifts the LUT's RGB ratios and therefore its color.
         let display_linear = rendered.map(|v| v.max(0.0).powf(2.4));
-        // Rec.709 linear-light luma. Near black, retain the source to avoid
-        // amplifying noise or undefined chroma in the LUT's black endpoint.
-        let source_y = 0.2126 * exposed[0] + 0.7152 * exposed[1] + 0.0722 * exposed[2];
+        // Undo the LUT's measured neutral-axis tone response, rather than
+        // substituting source luma (which also erases legitimate LUT luma
+        // changes for colored pixels).
         let rendered_y = 0.2126 * display_linear[0] + 0.7152 * display_linear[1] + 0.0722 * display_linear[2];
-        if source_y <= 1e-6 || rendered_y <= 1e-6 || !rendered_y.is_finite() {
+        if rendered_y <= 1e-6 || !rendered_y.is_finite() {
             return;
         }
-        let scale = source_y / rendered_y;
+        let recovered_y = invert_neutral_tone(&tone, rendered_y);
+        let scale = recovered_y / rendered_y;
         for c in 0..3 {
             // Remove LUT luminance/tone response and restore original scene
             // light. Undo the exposure used only to choose the LUT sample.
@@ -143,6 +155,80 @@ pub fn apply_color_only(image: &ImageBuf, lut: &Lut3D, exposure_ev: f64) -> Imag
     output
 }
 
+/// Apply the full LogC3/AWG3-to-BT.1886 Referent transform to a finished
+/// linear scan. This is the actual display transform, with no tone extraction.
+pub fn apply_output_transform(
+    image: &mut ImageBuf,
+    lut: &Arc<Lut3D>,
+    linear_input_space: &str,
+) {
+    let input = RgbColourspace::input(linear_input_space);
+    let srgb = RgbColourspace::output("sRGB");
+    let rec709_to_input = colorspace::icc_rgb_to_rgb(srgb, input);
+    let input_to_srgb = colorspace::icc_rgb_to_rgb(input, srgb);
+    image.par_pixels_mut().for_each(|px| {
+        let linear_srgb = colorspace::mat3_vec_f64(
+            &input_to_srgb,
+            [to_f32(px[0]) as f64, to_f32(px[1]) as f64, to_f32(px[2]) as f64],
+        );
+        let awg3 = [
+            SRGB_TO_AWG3[0][0] as f64 * linear_srgb[0] + SRGB_TO_AWG3[0][1] as f64 * linear_srgb[1] + SRGB_TO_AWG3[0][2] as f64 * linear_srgb[2],
+            SRGB_TO_AWG3[1][0] as f64 * linear_srgb[0] + SRGB_TO_AWG3[1][1] as f64 * linear_srgb[1] + SRGB_TO_AWG3[1][2] as f64 * linear_srgb[2],
+            SRGB_TO_AWG3[2][0] as f64 * linear_srgb[0] + SRGB_TO_AWG3[2][1] as f64 * linear_srgb[1] + SRGB_TO_AWG3[2][2] as f64 * linear_srgb[2],
+        ];
+        let logc = awg3.map(|v| logc3_encode_ei800(v as f32));
+        let display = trilinear_3d(&lut.data, lut.size as usize, logc[0], logc[1], logc[2]);
+        let linear709 = display.map(|v| v.max(0.0).powf(2.4) as f64);
+        let linear_input = colorspace::mat3_vec_f64(&rec709_to_input, linear709);
+        for c in 0..3 {
+            px[c] = from_f32(linear_input[c] as f32);
+        }
+    });
+}
+
+/// Measure the actual LUT response to neutral LogC3 samples. A strong Arc in
+/// the cache value keeps pointer keys unique while their curves are retained.
+fn neutral_tone_curve(lut: &Arc<Lut3D>) -> Arc<NeutralToneCurve> {
+    let cache = TONE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = Arc::as_ptr(lut) as usize;
+    if let Some((_, curve)) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return curve.clone();
+    }
+    const SAMPLES: usize = 4096;
+    let mut curve = Vec::with_capacity(SAMPLES + 1);
+    let mut monotone_y = 0.0f32;
+    for i in 0..=SAMPLES {
+        let code = i as f32 / SAMPLES as f32;
+        let scene_y = logc3_decode_ei800(code).max(0.0);
+        let output = trilinear_3d(&lut.data, lut.size as usize, code, code, code);
+        let output_y = 0.2126 * output[0].max(0.0).powf(2.4)
+            + 0.7152 * output[1].max(0.0).powf(2.4)
+            + 0.0722 * output[2].max(0.0).powf(2.4);
+        // A neutral tone curve must be invertible. Remove only numerical or
+        // LUT-quantization reversals; retain its measured endpoints and shape.
+        monotone_y = monotone_y.max(output_y);
+        curve.push((scene_y, monotone_y));
+    }
+    let curve = Arc::new(curve);
+    let mut entries = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if entries.len() >= 4 { entries.clear(); }
+    entries.insert(key, (lut.clone(), curve.clone()));
+    curve
+}
+
+/// Invert the sampled monotone neutral-axis tone response by linear
+/// interpolation between adjacent LUT-derived measurements.
+fn invert_neutral_tone(curve: &[(f32, f32)], output_y: f32) -> f32 {
+    let Some(&(first_x, first_y)) = curve.first() else { return output_y };
+    let Some(&(last_x, last_y)) = curve.last() else { return output_y };
+    if output_y <= first_y { return first_x; }
+    if output_y >= last_y { return last_x; }
+    let upper = curve.partition_point(|&(_, y)| y < output_y).min(curve.len() - 1);
+    let (x0, y0) = curve[upper - 1];
+    let (x1, y1) = curve[upper];
+    if y1 <= y0 { x1 } else { x0 + (x1 - x0) * ((output_y - y0) / (y1 - y0)) }
+}
+
 #[inline]
 fn logc3_encode_ei800(x: f32) -> f32 {
     const CUT: f32 = 0.010_591;
@@ -150,5 +236,15 @@ fn logc3_encode_ei800(x: f32) -> f32 {
         0.247_190 * (5.555_556 * x + 0.052_272).log10() + 0.385_537
     } else {
         5.367_655 * x + 0.092_809
+    }
+}
+
+#[inline]
+fn logc3_decode_ei800(x: f32) -> f32 {
+    const CUT_CODE: f32 = 0.149_658;
+    if x > CUT_CODE {
+        ((10.0f32).powf((x - 0.385_537) / 0.247_190) - 0.052_272) / 5.555_556
+    } else {
+        (x - 0.092_809) / 5.367_655
     }
 }

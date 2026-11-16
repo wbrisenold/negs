@@ -51,6 +51,8 @@ pub struct Preferences {
     pub lab_all_controls: bool,
     pub scope_mode: String,
     pub scope_height: f64,
+    /// Height of the open film or paper preview grid.
+    pub tray_height: f64,
     pub tone_graph_channel: String,
     pub favorite_films: Vec<String>,
     pub favorite_papers: Vec<String>,
@@ -90,6 +92,7 @@ impl Default for Preferences {
             lab_all_controls: false,
             scope_mode: "Histogram".into(),
             scope_height: 88.,
+            tray_height: crate::stock_browser::TRAY_HEIGHT,
             tone_graph_channel: "RGB".into(),
             favorite_films: DEFAULT_FAVORITE_FILMS
                 .iter()
@@ -399,8 +402,12 @@ impl Editor {
         location.set_xalign(0.);
         location.add_css_class("caption");
         b.append(&location);
+        // Without natural-height propagation the dialog sizes itself to the
+        // scroller's minimum and shows one row (issue #12); this way it is as
+        // tall as its settings, up to what the window allows, then scrolls.
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
             .child(&b)
             .build();
         toolbar.set_content(Some(&scroll));
@@ -434,6 +441,7 @@ impl Editor {
             } else {
                 88.
             };
+            p.tray_height = crate::stock_browser::tray_height(p.tray_height) as f64;
             p.width = p.width.clamp(360, 7680);
             p.height = p.height.clamp(480, 4320);
             p.appearance = p.appearance.min(2);

@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "spektrafilm-f64"
-path = "src/main.rs"
+path = "src/bin/spektrafilm_f64.rs"
 required-features = ["precision-f64"]
 
 [[bin]]

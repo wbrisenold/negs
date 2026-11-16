@@ -116,12 +116,17 @@ const SKIPPED: [&str; 3] = [
 /// crop and rotation, the speed and memory settings, CAT16 and the colour
 /// management settings (Negs-only switches) and the Prep/Post tabs. Every other params value comes from the preset or, where
 /// Python's GUI has no such setting, Negs's default.
-pub const KEPT: [&str; 25] = [
+pub const KEPT: [&str; 30] = [
     "prep",
     "io.lens_correction",
     "io.input_interpretation",
     "io.input_color_space",
     "io.input_cctf_decoding",
+    "io.input_scene_referred",
+    "io.raw_white_balance.method",
+    "io.referent_logc3_enabled",
+    "io.referent_logc3_path",
+    "io.render_look",
     "io.output_color_space",
     "io.output_cctf_encoding",
     "io.crop",
@@ -757,8 +762,9 @@ mod tests {
 
     /// Negs values a preset sets to Negs's default: Python's GUI has no such
     /// setting and renders with the same default.
-    const NEGS_DEFAULTS: [&str; 8] = [
+    const NEGS_DEFAULTS: [&str; 9] = [
         "film_render.grain.monochrome",
+        "film_render.silver_retention",
         "film_render.glare",
         "enlarger.normalize_print_exposure",
         "enlarger.y_filter_neutral",

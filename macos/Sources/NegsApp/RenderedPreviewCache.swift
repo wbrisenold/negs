@@ -56,6 +56,11 @@ final class RenderedPreviewCache: @unchecked Sendable {
         }
         do {
             var files = try [stamp(source), stamp(paths.helper), stamp(paths.data)]
+            // A custom LUT can be replaced without changing its path or edits.
+            // Include its identity so launch never restores pixels from the
+            // previous contents of that LUT.
+            let lutPath = state.params["io.referent_logc3_path"].string
+            if !lutPath.isEmpty { files.append(try stamp(URL(fileURLWithPath: lutPath))) }
             guard let items = FileManager.default.enumerator(at: paths.data, includingPropertiesForKeys: [.isRegularFileKey]) else { return nil }
             for case let url as URL in items {
                 if try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true { files.append(try stamp(url)) }
@@ -101,6 +106,10 @@ final class RenderedPreviewCache: @unchecked Sendable {
     /// Retains the finished surface until its bytes are safely on disk. It
     /// never reads the helper's preview file, which the next render can reuse.
     func save(_ surface: IOSurface, photoSize: CGSize, sourceSize: CGSize, workingSize: CGSize, raw: Bool, key: String) {
+        // Match the reader's limits before retaining/copying a large frame
+        // that this cache would be unable to restore.
+        guard (1...8192).contains(surface.width), (1...8192).contains(surface.height),
+              surface.bytesPerElement == 4, surface.planeCount <= 1 else { return }
         queue.async {
             let width = surface.width, height = surface.height
             surface.lock(options: .readOnly, seed: nil)
@@ -143,6 +152,7 @@ final class LaunchFrame: @unchecked Sendable {
         var scopes: ImageScopes
         var scopesCrop: CropSettings
         var scopesRotation: Int
+        var scopesMode: ScopeMode
     }
 
     private let done = DispatchSemaphore(value: 0)

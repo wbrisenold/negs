@@ -10,7 +10,7 @@ import SwiftUI
     private let updates: UpdateController
     private let removeAppData: () -> Void
     private let recent = NSMenu(title: "Open Recent")
-    private var settings: NSWindow?
+    private var settings: SettingsWindowController?
     private var removingAppData = false
 
     init(model: EditorModel, updates: UpdateController, removeAppData: @escaping () -> Void) {
@@ -37,7 +37,7 @@ import SwiftUI
         app.addItem(withTitle: "Quit \(name)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
         let file = submenu("File")
-        command(file, "Open Photograph…", #selector(openPhotograph), "o")
+        command(file, "Open…", #selector(openPhotograph), "o")
         // The action only lets validation disable the submenu while it's empty.
         let recentItem = file.addItem(withTitle: "Open Recent", action: #selector(showRecent), keyEquivalent: "")
         recentItem.target = self
@@ -48,10 +48,12 @@ import SwiftUI
         file.addItem(.separator())
         command(file, "Save Preview…", #selector(savePreview), "s")
         command(file, "Export Photograph…", #selector(exportPhotograph), "e", [.command, .shift])
-        command(file, "Export LUT…", #selector(exportLUT), "l", [.command, .shift])
+        // ⇧⌘L is reserved for the single Library workspace (View › Library).
+        command(file, "Export LUT…", #selector(exportLUT), "")
         file.addItem(.separator())
         command(file, "New Preset", #selector(newPreset), "s", [.command, .shift])
         command(file, "Import Presets…", #selector(importPresets), "o", [.command, .shift])
+        command(file, "Show Presets Folder", #selector(showPresetsFolder), "")
 
         let edit = submenu("Edit")
         edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
@@ -69,9 +71,10 @@ import SwiftUI
             .keyEquivalentModifierMask = [.command, .option]
 
         let view = submenu("View")
-        command(view, "Show Library", #selector(showLibrary), "l")
         // Plain keys, as in Lightroom, behind the same check as the rating keys.
         command(view, "Edit Photograph", #selector(editPhotograph), "e", [])
+        command(view, "Library", #selector(showLibrary), "l", [.command, .shift])
+        command(view, "Find Photos…", #selector(findPhotos), "f")
         hidden(view, #selector(editPhotograph), "\r")
         command(view, "Show Grid", #selector(showGrid), "g", [])
         // Esc shows the grid too: `EditorWindowController.escapeToGrid`.
@@ -79,13 +82,20 @@ import SwiftUI
         hidden(view, #selector(largerThumbnails), "=", .command)
         command(view, "Smaller Thumbnails", #selector(smallerThumbnails), "-")
         view.addItem(.separator())
+        // A plain key too: the photograph with only its caption and label.
+        // Esc leaves it first: `EditorWindowController.escapeToGrid`.
+        command(view, "Image Only", #selector(toggleImageOnly), "f", [])
         command(view, "Hide Film Strip", #selector(toggleFilmstrip), "f", [.command, .option])
         command(view, "Show Adjustments", #selector(toggleAdjustments), "i", [.command, .option])
         command(view, "Show Presets", #selector(togglePresets), "p", [.command, .option])
+        // Every control in every module, as the Lab's Advanced controls switch did.
+        command(view, "Show All Controls", #selector(toggleAllControls), "")
         view.addItem(.separator())
         command(view, "Fit Photograph", #selector(fitPhotograph), "0")
         command(view, "Actual Size", #selector(actualSize), "1")
+        // Rotate lives in cropping (§4.10); from here it starts cropping.
         command(view, "Rotate Clockwise", #selector(rotate), "r")
+        command(view, "Rotate Counterclockwise", #selector(rotateLeft), "r", [.command, .option])
         command(view, "Crop", #selector(crop), "k")
         view.addItem(.separator())
         // ⇧⌘R is Photo › Reset Edits.
@@ -166,31 +176,29 @@ import SwiftUI
     @objc private func checkForUpdates() { updates.check() }
     @objc private func showSettings() {
         if settings == nil {
-            let window = NSWindow(contentViewController: NSHostingController(rootView: UpdateSettings(updates: updates, model: model, removeAppData: removeAppData)))
-            window.title = "Settings"
-            window.styleMask = [.titled, .closable]
-            window.isReleasedWhenClosed = false
-            window.center()
-            settings = window
+            settings = SettingsWindowController(updates: updates, model: model, removeAppData: removeAppData)
         }
-        settings?.makeKeyAndOrderFront(nil)
+        settings?.window?.makeKeyAndOrderFront(nil)
     }
-    func prepareForAppDataRemoval() { removingAppData = true; settings?.orderOut(nil) }
+    func prepareForAppDataRemoval() { removingAppData = true; settings?.window?.orderOut(nil) }
     @objc private func openPhotograph() { model.openPanel() }
     @objc private func showRecent() {}
     @objc private func openRecent(_ item: NSMenuItem) { if let url = item.representedObject as? URL { model.open(url) } }
     @objc private func savePreview() { model.savePanel(export: false) }
-    @objc private func exportPhotograph() { model.exportPanel() }
+    @objc private func exportPhotograph() { EditorWindowController.exportFromCurrentWorkspace(model) }
     @objc private func exportLUT() { model.exportLUTPanel() }
-    @objc private func toggleFilmstrip() { model.filmstripVisible.toggle() }
-    @objc private func showLibrary() { model.workspace = .library }
+    @objc private func toggleImageOnly() { model.toggleImageOnly() }
+    @objc private func toggleFilmstrip() { model.toggleFilmstrip() }
     @objc private func toggleAdjustments() { model.togglePane(.adjustments) }
     @objc private func togglePresets() { model.togglePane(.presets) }
     @objc private func newPreset() { model.newPreset() }
     @objc private func importPresets() { model.importPresetsPanel() }
+    @objc private func showPresetsFolder() { model.showPresetsFolder() }
+    @objc private func toggleAllControls() { AdjustmentInspector.toggleAllControls() }
     @objc private func fitPhotograph() { model.zoom(fit: true) }
     @objc private func actualSize() { model.zoom(fit: false) }
-    @objc private func rotate() { model.rotate() }
+    @objc private func rotate() { model.turn(clockwise: true) }
+    @objc private func rotateLeft() { model.turn(clockwise: false) }
     @objc private func crop() { model.cropping ? model.endCrop(apply: true) : model.beginCrop() }
     @objc private func resetAdjustments() { model.reset() }
     @objc private func rate(_ item: NSMenuItem) { model.setRating(item.tag) }
@@ -200,8 +208,13 @@ import SwiftUI
     @objc private func reject() { model.setFlag(.reject) }
     @objc private func unflag() { model.setFlag(nil) }
     @objc private func toggleAdvance() { model.advanceAfterRating.toggle() }
-    @objc private func clearFilter() { model.library.filter = FolderLibraryFilter() }
-    @objc private func editPhotograph() { model.editCurrent() }
+    @objc private func clearFilter() {
+        if model.workspace == .library { model.clearLibraryFilters() }
+        else { model.library.filter = FolderLibraryFilter() }
+    }
+    @objc private func editPhotograph() { EditorWindowController.editFromCurrentWorkspace(model) }
+    @objc private func showLibrary() { model.showLibrary() }
+    @objc private func findPhotos() { model.findLibraryPhotos() }
     @objc private func copyEdits() { model.copyEdits() }
     @objc private func pasteEdits() { model.pasteEdits() }
     @objc private func pasteFromPrevious() { model.pasteFromPrevious() }
@@ -211,40 +224,18 @@ import SwiftUI
     @objc private func moveToTrashNow() { model.requestDelete(asking: false) }
     @objc private func deleteRejected() { model.requestDelete(model.rejected, asking: true) }
 
-    /// Copy Edits…: the groups to copy, in a sheet; the choice is remembered.
+    /// Copy Edits…: the groups to copy, in the alert sheet; the choice is remembered.
     @objc private func copyEditsChoosing() {
-        guard let window = NSApp.keyWindow as? EditorWindow else { return }
-        let alert = NSAlert()
-        alert.messageText = "Copy Edits"
-        alert.informativeText = "Choose the edits Paste Edits applies."
-        let chosen = model.copyGroups
-        let boxes = EditGroup.allCases.map { group in
-            let box = NSButton(checkboxWithTitle: group.title, target: nil, action: nil)
-            box.state = chosen.contains(group) ? .on : .off
-            return box
-        }
-        let stack = NSStackView(views: boxes)
-        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 6
-        stack.frame.size = stack.fittingSize
-        alert.accessoryView = stack
-        alert.addButton(withTitle: "Copy")
-        alert.addButton(withTitle: "Cancel")
-        alert.beginSheetModal(for: window) { [model] response in
-            MainActor.assumeIsolated {
-                guard response == .alertFirstButtonReturn else { return }
-                let groups = Set(zip(EditGroup.allCases, boxes).filter { $0.1.state == .on }.map(\.0))
-                model.copyGroups = groups
-                model.copyEdits(groups: groups)
-            }
-        }
+        guard NSApp.keyWindow is EditorWindow else { return }
+        model.copyEditsChoosing()
     }
-    @objc private func showGrid() { model.showGrid() }
+    @objc private func showGrid() { model.showLibrary() }
     @objc private func largerThumbnails() { model.changeGridCellSize(larger: true) }
     @objc private func smallerThumbnails() { model.changeGridCellSize(larger: false) }
 
     /// Rating and flag keys act on the photograph in the editing window,
     /// and not while a text field there (or any other window) has the keys.
-    private var rating: Bool { !model.ratingTargets.isEmpty && Self.takesRatingKeys(NSApp.keyWindow) }
+    private var rating: Bool { model.workspace == .editor && !model.ratingTargets.isEmpty && Self.takesRatingKeys(NSApp.keyWindow) }
     /// On when every photograph a rating command acts on passes `test`,
     /// mixed when some do.
     private func state(_ test: (LibrarySummary) -> Bool) -> NSControl.StateValue {
@@ -257,7 +248,9 @@ import SwiftUI
         guard takesRatingKeys(window) else { return false }
         var view = window?.firstResponder as? NSView
         while let next = view {
+            // A list, or a focused control that deletes its own (a preset tile).
             if next is NSTableView { return false }
+            if let anchor = next as? FocusAnchorView, anchor.delete != nil { return false }
             view = next.superview
         }
         return true
@@ -269,53 +262,68 @@ import SwiftUI
     }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
-        if removingAppData { return false }
-        let photo = model.workspace == .editor && model.source != nil && model.mode == .photo
-        let editing = photo
+        // The alert sheet is answered first, as a system alert's would be.
+        if removingAppData || model.alert != nil { return false }
+        let photo = model.source != nil
+        // The grid shows no photograph to adjust, zoom or crop.
+        let inEditor = model.workspace == .editor
+        let editing = inEditor && photo && model.mode == .photo
         switch item.action {
-        case #selector(showLibrary):
-            item.title = model.workspace == .editor ? "Show Library" : "Library"
-            return model.workspace == .editor && !model.cropping
         case #selector(checkForUpdates): return updates.configured && updates.canCheck
         case #selector(showRecent): return !model.recentFiles.isEmpty
-        case #selector(savePreview): return model.canSave && model.mode == .photo
+        case #selector(showLibrary), #selector(findPhotos): return !model.cropping
+        case #selector(savePreview): return editing && model.canSave
         case #selector(exportPhotograph):
+            if !inEditor {
+                item.title = "Export Selected Photographs…"
+                return EditorWindowController.hasLibraryExportSelection(model) && model.ready && !model.exporting && !model.saving && !model.batchRunning
+            }
             item.title = model.exportTitle
             return model.canExport && !model.cropping
-        case #selector(exportLUT): return model.canExportLUT && model.mode == .photo
+        case #selector(exportLUT): return editing && model.canExportLUT
+        case #selector(toggleImageOnly):
+            item.state = model.imageOnly ? .on : .off
+            // In the grid it opens the current photograph in Image Only.
+            let shown = model.mode == .grid ? model.selection.current != nil : photo
+            return inEditor && Self.takesRatingKeys(NSApp.keyWindow) && (model.imageOnly || (shown && !model.cropping))
         case #selector(toggleFilmstrip):
-            item.title = model.filmstripVisible ? "Hide Film Strip" : "Show Film Strip"
-            return model.mode == .photo
+            item.title = model.stripShown ? "Hide Film Strip" : "Show Film Strip"
+            return editing
         case #selector(toggleAdjustments):
-            item.state = model.inspectorVisible && model.inspectorPane == .adjustments ? .on : .off; return model.mode == .photo
+            item.state = model.inspectorShown && model.inspectorPane == .adjustments ? .on : .off; return editing
         case #selector(togglePresets):
-            item.state = model.inspectorVisible && model.inspectorPane == .presets ? .on : .off; return model.mode == .photo
-        case #selector(newPreset): return model.canChangePresets && model.mode == .photo
+            item.state = model.inspectorShown && model.inspectorPane == .presets ? .on : .off; return editing
+        case #selector(newPreset): return editing && model.canChangePresets
         case #selector(importPresets): return model.canChangePresets
+        case #selector(showPresetsFolder): return true
+        case #selector(toggleAllControls):
+            item.state = UserDefaults.standard.bool(forKey: AdjustmentInspector.allControlsKey) ? .on : .off
+            return editing
         case #selector(fitPhotograph), #selector(actualSize): return editing && !model.cropping
-        case #selector(rotate): return editing
+        case #selector(rotate), #selector(rotateLeft): return inEditor && (model.cropping || (editing && model.image != nil))
         case #selector(crop):
             item.title = model.cropping ? "Done Cropping" : "Crop"
-            return model.cropping || (model.image != nil && model.mode == .photo)
-        case #selector(resetAdjustments): return model.hasCatalog && !model.cropping && model.mode == .photo
-        case #selector(editPhotograph): return model.mode == .grid && model.selection.current != nil && Self.takesRatingKeys(NSApp.keyWindow)
+            return inEditor && (model.cropping || (model.image != nil && model.mode == .photo))
+        case #selector(resetAdjustments): return editing && model.hasCatalog && !model.cropping
+        case #selector(editPhotograph):
+            return Self.takesRatingKeys(NSApp.keyWindow) && (inEditor ? model.mode == .grid && model.selection.current != nil : EditorWindowController.hasLibraryExportSelection(model) || photo)
         case #selector(showGrid): return editing && !model.cropping && Self.takesRatingKeys(NSApp.keyWindow)
-        case #selector(largerThumbnails): return model.mode == .grid && model.gridCellSize < GridMetrics.sizes.upperBound
-        case #selector(smallerThumbnails): return model.mode == .grid && model.gridCellSize > GridMetrics.sizes.lowerBound
+        case #selector(largerThumbnails): return inEditor && model.mode == .grid && model.gridCellSize < SheetLayout.sizes.upperBound
+        case #selector(smallerThumbnails): return inEditor && model.mode == .grid && model.gridCellSize > SheetLayout.sizes.lowerBound
         case #selector(copyEdits), #selector(copyEditsChoosing):
-            return model.canCopyEdits && Self.takesRatingKeys(NSApp.keyWindow)
+            return inEditor && model.canCopyEdits && Self.takesRatingKeys(NSApp.keyWindow)
         case #selector(pasteEdits):
-            return model.canPasteEdits && Self.takesRatingKeys(NSApp.keyWindow)
+            return inEditor && model.canPasteEdits && Self.takesRatingKeys(NSApp.keyWindow)
         case #selector(pasteFromPrevious):
-            return model.previousEdits != nil && model.canChangeEdits && !model.editTargets.isEmpty && Self.takesRatingKeys(NSApp.keyWindow)
+            return inEditor && model.previousEdits != nil && model.canChangeEdits && !model.editTargets.isEmpty && Self.takesRatingKeys(NSApp.keyWindow)
         case #selector(duplicate), #selector(resetEdits):
-            return model.canChangeEdits && !model.editTargets.isEmpty && Self.takesRatingKeys(NSApp.keyWindow)
+            return inEditor && model.canChangeEdits && !model.editTargets.isEmpty && Self.takesRatingKeys(NSApp.keyWindow)
         case #selector(moveToTrash), #selector(moveToTrashNow):
             let count = model.deleteTargets.count
             let title = count > 1 ? "Move \(count) Photographs to Trash" : "Move to Trash"
             item.title = item.action == #selector(moveToTrash) ? title + "…" : title
-            return model.canDelete && count > 0 && Self.takesDeleteKey(NSApp.keyWindow)
-        case #selector(deleteRejected): return model.canDelete && !model.rejected.isEmpty
+            return inEditor && model.canDelete && count > 0 && Self.takesDeleteKey(NSApp.keyWindow)
+        case #selector(deleteRejected): return inEditor && model.canDelete && !model.rejected.isEmpty
         case #selector(rate(_:)):
             item.state = state { $0.rating == item.tag }; return rating
         case #selector(raiseRating), #selector(lowerRating): return rating
@@ -323,7 +331,8 @@ import SwiftUI
         case #selector(reject): item.state = state { $0.flag == .reject }; return rating
         case #selector(unflag): item.state = state { $0.flag == nil }; return rating
         case #selector(toggleAdvance): item.state = model.advanceAfterRating ? .on : .off; return true
-        case #selector(clearFilter): return model.library.filter.active
+        case #selector(clearFilter):
+            return inEditor ? model.library.filter.active : model.photoLibrary.filter != .all || model.photoLibrary.selectedSmartCollectionID != nil || !model.photoLibrary.cullFilters.isEmpty
         default: return true
         }
     }

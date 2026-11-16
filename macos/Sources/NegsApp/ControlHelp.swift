@@ -59,6 +59,7 @@ enum ControlHelp {
         "film_render.density_curves_morph.developer_exhaustion": "Developer running out in dense, brightly exposed areas: the highlights roll off more gently, mid-grey stays put. 0 is off.",
 
         // Grain
+        "film_render.silver_retention": "Keystone-style silver retention after the scan. Drag right to keep more silver character; the 0–80 scale matches Keystone’s control. Available for colour negative film.",
         "film_render.grain.rms_granularity": "How coarse the grain is, from the film’s datasheet (RMS granularity). Fine films measure about 4, coarse ones 40.",
         "film_render.grain.uniformity": "How evenly the crystals are spread. Higher makes the grain peak in the mid-tones and ease off in the densest areas; lower lets it keep growing into them.",
         "film_render.grain.particle_scale_sublayers": "The crystal size of one of the emulsion’s three sub-layers, relative to the film’s own. Larger crystals make coarser, stronger grain.",
@@ -132,7 +133,7 @@ enum ControlHelp {
         "io.output_gamut_compress.algorithm": "Rolls colours the output colour space can’t hold back inside it, leaving colours within it untouched. ACES RGC is the industry standard; OKLCh, OKLrab and CAM16-UCS keep hue more evenly. Off clips them.",
         "io.input_gamut_compress.algorithm": "Pulls the photograph’s colours that lie outside what eyes can see (possible in wide-gamut RAWs) inside, before they become spectra. Off passes them as they are.",
         "settings.use_cat16": "Adapts the photograph’s white to the light the film was characterised in, with CAT16. Off uses CAT02.",
-        "settings.rgb_to_raw_method": "How each colour is turned into the spectrum of light the film is exposed to. Hanatos 2025 covers every visible colour; Mallett 2019 only sRGB, clipping the rest; Arctic 2026 is a newer method in testing."
+        "settings.rgb_to_raw_method": "How each colour is turned into the spectrum of light the film is exposed to. Arctic 2026 (Beta 04) is the default; Hanatos 2025 and Mallett 2019 remain available for comparison."
     ]
 
     private static let groups: [String: String] = [

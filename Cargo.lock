@@ -240,8 +240,7 @@ dependencies = [
 [[package]]
 name = "block"
 version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d8c1fef690941d3e7788d328517591fecc684c084084702d6ff1641e993699a"
+source = "git+https://github.com/Dicklesworthstone/rust-block?rev=b39ae859d1ee8e8cb5eef6a516471f1578d26b96#b39ae859d1ee8e8cb5eef6a516471f1578d26b96"
 
 [[package]]
 name = "brotli-decompressor"
@@ -2163,7 +2162,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "spektrafilm-cli"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2183,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "spektrafilm-core"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "blas-src",
  "cblas",
@@ -2205,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "spektrafilm-gpu"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "accelerate-src",
  "blas-src",
@@ -2228,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "spektrafilm-io"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -2244,7 +2243,7 @@ dependencies = [
 
 [[package]]
 name = "spektrafilm-math"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "byteorder",
  "half",
@@ -2259,7 +2258,7 @@ dependencies = [
 
 [[package]]
 name = "spektrafilm-model"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "rand",
  "rand_distr",
@@ -2274,7 +2273,7 @@ dependencies = [
 
 [[package]]
 name = "spektrafilm-native"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "image",
@@ -2290,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "spektrafilm-wasm"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",

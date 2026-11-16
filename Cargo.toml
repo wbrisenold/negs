@@ -13,7 +13,7 @@ members = [
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 license = "GPL-3.0-only"
 rust-version = "1.89"
@@ -59,3 +59,4 @@ opt-level = 3
 # Drop once upstream takes the change (see vendor/README.md).
 [patch.crates-io]
 rawler = { path = "vendor/rawler" }
+block = { git = "https://github.com/Dicklesworthstone/rust-block", rev = "b39ae859d1ee8e8cb5eef6a516471f1578d26b96" }

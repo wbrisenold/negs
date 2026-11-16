@@ -33,8 +33,11 @@ pub use colour::{InputColour, InputInterpretation, InputMode};
 pub use metadata::{ImageMetadata, read_metadata};
 pub use save::save_image;
 pub use raw::LensCorrection;
+pub use rawler::imgop::develop::XTransDemosaic;
 pub use white_balance::{ItcwbEstimate, RawWhiteBalance, RawWhiteBalanceMethod, RawWhiteBalanceMode, estimate_itcwb, estimate_itcwb_with_method};
 
+/// Read the exact per-channel As Shot multipliers recorded in a RAW file.
+/// These are camera values, not a guessed Kelvin/tint conversion.
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -116,9 +119,13 @@ pub fn load_image_with_wb(path: &Path, formats: Formats, wb: RawWhiteBalance) ->
 /// An input in the engine's representation, and what it was read as.
 pub struct LoadedImage {
     pub image: ImageBuf,
+    pub as_shot_white_balance: Option<[Option<f32>; 4]>,
     pub colour: InputColour,
     /// A RAW whose decoder can apply [`LensCorrection`]; false for other files.
     pub lens_correction_supported: bool,
+    /// The size of the whole photograph: `image`'s, unless a reduced read
+    /// ([`load_image_colour_limited`]) returned less.
+    pub full_size: (u32, u32),
 }
 
 /// Shared preview/export loader. RAW WB applies to RAW files only, and the
@@ -132,6 +139,40 @@ pub fn load_image_colour(
     lens: LensCorrection,
     interpretation: &InputInterpretation,
 ) -> Result<LoadedImage> {
+    load_image_colour_scaled(path, formats, wb, lens, interpretation, 1.0)
+}
+
+/// As [`load_image_colour`], limiting native RAW development to this long side.
+/// Other formats and RAW decoders without a reduced-read path remain full size.
+pub fn load_image_colour_limited(
+    path: &Path,
+    formats: Formats,
+    wb: RawWhiteBalance,
+    lens: LensCorrection,
+    interpretation: &InputInterpretation,
+    max_long_side: u32,
+) -> Result<LoadedImage> {
+    if is_raw(path) {
+        let decoded = raw::decode_raw(
+            path,
+            raw::RawDecodeOptions {
+                white_balance: wb,
+                apply_orientation: true,
+                lens_correction: lens,
+                max_long_side,
+                ..Default::default()
+            },
+            raw::RawDecoderPreference::Auto,
+        )?;
+        let full_size = decoded.reduced_from.unwrap_or((decoded.image.width, decoded.image.height));
+        return Ok(LoadedImage {
+            image: decoded.image,
+            as_shot_white_balance: decoded.as_shot_white_balance,
+            colour: InputColour::raw(decoded.decoder),
+            lens_correction_supported: decoded.lens_correction_supported,
+            full_size,
+        });
+    }
     load_image_colour_scaled(path, formats, wb, lens, interpretation, 1.0)
 }
 
@@ -160,13 +201,17 @@ pub fn load_image_colour_scaled(
             path,
             raw::RawDecodeOptions {
                 white_balance: wb, apply_orientation: true, lens_correction: lens, decode_scale,
+                max_long_side: 0,
             },
             decoder,
         )?;
+        let full_size = decoded.reduced_from.unwrap_or((decoded.image.width, decoded.image.height));
         return Ok(LoadedImage {
             image: decoded.image,
+            as_shot_white_balance: decoded.as_shot_white_balance,
             colour: InputColour::raw(decoded.decoder),
             lens_correction_supported: decoded.lens_correction_supported,
+            full_size,
         });
     }
     if formats == Formats::TiffPngRaw && !matches!(ext.as_str(), "tif" | "tiff" | "png") {
@@ -174,7 +219,8 @@ pub fn load_image_colour_scaled(
     }
     let (img, info, format) = decode_no_limits(path)?;
     let (image, colour) = colour::convert(img, &info, interpretation, format == image::ImageFormat::Png)?;
-    Ok(LoadedImage { image, colour, lens_correction_supported: false })
+    let full_size = (image.width, image.height);
+    Ok(LoadedImage { image, as_shot_white_balance: None, colour, lens_correction_supported: false, full_size })
 }
 
 /// Decode with the `image` crate's memory limits disabled and apply the
@@ -253,6 +299,7 @@ fn load_raw_impl(path: &Path, orient: bool, wb: RawWhiteBalance) -> Result<Image
 /// A RAW developed by rawler, and the lens corrections it carries.
 pub(crate) struct RawlerImage {
     pub image: ImageBuf,
+    pub as_shot_white_balance: Option<[Option<f32>; 4]>,
     pub lens: Option<lens::Source>,
 }
 
@@ -261,23 +308,34 @@ fn load_raw_rawler(path: &Path, orient: bool, wb: RawWhiteBalance, lens: LensCor
     wb.validate()?;
     let src =
         RawSource::new(path).with_context(|| format!("opening RAW file: {}", path.display()))?;
-    develop_rawler(&src, orient, wb, lens)
+    develop_rawler(&src, orient, wb, lens, |_| XTransDemosaic::default())
 }
 
 /// [`load_raw_with_wb`] from the file's bytes, with rawler: for browsers,
 /// which have no files.
 pub fn load_raw_bytes(bytes: &[u8], wb: RawWhiteBalance) -> Result<ImageBuf> {
     wb.validate()?;
-    Ok(develop_rawler(&rawler::rawsource::RawSource::new_from_slice(bytes), true, wb, LensCorrection::default())?.image)
+    Ok(develop_rawler(&rawler::rawsource::RawSource::new_from_slice(bytes), true, wb, LensCorrection::default(), |_| XTransDemosaic::default())?.image)
 }
 
 /// [`load_raw_bytes`] without turning the image upright, and the EXIF
 /// orientation (1 to 8) that would: for a caller that shrinks it first,
 /// which then turns a smaller copy.
 pub fn load_raw_bytes_unoriented(bytes: &[u8], wb: RawWhiteBalance) -> Result<(ImageBuf, u16)> {
+    load_raw_bytes_unoriented_with(bytes, wb, |_| XTransDemosaic::default())
+}
+
+/// [`load_raw_bytes_unoriented`], demosaicing a Fuji X-Trans sensor as
+/// `xtrans` says for its pixel count (the whole sensor's, before any crop).
+/// Every other sensor ignores it.
+pub fn load_raw_bytes_unoriented_with(
+    bytes: &[u8],
+    wb: RawWhiteBalance,
+    xtrans: impl FnOnce(usize) -> XTransDemosaic,
+) -> Result<(ImageBuf, u16)> {
     wb.validate()?;
     let src = rawler::rawsource::RawSource::new_from_slice(bytes);
-    let image = develop_rawler(&src, false, wb, LensCorrection::default())?.image;
+    let image = develop_rawler(&src, false, wb, LensCorrection::default(), xtrans)?.image;
     Ok((image, raw_exif_orientation(&src, &rawler::decoders::RawDecodeParams::default())))
 }
 
@@ -286,13 +344,18 @@ fn develop_rawler(
     orient: bool,
     wb: RawWhiteBalance,
     lens_correction: LensCorrection,
+    xtrans: impl FnOnce(usize) -> XTransDemosaic,
 ) -> Result<RawlerImage> {
     use rawler::decoders::RawDecodeParams;
     let decode_params = RawDecodeParams::default();
     let raw = rawler::decode(src, &decode_params)
         .map_err(|e| anyhow::anyhow!("RAW decode failed: {e:?}"))?;
+    let as_shot_white_balance = Some(raw.wb_coeffs.map(|gain| {
+        (gain.is_finite() && gain > 0.0).then_some(gain)
+    }));
     let area = lens_area(&raw);
-    let mut img = develop_decoded(raw, wb)?;
+    let xtrans = xtrans(raw.width * raw.height);
+    let mut img = develop_decoded_with(raw, wb, xtrans)?;
     // Lens corrections are defined in sensor coordinates: before orientation.
     let profile = lens::read_profile_from(src);
     if lens_correction.enabled && let Some(profile) = &profile {
@@ -301,10 +364,10 @@ fn develop_rawler(
     }
     let lens = profile.map(|p| p.source);
     if !orient {
-        return Ok(RawlerImage { image: img, lens });
+        return Ok(RawlerImage { image: img, as_shot_white_balance, lens });
     }
     // rawler still sets RawImage::orientation to Normal: read EXIF ourselves.
-    Ok(RawlerImage { image: img.oriented(raw_exif_orientation(src, &decode_params)), lens })
+    Ok(RawlerImage { image: img.oriented(raw_exif_orientation(src, &decode_params)), as_shot_white_balance, lens })
 }
 
 /// The active area (where DNG lens opcodes are defined) relative to the image
@@ -332,9 +395,13 @@ fn lens_area(raw: &rawler::RawImage) -> Option<LensArea> {
 }
 
 /// Develop an already decoded sensor; shared with the opt-in bounded loader.
-fn develop_decoded(mut raw: rawler::RawImage, wb: RawWhiteBalance) -> Result<ImageBuf> {
+fn develop_decoded(raw: rawler::RawImage, wb: RawWhiteBalance) -> Result<ImageBuf> {
+    develop_decoded_with(raw, wb, XTransDemosaic::default())
+}
+
+fn develop_decoded_with(mut raw: rawler::RawImage, wb: RawWhiteBalance, xtrans: XTransDemosaic) -> Result<ImageBuf> {
     use rawler::imgop::develop::{ProcessingStep, RawDevelop};
-    let mut dev = RawDevelop::default();
+    let mut dev = RawDevelop { xtrans, ..RawDevelop::default() };
     // Our `calibrate` replaces rawler's, which clips (see there).
     dev.steps.retain(|s| !matches!(s, ProcessingStep::SRgb | ProcessingStep::Calibrate));
     // rawler guards `decode` against panics but not `develop_intermediate`,

@@ -32,6 +32,7 @@ mod integration_tests {
         params.film_render.halation.active = false;
         params.film_render.dir_couplers.active = false;
         params.camera.auto_exposure = false;
+        params.io.render_look = Some(crate::params::RenderLook::Off);
 
         let backend = spektrafilm_gpu::cpu_backend::CpuBackend;
         let img = ImageBuf::from_data(8, 8, vec![from_f64(0.184); 8 * 8 * 3]);
@@ -111,6 +112,7 @@ mod integration_tests {
         params.io.input_color_space = "sRGB".to_string();
         params.io.input_cctf_decoding = false;
         params.io.output_cctf_encoding = false;
+        params.io.render_look = Some(crate::params::RenderLook::Off);
         params.film_render.grain.active = false;
         params.film_render.halation.active = false;
         params.film_render.dir_couplers.active = false;

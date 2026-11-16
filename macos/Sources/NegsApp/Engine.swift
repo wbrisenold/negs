@@ -234,6 +234,17 @@ struct ExportRecord: Codable {
 
 /// A serial worker owns the pipe protocol. No pipe reads or image work on the UI thread.
 final class EngineClient: @unchecked Sendable {
+    /// A cancelled queued request should not make the helper develop a frame
+    /// nobody can show. An in-flight request still drains its reply so the
+    /// next request remains in sequence.
+    private final class RequestCancellation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+        func cancel() { lock.withLock { cancelled = true } }
+        func check() throws {
+            if lock.withLock({ cancelled }) { throw CancellationError() }
+        }
+    }
     let paths: EnginePaths
     let scratch: ScratchSpace
     var directory: URL { scratch.directory }
@@ -245,6 +256,9 @@ final class EngineClient: @unchecked Sendable {
     private var output: FileHandle?
     private var log: FileHandle?
     private var pending = Data()
+    /// Engine replies contain metadata only; image pixels travel through the
+    /// shared preview surface. Bound protocol buffering if the helper misbehaves.
+    private let maximumReplyBytes = 16 * 1024 * 1024
     private var sequence = 0
     /// Counts helper launches: a relaunched helper keeps nothing of the last one.
     private var launches = 0
@@ -265,12 +279,20 @@ final class EngineClient: @unchecked Sendable {
 
     /// `request`, plus which helper launch answered it.
     func requestOnLaunch(_ command: [String: JSONValue]) async throws -> (id: Int, result: JSONValue, launch: Int) {
-        try await withCheckedThrowingContinuation { continuation in
-            queue.async {
-                do { continuation.resume(returning: try self.exchange(command)) }
-                catch { continuation.resume(throwing: error) }
+        let cancellation = RequestCancellation()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                queue.async {
+                    do {
+                        try cancellation.check()
+                        let reply = try self.exchange(command)
+                        try cancellation.check()
+                        continuation.resume(returning: reply)
+                    } catch { continuation.resume(throwing: error) }
+                }
             }
-        }
+        } onCancel: { cancellation.cancel() }
     }
 
     /// The helper running now, nil if none is: a request starts a new one.
@@ -298,13 +320,25 @@ final class EngineClient: @unchecked Sendable {
         var data = try JSONEncoder().encode(JSONValue.object(body)); data.append(10)
         do {
             try input!.write(contentsOf: data)
-            while !pending.contains(10) {
+            var newline = pending.firstIndex(of: 10)
+            while newline == nil {
+                let scanStart = pending.endIndex
                 let bytes = output!.availableData
                 guard !bytes.isEmpty else { throw EngineError(message: "The image engine stopped unexpectedly. Open the image again to retry.") }
                 pending.append(bytes)
+                guard pending.count <= maximumReplyBytes else {
+                    if let process, process.isRunning {
+                        kill(process.processIdentifier, SIGKILL)
+                        process.waitUntilExit()
+                    }
+                    closeHandles()
+                    throw EngineError(message: "The image engine returned an oversized response. Restart Negs and try again.")
+                }
+                // Earlier chunks contain no newline; scan only the new bytes.
+                newline = pending[scanStart...].firstIndex(of: 10)
             }
-            let newline = pending.firstIndex(of: 10)!
-            let line = Data(pending[..<newline]); pending.removeSubrange(...newline)
+            let lineEnd = newline!
+            let line = Data(pending[..<lineEnd]); pending.removeSubrange(...lineEnd)
             let reply = try JSONDecoder().decode(JSONValue.self, from: line)
             guard reply["id"].double == Double(id) else { throw EngineError(message: "Image engine response is out of sequence.") }
             if !reply["error"].string.isEmpty { throw EngineError(message: reply["error"].string) }
@@ -408,7 +442,8 @@ final class EngineClient: @unchecked Sendable {
             let hint = engine == .fast ? " If the GPU ran out of memory, export with Reference (CPU, 64-bit) instead." : ""
             throw EngineError(message: "Export failed.\(hint)\n\(diagnostic.isEmpty ? "Unknown exporter error" : String(diagnostic.suffix(4000)))")
         }
-        if let rating { try ExportRating.embed(rating, in: staging) }
+        if let rating { try await ExportRating.embedOffMain(rating, in: staging) }
+        if cancelled { throw CancellationError() }
         guard rename(staging.path, destination.path) == 0 else { throw EngineError(message: "Could not move the completed export to \(destination.path): \(String(cString: strerror(errno)))") }
         return ExportOutcome(fellBackToCPU: engine == .fast && !ExportEngine.ranOnGPU(log: diagnostic))
     }
@@ -417,7 +452,9 @@ final class EngineClient: @unchecked Sendable {
         cancelled = true
         // No waitUntilExit: it spins the run loop and can hang the main thread.
         // run() removes the files again once the termination handler fires.
-        if let process, process.isRunning { kill(process.processIdentifier, SIGKILL) }
-        temporaryFiles.forEach { try? FileManager.default.removeItem(at: $0) }
+        if let process, process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+            temporaryFiles.forEach { try? FileManager.default.removeItem(at: $0) }
+        }
     }
 }

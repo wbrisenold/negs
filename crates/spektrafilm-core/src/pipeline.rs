@@ -198,6 +198,9 @@ pub struct Pipeline {
     /// The caller's slot for this frame's Prep output; see
     /// [`Self::with_prepared_frame`].
     prepared_frame: Option<crate::prep::PreparedFrame>,
+    /// The backend slot and the caller's frame name for keeping the film
+    /// side; see [`Self::with_film_cache`].
+    film_cache: Option<(u32, u64)>,
 }
 
 impl Pipeline {
@@ -320,6 +323,18 @@ impl Pipeline {
     /// own (`1 << 63` and up: the caller's image keys stay below).
     pub fn with_prepared_frame(mut self, frame: crate::prep::PreparedFrame) -> Self {
         self.prepared_frame = Some(frame);
+        self
+    }
+
+    /// Let [`Self::process_resident_borrowed`] keep its film side (the film
+    /// density after grain) in the backend's `slot` and reuse it while every
+    /// input of the film stages is the same (ticket 41). `frame` names the
+    /// image's pixels: the caller promises that every image it renders with
+    /// one `frame` and size has the same pixels, as for
+    /// [`Self::with_prepared_frame`]. The input decoding and Prep join the
+    /// name here; the backend compares the film stages' inputs itself.
+    pub fn with_film_cache(mut self, slot: u32, frame: u64) -> Self {
+        self.film_cache = Some((slot, frame));
         self
     }
 
@@ -472,6 +487,7 @@ impl Pipeline {
             metering_preview: None,
             autoexposure_ev: None,
             prepared_frame: None,
+            film_cache: None,
         };
         pipeline.apply_film_curves_morph();
         pipeline
@@ -666,6 +682,7 @@ impl Pipeline {
             metering_preview: None,
             autoexposure_ev: None,
             prepared_frame: None,
+            film_cache: None,
         };
         // The enlarger illuminant with its dichroic filters, and the preflash.
         pipeline.filter_enlarger();
@@ -816,6 +833,26 @@ impl Pipeline {
     /// The post adjustments, last, on the scanned photograph, clipped to
     /// what a display holds first.
     fn apply_post(&self, mut image: ImageBuf) -> ImageBuf {
+        match self.params.io.effective_render_look() {
+            crate::params::RenderLook::HasselbladHncs
+            | crate::params::RenderLook::ReferentColorHncs
+            | crate::params::RenderLook::ReferentOutputHncsTone => {
+                crate::hncs::apply_reference(
+                    &mut image,
+                    &self.params.io.output_color_space,
+                    self.params.io.output_cctf_encoding,
+                );
+            }
+            crate::params::RenderLook::HasselbladHncsSmooth
+            | crate::params::RenderLook::ReferentOutputHncsSmoothTone => {
+                crate::hncs::apply(
+                    &mut image,
+                    &self.params.io.output_color_space,
+                    self.params.io.output_cctf_encoding,
+                );
+            }
+            _ => {}
+        }
         self.apply_silver_retention(&mut image);
         let post = &self.params.post;
         if !post.is_identity() {
@@ -894,7 +931,25 @@ impl Pipeline {
         let t = Instant::now();
         let mut image = self.rescale_working(image)?;
         print_stage_timing(stage_timings, "rescale", t);
-        let render_params = self.params.clone();
+        let mut render_params = self.params.clone();
+        let render_look = render_params.io.effective_render_look();
+        let referent_color_only = matches!(
+            render_look,
+            crate::params::RenderLook::ReferentColorOnly | crate::params::RenderLook::ReferentColorHncs
+        )
+            && render_params.io.input_scene_referred;
+        let referent_output = matches!(
+            render_look,
+            crate::params::RenderLook::ReferentOutput
+                | crate::params::RenderLook::ReferentOutputHncsTone
+                | crate::params::RenderLook::ReferentOutputHncsSmoothTone
+        );
+        if referent_output {
+            // The LUT replaces the scan's output rendering transform. Keep the
+            // scan linear until the full Referent display transform is applied.
+            render_params.io.output_cctf_encoding = false;
+            render_params.io.output_gamut_compress.algorithm = "off".into();
+        }
         let color_ref = crate::color_reference::ColorReference::compute(
             &self.film,
             &self.print,
@@ -903,9 +958,7 @@ impl Pipeline {
             self.print_exposure_factor,
             self.preflash_raw,
         );
-        let referent_active = render_params.io.referent_logc3_enabled
-            && render_params.io.input_scene_referred;
-        if referent_active {
+        if referent_color_only {
             let lut = crate::referent::load_cube(std::path::Path::new(
                 &render_params.io.referent_logc3_path,
             ))
@@ -933,10 +986,12 @@ impl Pipeline {
         // extended resident chain, including camera/scanner lens blur,
         // highlight boost, and enlarger diffusion. Backends that do not
         // implement the resident chain return `None` and fall through.
-        if self.tc_lut.is_some() && !referent_active {
+        if self.tc_lut.is_some() && !referent_color_only && !referent_output {
             let run =
                 |params: &spektrafilm_gpu::FilmChainParams<'_>| backend.try_run_film_chain(params);
-            match self.try_gpu_resident(&image, None, backend, &color_ref, autoexposure_ev, run) {
+            match self.try_gpu_resident(
+                &image, None, self.film_cache.is_some(), backend, &color_ref, autoexposure_ev, run,
+            ) {
                 Ok(Some(out)) => {
                     tracing::info!("pipeline: gpu-resident fast path complete");
                     return Ok((self.finish_resident(out, backend), backend.name()));
@@ -970,7 +1025,7 @@ impl Pipeline {
         tracing::info!("pipeline: filming complete");
         dump_if_env("SPEKTRAFILM_DUMP_FILM_DENSITY", &filmed);
 
-        let result = if self.params.io.scan_film {
+        let mut result = if self.params.io.scan_film {
             let t = Instant::now();
             let result = stages::scanning::process(
                 filmed,
@@ -1012,6 +1067,21 @@ impl Pipeline {
             tracing::info!("pipeline: scanning complete");
             result
         };
+        if referent_output {
+            let lut = crate::referent::load_cube(std::path::Path::new(
+                &render_params.io.referent_logc3_path,
+            ))
+            .map_err(spektrafilm_io::image_size::SizeError::InvalidInputTransform)?;
+            crate::referent::apply_output_transform(
+                &mut result,
+                &lut,
+                &render_params.io.output_color_space,
+            );
+            stages::scanning::encode_output(
+                &mut result,
+                &render_params.io.output_color_space,
+            );
+        }
         Ok((result, backend.name()))
     }
 
@@ -1032,8 +1102,72 @@ impl Pipeline {
             self.print_exposure_factor,
             self.preflash_raw,
         );
-        let render_params = self.params.clone();
-        let image = if render_params.io.referent_logc3_enabled
+        let mut render_params = self.params.clone();
+        let render_look = render_params.io.effective_render_look();
+        if matches!(
+            render_look,
+            crate::params::RenderLook::ReferentOutput
+                | crate::params::RenderLook::ReferentOutputHncsTone
+                | crate::params::RenderLook::ReferentOutputHncsSmoothTone
+        ) {
+            render_params.io.output_cctf_encoding = false;
+            render_params.io.output_gamut_compress.algorithm = "off".into();
+        }
+        let finish_scan = |mut scan: ImageBuf| {
+            if matches!(
+                render_look,
+                crate::params::RenderLook::ReferentOutput
+                    | crate::params::RenderLook::ReferentOutputHncsTone
+                    | crate::params::RenderLook::ReferentOutputHncsSmoothTone
+            ) {
+                if let Ok(lut) = crate::referent::load_cube(std::path::Path::new(
+                    &render_params.io.referent_logc3_path,
+                )) {
+                    crate::referent::apply_output_transform(
+                        &mut scan,
+                        &lut,
+                        &render_params.io.output_color_space,
+                    );
+                    stages::scanning::encode_output(&mut scan, &render_params.io.output_color_space);
+                }
+            }
+            if matches!(
+                render_look,
+                crate::params::RenderLook::HasselbladHncs
+                    | crate::params::RenderLook::HasselbladHncsSmooth
+                    | crate::params::RenderLook::ReferentColorHncs
+                    | crate::params::RenderLook::ReferentOutputHncsTone
+                    | crate::params::RenderLook::ReferentOutputHncsSmoothTone
+            ) {
+                let encoded = if matches!(
+                    render_look,
+                    crate::params::RenderLook::ReferentOutputHncsTone
+                        | crate::params::RenderLook::ReferentOutputHncsSmoothTone
+                ) {
+                        true
+                    } else {
+                        render_params.io.output_cctf_encoding
+                    };
+                if matches!(
+                    render_look,
+                    crate::params::RenderLook::HasselbladHncsSmooth
+                        | crate::params::RenderLook::ReferentOutputHncsSmoothTone
+                ) {
+                    crate::hncs::apply(&mut scan, &render_params.io.output_color_space, encoded);
+                } else {
+                    crate::hncs::apply_reference(
+                        &mut scan,
+                        &render_params.io.output_color_space,
+                        encoded,
+                    );
+                }
+            }
+            scan
+        };
+        let image = if matches!(
+            render_params.io.effective_render_look(),
+            crate::params::RenderLook::ReferentColorOnly | crate::params::RenderLook::ReferentColorHncs
+        )
             && render_params.io.input_scene_referred
         {
             if let Ok(lut) = crate::referent::load_cube(std::path::Path::new(
@@ -1069,7 +1203,7 @@ impl Pipeline {
                 &color_ref,
                 &self.output_gamut,
             );
-            return (log_film, None, scan);
+            return (log_film, None, finish_scan(scan));
         }
         let log_paper = stages::printing::expose_calibrated(
             filmed,
@@ -1091,7 +1225,7 @@ impl Pipeline {
             &color_ref,
             &self.output_gamut,
         );
-        (log_film, Some(log_paper), scan)
+        (log_film, Some(log_paper), finish_scan(scan))
     }
 
     /// The film's raw exposure of an auto-exposure metering frame
@@ -1156,7 +1290,7 @@ impl Pipeline {
     ) -> Option<ImageBuf> {
         let run =
             |params: &spektrafilm_gpu::FilmChainParams<'_>| backend.try_run_film_chain(params);
-        let out = self.borrowed_resident(image, None, backend, run)?;
+        let out = self.borrowed_resident(image, None, self.film_cache.is_some(), backend, run)?;
         let out = self.finish_resident(out, backend);
         Some(self.apply_post(out))
     }
@@ -1178,7 +1312,7 @@ impl Pipeline {
         let submit = |params: &spektrafilm_gpu::FilmChainParams<'_>| {
             backend.submit_film_chain(params, output, on_mapped)
         };
-        self.borrowed_resident(image, image_key, backend, submit)
+        self.borrowed_resident(image, image_key, self.film_cache.is_some(), backend, submit)
     }
 
     /// The finished chain: a scan finished as `process_resident_borrowed`
@@ -1205,6 +1339,15 @@ impl Pipeline {
             &self.params.io.output_color_space,
         );
         backend.resident_chain_applies_post_scan()
+            && !matches!(
+                self.params.io.effective_render_look(),
+                crate::params::RenderLook::ReferentOutput
+                    | crate::params::RenderLook::HasselbladHncs
+                    | crate::params::RenderLook::HasselbladHncsSmooth
+                    | crate::params::RenderLook::ReferentColorHncs
+                    | crate::params::RenderLook::ReferentOutputHncsTone
+                    | crate::params::RenderLook::ReferentOutputHncsSmoothTone
+            )
             && output.name == spektrafilm_math::colorspace::SRGB.name
             && self.params.film_render.silver_retention == 0.0
             && (!self.params.io.output_cctf_encoding || self.gpu_encodes_output())
@@ -1228,11 +1371,21 @@ impl Pipeline {
         &self,
         image: &ImageBuf,
         image_key: Option<u64>,
+        film_cache: bool,
         backend: &dyn ComputeBackend,
         run: impl FnOnce(&spektrafilm_gpu::FilmChainParams<'_>) -> Option<T>,
     ) -> Option<T> {
         self.tc_lut.as_ref()?;
         let io = &self.params.io;
+        let look = io.effective_render_look();
+        if look == crate::params::RenderLook::ReferentOutput
+            || look == crate::params::RenderLook::ReferentColorHncs
+            || look == crate::params::RenderLook::ReferentOutputHncsTone
+            || look == crate::params::RenderLook::ReferentOutputHncsSmoothTone
+            || (look == crate::params::RenderLook::ReferentColorOnly && io.input_scene_referred)
+        {
+            return None;
+        }
         if io.photo_long_side_px.is_some() || (io.upscale_factor - 1.0).abs() >= 1e-6 {
             return None;
         }
@@ -1250,7 +1403,7 @@ impl Pipeline {
             self.preflash_raw,
         );
         let autoexposure_ev = self.frame_autoexposure_ev(image);
-        self.try_gpu_resident(image, image_key, backend, &color_ref, autoexposure_ev, run)
+        self.try_gpu_resident(image, image_key, film_cache, backend, &color_ref, autoexposure_ev, run)
             .ok()?
     }
 
@@ -1272,6 +1425,7 @@ impl Pipeline {
         &self,
         image: &ImageBuf,
         image_key: Option<u64>,
+        film_cache: bool,
         backend: &dyn ComputeBackend,
         color_ref: &crate::color_reference::ColorReference,
         autoexposure_ev: f64,
@@ -1321,6 +1475,20 @@ impl Pipeline {
         if !prep_active && let Some(frame) = &self.prepared_frame {
             frame.clear(); // neutral Prep needs no copy of the frame
         }
+        // The uploaded pixels' name for the film-side cache: the caller's
+        // frame, then what made `image` of it (as `PreparedKey`, and more).
+        let film_cache = self.film_cache.filter(|_| film_cache).map(|(slot, frame)| {
+            let mut name = frame.to_le_bytes().to_vec();
+            name.push(self.params.io.input_cctf_decoding as u8);
+            name.extend(self.params.io.input_color_space.as_bytes());
+            name.push(0);
+            if prep_active {
+                name.extend(autoexposure_ev.to_bits().to_le_bytes());
+                name.extend(self.params.camera.exposure_compensation_ev.to_bits().to_le_bytes());
+                name.extend(format!("{:?}", self.params.prep).as_bytes());
+            }
+            spektrafilm_gpu::FilmCacheSlot { slot, image: name }
+        });
         // Bake the exposure scale (auto-exposure × manual EV compensation ×
         // an exposure-only Prep)
         // into the front-pass matrix. The upsampler is homogeneous in the
@@ -1699,6 +1867,7 @@ impl Pipeline {
         let params = spektrafilm_gpu::FilmChainParams {
             image,
             image_key,
+            film_cache,
             front,
             film_log_exposure: &film_log_exp,
             film_density_curves_normalized: &film_curves_norm,

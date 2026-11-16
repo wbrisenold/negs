@@ -8,6 +8,7 @@ pub mod data_fs;
 pub mod enlarger;
 pub mod exposure_placement;
 pub mod gamut_compression;
+pub mod hncs;
 pub mod grain;
 pub mod illuminants;
 pub mod image_size;

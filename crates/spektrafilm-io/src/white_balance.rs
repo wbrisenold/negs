@@ -119,10 +119,12 @@ impl RawWhiteBalance {
 }
 
 /// Leave As-shot entirely untouched (including rawler's missing-WB fallback).
-/// Other modes start with a camera-matrix-derived daylight development.
+/// Custom also retains the camera's recorded WB multipliers as its baseline;
+/// its temperature/tint controls are then a correction from that baseline.
+/// Daylight and Tungsten start with a camera-matrix-derived daylight develop.
 pub(crate) fn prepare(raw: &mut RawImage, settings: RawWhiteBalance) -> Result<()> {
     settings.validate()?;
-    if settings.mode == RawWhiteBalanceMode::AsShot || is_monochrome(raw) {
+    if matches!(settings.mode, RawWhiteBalanceMode::AsShot | RawWhiteBalanceMode::Custom) || is_monochrome(raw) {
         return Ok(());
     }
     use rawler::imgop::{chromatic_adaption::adapt_bradford, xyz::Illuminant};

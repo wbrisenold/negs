@@ -28,6 +28,25 @@ final class SelectionTests: XCTestCase {
         XCTAssertEqual(selection.selected, [photos[4]])
     }
 
+    /// ⌘ on the current photograph in the grid passes current on: to the
+    /// next selected to its right, else the nearest to its left.
+    func testCommandClickingTheCurrentPhotograph() {
+        var selection = LibrarySelection()
+        selection.select(photos[2])
+        selection.selectAll(photos)
+        selection.toggle(photos[2], in: photos)
+        XCTAssertEqual(selection.selected, Set([0, 1, 3, 4, 5].map { photos[$0] }))
+        XCTAssertEqual(selection.current, photos[3])
+        selection.select(photos[4])
+        selection.toggle(photos[1], in: photos)
+        selection.toggle(photos[4], in: photos)
+        XCTAssertEqual(selection.selected, [photos[1]])
+        XCTAssertEqual(selection.current, photos[1], "none to the right: the nearest to the left")
+        selection.toggle(photos[1], in: photos)
+        XCTAssertEqual(selection.selected, [photos[1]], "the only one selected stays")
+        XCTAssertEqual(selection.current, photos[1])
+    }
+
     func testKeys() {
         var selection = LibrarySelection()
         selection.select(photos[2])
@@ -55,46 +74,106 @@ final class SelectionTests: XCTestCase {
         XCTAssertEqual(selection.selected, [photos[0], photos[1], photos[4]])
     }
 
-    /// Photographs a rating changed stay shown until the selection moves;
-    /// a filter change drops the hidden ones from the selection.
-    func testKeptAndPruned() {
+    /// A filter change drops the hidden ones from the selection.
+    func testPruned() {
         var selection = LibrarySelection()
         selection.select(photos[0])
         selection.extend(to: photos[2], in: photos)
-        selection.keep([photos[1], photos[2]])
-        XCTAssertEqual(selection.visible, Set([0, 1, 2].map { photos[$0] }))
         selection.toggle(photos[5])
-        XCTAssertEqual(selection.visible, [photos[0]], "kept until the selection changes")
         selection.prune(to: [photos[2]])
         XCTAssertEqual(selection.selected, [photos[0], photos[2]], "the current photograph is never pruned")
         XCTAssertEqual(selection.current, photos[0])
     }
 
-    func testGridMetrics() {
-        let metrics = GridMetrics(width: 1000, cell: 180)
-        // (1000 - 40 + 14) / 194 = 5 columns, centred.
-        XCTAssertEqual(metrics.columns, 5)
-        XCTAssertEqual(metrics.inset, (1000 - (5 * 180 + 4 * 14)) / 2)
-        XCTAssertEqual(metrics.rows(11), 3)
-        XCTAssertEqual(metrics.frame(6).minX, metrics.frame(1).minX)
-        XCTAssertEqual(metrics.frame(6).minY, GridMetrics.padding + metrics.rowHeight + GridMetrics.spacing)
-        // A band over the second row's first two cells, and the gap below it.
-        let second = metrics.frame(5).union(metrics.frame(6)).insetBy(dx: 10, dy: 10)
-        XCTAssertEqual(metrics.indices(in: second, count: 11), [5, 6])
-        let gap = CGRect(x: 0, y: metrics.frame(0).maxY + 2, width: 1000, height: 4)
-        XCTAssertEqual(metrics.indices(in: gap, count: 11), [], "between rows touches none")
-        XCTAssertEqual(metrics.indices(in: CGRect(x: 0, y: 0, width: 1000, height: 2000), count: 11), Array(0..<11))
-        XCTAssertEqual(GridMetrics(width: 50, cell: 360).columns, 1, "always at least one column")
+    /// What scrolls into view for the current photograph is its yellow box
+    /// with room round it, which reaches past the picture and its row; a
+    /// pinch holds the photograph under it, or the nearest.
+    func testTheSelectionBoxAndTheNearestPhotograph() {
+        let layout = SheetLayout(ratios: [1.5, 1.5, 1.5, 1.5, 0.75], width: 1000, target: 176)
+        for index in layout.frames.indices {
+            let frame = layout.frames[index], box = layout.selectionBox(index, name: "IMG_\(index).CR3")
+            // The box is drawn 8 pt out in a 4 pt line, so at least 10 pt past the picture, and a margin more.
+            XCTAssertLessThanOrEqual(box.minY, frame.minY - 10 - SheetLayout.boxMargin)
+            XCTAssertGreaterThanOrEqual(box.maxY, frame.maxY + 10 + SheetLayout.boxMargin)
+            XCTAssertLessThanOrEqual(box.minX, frame.minX - 10 - SheetLayout.boxMargin)
+            XCTAssertLessThan(box.height, frame.height + 2 * (PickBox.reach + SheetLayout.boxMargin), "within what the layer draws")
+        }
+        XCTAssertEqual(layout.nearest(to: CGPoint(x: layout.frames[2].midX, y: layout.frames[2].midY)), 2, "the one under it")
+        XCTAssertEqual(layout.nearest(to: CGPoint(x: layout.frames[1].maxX + 2, y: layout.frames[1].midY)), 1, "in the gap, the nearer")
+        XCTAssertEqual(layout.nearest(to: CGPoint(x: 900, y: layout.height + 50)), 4, "below the last row, its nearest")
+        XCTAssertEqual(layout.nearest(to: CGPoint(x: 0, y: 0)), 0)
+        XCTAssertNil(SheetLayout(ratios: [], width: 1000, target: 176).nearest(to: .zero))
     }
 
-    /// The edit view's tools leave the toolbar in the grid; Open, the
-    /// switch and Filter lead in both, so only the rest is replaced.
-    @MainActor func testToolbarItemsPerMode() {
-        let photo = EditorWindowController.itemIdentifiers(for: .photo), grid = EditorWindowController.itemIdentifiers(for: .grid)
-        XCTAssertEqual(Array(photo.prefix(3)), Array(grid.prefix(3)))
-        XCTAssertEqual(Array(photo.prefix(4)), [.open, .mode, .filter, .filmstrip])
-        XCTAssertTrue(grid.contains(.gridSize) && grid.contains(.export))
-        for id in [NSToolbarItem.Identifier.filmstrip, .zoom, .edit, .presets, .adjustments] { XCTAssertFalse(grid.contains(id)) }
+    /// The sheet packs photographs in rows at their own proportions (§4.6).
+    func testSheetLayoutPacksRowsAtTheirOwnProportions() {
+        let layout = SheetLayout(ratios: [1.5, 1.5, 1.5, 1.5, 0.75], width: 1000, target: 176)
+        // 968 pt across: three at 176 leave a gap, four overfill; four at
+        // 158 is nearer 176 than three at 212, so the row takes four.
+        XCTAssertEqual(layout.rows.map(\.range), [0..<4, 4..<5])
+        XCTAssertEqual(layout.rows[0].height, 158)
+        XCTAssertEqual(layout.frames[0].minX, SheetLayout.side)
+        XCTAssertEqual(layout.frames[1].minX, layout.frames[0].maxX + SheetLayout.gap)
+        XCTAssertEqual(layout.frames[3].maxX, 1000 - SheetLayout.side, "a full row ends flush")
+        XCTAssertEqual(layout.frames[0].width, 237, "each at its own proportions")
+        // The last row isn't stretched.
+        XCTAssertEqual(layout.rows[1].height, 176)
+        XCTAssertEqual(layout.frames[4].size, CGSize(width: 132, height: 176))
+        XCTAssertEqual(layout.rows[1].y, SheetLayout.top + 158 + SheetLayout.gap)
+        XCTAssertEqual(layout.height, SheetLayout.top + 158 + SheetLayout.gap + 176 + SheetLayout.bottom)
+
+        // Up and down land on the nearest across, as in Finder.
+        XCTAssertEqual(layout.vertical(from: 3, by: 1), 4)
+        XCTAssertEqual(layout.vertical(from: 4, by: -1), 0)
+        XCTAssertNil(layout.vertical(from: 0, by: -1))
+        XCTAssertNil(layout.vertical(from: 4, by: 1))
+        XCTAssertEqual(layout.row(of: 3), 0)
+        XCTAssertEqual(layout.row(of: 4), 1)
+        XCTAssertNil(layout.row(of: 5))
+
+        // The rubber band.
+        XCTAssertEqual(layout.indices(in: layout.frames[1].union(layout.frames[2]).insetBy(dx: 10, dy: 10)), [1, 2])
+        let gap = CGRect(x: 0, y: layout.frames[0].maxY + 2, width: 1000, height: 2)
+        XCTAssertEqual(layout.indices(in: gap), [], "between rows touches none")
+        XCTAssertEqual(layout.indices(in: CGRect(x: 0, y: 0, width: 1000, height: 2000)), Array(0..<5))
+        // The grid builds the photographs of the rows reaching into its view.
+        XCTAssertEqual(layout.indices(from: 0, to: 10), 0..<0, "above the first row")
+        XCTAssertEqual(layout.indices(from: 0, to: 30), layout.rows[0].range)
+        XCTAssertEqual(layout.indices(from: 0, to: layout.rows[1].y), 0..<5)
+        XCTAssertEqual(layout.indices(from: layout.rows[1].y, to: 5000), layout.rows[1].range)
+        XCTAssertEqual(layout.indices(from: 5000, to: 6000), 0..<0)
+
+        // A panorama wider than the sheet has a row to itself, shrunk to fit.
+        let wide = SheetLayout(ratios: [10, 1.5], width: 500, target: 176)
+        XCTAssertEqual(wide.rows.map(\.range), [0..<1, 1..<2])
+        XCTAssertEqual(wide.frames[0].width, 468)
+        XCTAssertEqual(wide.rows[0].height, 47)
+        let empty = SheetLayout(ratios: [], width: 500, target: 176)
+        XCTAssertTrue(empty.rows.isEmpty)
+        XCTAssertEqual(empty.height, SheetLayout.top + SheetLayout.bottom)
+    }
+
+    /// The sentence over the grid and its foot (§4.6), in the app's words.
+    func testTheCurrentAndTheSelectedAreDrawnSelected() {
+        var selection = LibrarySelection()
+        XCTAssertFalse(photos.contains { SheetLayout.drawnSelected($0, selection: selection) })
+        selection.select(photos[3])
+        selection.toggle(photos[4])
+        XCTAssertEqual(photos.indices.filter { SheetLayout.drawnSelected(photos[$0], selection: selection) }, [3, 4])
+    }
+
+    func testTheSheetSaysWhatItShows() {
+        XCTAssertEqual(SheetWords.words(for: LibraryFilter()), [])
+        let filter = LibraryFilter(rating: .atLeast(3), flags: [.pick], editedOnly: true)
+        XCTAssertEqual(SheetWords.words(for: filter), [SheetWords.Part(lead: "rated ", word: "★★★ or more"),
+                                                       SheetWords.Part(lead: "", word: "picks"),
+                                                       SheetWords.Part(lead: "", word: "edited")])
+        XCTAssertEqual(SheetWords.words(for: LibraryFilter(rating: .atLeast(5))), [SheetWords.Part(lead: "rated ", word: "★★★★★")])
+        XCTAssertEqual(SheetWords.words(for: LibraryFilter(rating: .unrated, flags: [.pick, .reject])),
+                       [SheetWords.Part(lead: "", word: "unrated"), SheetWords.Part(lead: "", word: "picks or rejected")])
+        XCTAssertEqual(SheetWords.count(shown: 12, total: 12, selected: 1, filtered: false), "12 photographs · 1 selected")
+        XCTAssertEqual(SheetWords.count(shown: 4, total: 12, selected: 1, filtered: true), "4 of 12 photographs")
+        XCTAssertEqual(SheetWords.count(shown: 1, total: 1, selected: 0, filtered: false), "1 photograph")
     }
 
     /// Copy Edits' groups: the standard ones leave crop, rotation and how
@@ -238,6 +317,95 @@ final class SelectionTests: XCTestCase {
         let reordered = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"params": {"prep": {"gain": 2, "lift": 1}}, "film": "a"}"#.utf8))
         XCTAssertEqual(PhotoSidecar.look(of: edits, defaultsVersion: 1), PhotoSidecar.look(of: reordered, defaultsVersion: 1))
         XCTAssertNotEqual(PhotoSidecar.look(of: edits, defaultsVersion: 1), PhotoSidecar.look(of: edits, defaultsVersion: 2))
+    }
+
+    /// Past the limit the least recently shown go first: after the default
+    /// film changes, the unedited thumbnails developed with the old one.
+    func testThumbnailsPrunedLeastRecentlyShownFirst() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("negs-thumbs-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = EditedThumbnailStore(directory: dir)
+        let context = try XCTUnwrap(CGContext(data: nil, width: 64, height: 64, bitsPerComponent: 8, bytesPerRow: 0,
+                                              space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+        context.setFillColor(red: 0.8, green: 0.3, blue: 0.1, alpha: 1); context.fill(CGRect(x: 0, y: 0, width: 64, height: 64))
+        let image = try XCTUnwrap(context.makeImage())
+        let before = Date(timeIntervalSinceNow: -3 * 86_400)
+        // Before the default changed: two unedited and two edited photographs.
+        for key in ["old-film-1", "old-film-2", "edited-1", "edited-2"] {
+            try store.save(image, as: key)
+            try FileManager.default.setAttributes([.modificationDate: before], ofItemAtPath: store.url(for: key).path)
+        }
+        // Since: the unedited ones developed again, and the edited ones shown.
+        for key in ["new-film-1", "new-film-2"] { try store.save(image, as: key) }
+        for key in ["edited-1", "edited-2"] { XCTAssertNotNil(store.image(key, maxPixels: 64)) }
+        let size = try XCTUnwrap(store.url(for: "edited-1").resourceValues(forKeys: [.fileSizeKey]).fileSize)
+        store.prune(limit: size * 6 + 1)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path).count, 6, "nothing under the limit")
+        // Just under six: down to three quarters, which two make room for.
+        store.prune(limit: size * 16 / 3 + 4)
+        for key in ["old-film-1", "old-film-2"] { XCTAssertFalse(store.contains(key), key) }
+        for key in ["edited-1", "edited-2", "new-film-1", "new-film-2"] { XCTAssertTrue(store.contains(key), key) }
+
+        // Emptied, but for one being written.
+        let writing = dir.appendingPathComponent(".new-film-3-temporary.jpg")
+        try Data([1]).write(to: writing)
+        XCTAssertEqual(store.size(), size * 4)
+        store.removeAll()
+        XCTAssertEqual(store.size(), 0)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), [writing.lastPathComponent])
+    }
+
+    /// After an update a photograph's thumbnail and kept develop are no
+    /// longer found by name; the last engine's stand in until they're made
+    /// again, which the pump still sees is needed.
+    func testThumbnailsOfThePreviousEngineStandIn() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("negs-thumbs-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let photoURL = dir.appendingPathComponent("a.jpg")
+        try Data([1, 2, 3]).write(to: photoURL)
+        let photo = PhotoFile(url: photoURL)
+        let store = EditedThumbnailStore(directory: dir.appendingPathComponent("thumbnails"))
+        func image(_ red: CGFloat) throws -> CGImage {
+            let context = try XCTUnwrap(CGContext(data: nil, width: 64, height: 48, bitsPerComponent: 8, bytesPerRow: 0,
+                                                  space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+            context.setFillColor(red: red, green: 0.3, blue: 0.1, alpha: 1); context.fill(CGRect(x: 0, y: 0, width: 64, height: 48))
+            return try XCTUnwrap(context.makeImage())
+        }
+        func red(_ image: CGImage?) throws -> Int {
+            let image = try XCTUnwrap(image)
+            let context = try XCTUnwrap(CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                                  space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+            context.draw(image, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+            return Int(try XCTUnwrap(context.data).load(as: UInt8.self))
+        }
+        store.engineStamp = "old"
+        XCTAssertNil(store.previousKey(for: photo, look: "edits"), "nothing saved yet")
+        let old = try XCTUnwrap(store.key(for: photo, look: "edits"))
+        try store.save(image(0.9), as: old, loose: store.looseKey(for: photo, look: "edits"), photoSize: CGSize(width: 6000, height: 4500))
+        let other = await PhotoThumbnails.shared.image(for: photo, size: .large, look: "other edits", edited: store)
+        XCTAssertNil(other, "only for the same edits")
+
+        store.engineStamp = "new"
+        let new = try XCTUnwrap(store.key(for: photo, look: "edits"))
+        XCTAssertFalse(store.contains(new), "the pump develops it again")
+        XCTAssertEqual(store.previousKey(for: photo, look: "edits"), old)
+        XCTAssertEqual(store.render(old)?.photoSize, CGSize(width: 6000, height: 4500))
+        let standIn = await PhotoThumbnails.shared.image(for: photo, size: .large, look: "edits", edited: store)
+        XCTAssertGreaterThan(try red(standIn), 200)
+        // Made again: it replaces the stand-in, in memory too.
+        try store.save(image(0.1), as: new, loose: store.looseKey(for: photo, look: "edits"))
+        let made = await PhotoThumbnails.shared.image(for: photo, size: .large, look: "edits", edited: store)
+        XCTAssertLessThan(try red(made), 60)
+        XCTAssertEqual(store.previousKey(for: photo, look: "edits"), new, "the link follows the newest")
+
+        // Links go with what they point at, and count for nothing.
+        let sizes = try [old, new].map { try XCTUnwrap(store.url(for: $0).resourceValues(forKeys: [.fileSizeKey]).fileSize) }
+        XCTAssertEqual(store.size(), sizes[0] + sizes[1])
+        try FileManager.default.removeItem(at: store.url(for: new))
+        store.prune(limit: 0)
+        XCTAssertNil(store.previousKey(for: photo, look: "edits"))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: store.directory.path), [])
     }
 
     /// A match solved in the background lands only on the edits it was solved for.

@@ -13,7 +13,8 @@ which every reader is tested against: [sidecar-fixtures/](sidecar-fixtures/).
   file name plus `.negs`. RAW+JPEG pairs get one each, and the name never
   collides with a Lightroom, Capture One or darktable `.xmp`.
 - Visible, not a dotfile, so it survives copying and people see what to share.
-- Written only once a photo has a rating, flag or edit. Opening or browsing a
+- Written only once a photo has a rating, flag, edit or saved comparison
+  version. Opening or browsing a
   photo writes nothing; neither does Negs's automatic *Match camera
   brightness* solve on a photo the user hasn't edited.
 
@@ -35,7 +36,7 @@ which every reader is tested against: [sidecar-fixtures/](sidecar-fixtures/).
   schema, or a `defaultsVersion` this build has no table for. Open the photo
   with the defaults, say why, and leave the file alone.
 - **Remove the file** when a write leaves one variant with nothing in it
-  (no rating, flag or edits) and no other keys in the file.
+  (no rating, flag, edits or saved versions) and no other keys in the file.
   A duplicate may hold nothing but its `id` (a copy of an unedited photo);
   it still counts, so a file with two variants stays.
 - Keys are written sorted, two-space indented, with a final newline, so the
@@ -61,7 +62,11 @@ which every reader is tested against: [sidecar-fixtures/](sidecar-fixtures/).
         "crop": { "rect": [[0.1, 0.05], [0.8, 0.9]], "aspect": "freeform" },
         "border": { "enabled": true, "style": "keyline" },
         "brightnessMatch": { "ev": 0.45, "highlightLimited": false }
-      }
+      },
+      "versions": [
+        { "slot": 1, "edits": { "film": "kodak_portra_400", "paper": "kodak_portra_endura" } },
+        { "slot": 2, "edits": { "film": "kodak_gold_200", "paper": "kodak_portra_endura", "params": { "prep": { "exposure_ev": 0.3 } } } }
+      ]
     }
   ]
 }
@@ -77,6 +82,7 @@ which every reader is tested against: [sidecar-fixtures/](sidecar-fixtures/).
 | `variants[].rating` | integer 0–5 | Stars. Absent means 0. XMP's −1 for rejected is *not* used here; see `flag`. |
 | `variants[].flag` | `"pick"` or `"reject"` | Absent means unflagged. Independent of the rating: a photo can be a 4-star reject. |
 | `variants[].edits` | object | Absent: no edits, the photo opens as a new one. |
+| `variants[].versions` | array | Up to two saved edit snapshots for the photo. Each entry has `slot` (1 or 2) and `edits`, stored against the same defaults table as the variant. Absent: no saved versions. |
 
 ### `edits`
 

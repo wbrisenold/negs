@@ -63,7 +63,7 @@ extension JSONValue {
 /// a new table and never edits an old one; `SidecarDefaultsTests` hashes each.
 struct SidecarDefaults: Equatable, Sendable {
     /// New sidecars get this version.
-    static let latest = 1
+    static let latest = 2
 
     let version: Int
     let film: String
@@ -130,6 +130,7 @@ struct PhotoSidecar: Equatable, Sendable {
         var flag: Flag?
         /// The stored edits, as in the file; nil when none.
         var edits: JSONValue?
+        var versions: JSONValue?
     }
 
     var raw: JSONValue
@@ -177,7 +178,9 @@ struct PhotoSidecar: Equatable, Sendable {
             }
             let edits = fields["edits"]
             if let edits, edits.object == nil { throw Problem.unreadable("edits that aren’t an object") }
-            variants.append(Variant(id: id, rating: rating, flag: flag, edits: edits))
+            let versions = fields["versions"]
+            if let versions, case .array = versions {} else if versions != nil { throw Problem.unreadable("saved versions") }
+            variants.append(Variant(id: id, rating: rating, flag: flag, edits: edits, versions: versions))
         }
         self.raw = raw
         defaultsVersion = version
@@ -236,6 +239,11 @@ struct PhotoSidecar: Equatable, Sendable {
         state.film = try string("film", table.film)
         state.paper = try string("paper", table.paper)
         state.params = table.params.overlaid(with: fields["params"] ?? .object([:]))
+        // v1 used Hanatos 2025 as its default. Migrate that old default for
+        // existing photos, while preserving any explicitly saved newer value.
+        if table.version < 2, state.params["settings.rgb_to_raw_method"].string == "hanatos2025" {
+            state.params["settings.rgb_to_raw_method"] = .string("arctic2026beta04")
+        }
         guard let crop = decode(CropSettings.self, table.crop.overlaid(with: fields["crop"] ?? .object([:]))) else { throw Problem.unreadable("crop") }
         guard let border = decode(BorderSettings.self, table.border.overlaid(with: fields["border"] ?? .object([:]))) else { throw Problem.unreadable("border") }
         state.crop = crop
@@ -253,6 +261,24 @@ struct PhotoSidecar: Equatable, Sendable {
         }
         do { try state.validate() } catch { throw Problem.unreadable("edits out of range") }
         return SavedEdits(state: state, matchSolved: solved)
+    }
+
+    static func encodeVersions(_ versions: [SavedEditVersion], table: SidecarDefaults) -> JSONValue {
+        .array(versions.sorted { $0.slot < $1.slot }.filter { (1...2).contains($0.slot) }.map {
+            .object(["slot": .number(Double($0.slot)), "edits": encodeEdits($0.state, matchSolved: false, table: table)])
+        })
+    }
+
+    static func decodeVersions(_ value: JSONValue?, table: SidecarDefaults) throws -> [SavedEditVersion] {
+        guard let value else { return [] }
+        guard case .array(let entries) = value, entries.count <= 2 else { throw Problem.unreadable("saved versions") }
+        var versions: [SavedEditVersion] = []
+        for entry in entries {
+            guard let slot = entry["slot"].integer, (1...2).contains(slot), !versions.contains(where: { $0.slot == slot }),
+                  let edits = entry.object?["edits"] else { throw Problem.unreadable("saved versions") }
+            versions.append(SavedEditVersion(slot: slot, state: try decodeEdits(edits, table: table).state))
+        }
+        return versions.sorted { $0.slot < $1.slot }
     }
 
     private static func json<T: Encodable>(_ value: T) -> JSONValue? {
@@ -274,6 +300,8 @@ struct SidecarPatch: Equatable, Sendable {
     var primary = false
     /// The variant's new stored edits (`.some(nil)` removes them); nil leaves them.
     var edits: JSONValue?? = nil
+    /// Per-photo comparison versions; `.some(nil)` removes them.
+    var versions: JSONValue?? = nil
     /// The new rating, 0 to 5; nil leaves it.
     var rating: Int? = nil
     /// The new flag (`.some(nil)` unflags); nil leaves it.
@@ -294,7 +322,7 @@ struct SidecarPatch: Equatable, Sendable {
     var app: String
 
     /// Whether the change gives a variant something to hold.
-    private var adds: Bool { (edits ?? nil) != nil || (rating ?? 0) > 0 || (flag ?? nil) != nil }
+    private var adds: Bool { (edits ?? nil) != nil || (versions ?? nil) != nil || (rating ?? 0) > 0 || (flag ?? nil) != nil }
 
     /// The file after this change, or nil to remove it: a single variant with
     /// nothing in it and nothing else in the file means the photo has no
@@ -306,7 +334,7 @@ struct SidecarPatch: Equatable, Sendable {
             // Decoding checks the schema and versions: a newer file is never written over.
             let sidecar = try PhotoSidecar(raw: .object(top))
             // Ratings and flags don't depend on the table; edits are stored against it.
-            if edits != nil, sidecar.defaultsVersion != defaultsVersion {
+            if (edits != nil || versions != nil), sidecar.defaultsVersion != defaultsVersion {
                 throw PhotoSidecar.Problem.unreadable("its defaults version changed while it was open")
             }
         }
@@ -332,6 +360,7 @@ struct SidecarPatch: Equatable, Sendable {
             }
             fields["edits"] = stored.isEmpty ? nil : .object(stored)
         }
+        if let versions { fields["versions"] = versions ?? nil }
         if let rating { fields["rating"] = rating > 0 ? .number(Double(min(rating, 5))) : nil }
         if let flag { fields["flag"] = flag.map { .string($0.rawValue) } }
         variants[index!] = .object(fields)

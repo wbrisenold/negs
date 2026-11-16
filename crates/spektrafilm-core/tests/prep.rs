@@ -40,6 +40,7 @@ fn controls() -> PrepParams {
         color_boost: 15.,
         saturation: -12.,
         midtone_detail: 27.,
+        ..Default::default()
     }
 }
 fn compare(a: &ImageBuf, b: &ImageBuf, tolerance: f64) {

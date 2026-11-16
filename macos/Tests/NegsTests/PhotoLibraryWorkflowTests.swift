@@ -1,0 +1,133 @@
+import Foundation
+import Observation
+import XCTest
+@testable import NegsApp
+
+/// Persistent Media Pool behavior, isolated from the user's catalog.
+@MainActor final class PhotoLibraryWorkflowTests: XCTestCase {
+    private struct Catalog: Encodable {
+        var schema = 1
+        var folders: [LibraryFolder]
+        var photos: [LibraryPhoto]
+        var albums: [LibraryAlbum]
+        var smartCollections: [SmartLibraryCollection]
+        var projects: [LibraryProject]
+    }
+
+    @MainActor private struct Fixture {
+        var library: PhotoLibrary
+        var root: URL
+        var photos: [LibraryPhoto]
+        var folderID: UUID
+        var binID: UUID
+        var projectID: UUID
+
+        func clean() {
+            library.flushPersistence()
+            try? FileManager.default.removeItem(at: root)
+        }
+    }
+
+    private func fixture() async throws -> Fixture {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("negs-media-pool-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        // The source stays offline so loading exercises catalog preservation.
+        let source = root.appendingPathComponent("offline")
+        let folderID = UUID(), binID = UUID(), projectID = UUID()
+        var first = LibraryPhoto(file: PhotoFile(url: source.appendingPathComponent("a.png")), folderID: folderID)
+        first.flag = .picked
+        first.albumIDs = [binID]
+        var second = LibraryPhoto(file: PhotoFile(url: source.appendingPathComponent("b.png")), folderID: folderID)
+        second.flag = .picked
+        second.rating = 5
+        second.missing = true
+        second.albumIDs = [binID]
+        let records = [first, second]
+        let catalog = Catalog(folders: [LibraryFolder(id: folderID, path: source.path)], photos: records,
+                              albums: [LibraryAlbum(id: binID, name: "Review")],
+                              smartCollections: [SmartLibraryCollection(id: UUID(), name: "Picked", filter: .picked)],
+                              projects: [LibraryProject(id: projectID, name: "Client", photoPaths: Set(records.map { $0.file.url.path }))])
+        let store = root.appendingPathComponent("catalog.json")
+        try JSONEncoder().encode(catalog).write(to: store)
+        let library = PhotoLibrary(storeURL: store)
+        await library.load()
+        return Fixture(library: library, root: root, photos: records, folderID: folderID, binID: binID, projectID: projectID)
+    }
+
+    func testCacheHitsRetainObservationDependencies() async throws {
+        let fixture = try await fixture()
+        defer { fixture.clean() }
+        let library = fixture.library
+        library.selectedFolderID = fixture.folderID
+        library.selectedPhotoURL = fixture.photos[0].file.url
+        // Warm every cache, then register a fresh view read on the hit path.
+        _ = library.scopePhotos; _ = library.sidebarCounts
+        _ = library.selectedPhoto; _ = library.count(for: .fiveStar)
+        let scope = expectation(description: "cached scope observes changes")
+        let counts = expectation(description: "cached counts observe changes")
+        let selected = expectation(description: "cached inspector observes changes")
+        let filters = expectation(description: "cached filters observe changes")
+        withObservationTracking { _ = library.scopePhotos } onChange: { scope.fulfill() }
+        withObservationTracking { _ = library.sidebarCounts } onChange: { counts.fulfill() }
+        withObservationTracking { _ = library.selectedPhoto } onChange: { selected.fulfill() }
+        withObservationTracking { _ = library.count(for: .fiveStar) } onChange: { filters.fulfill() }
+        library.setRating(5, for: fixture.photos[0].file.url)
+        await fulfillment(of: [scope, counts, selected, filters], timeout: 1)
+        XCTAssertEqual(library.selectedPhoto?.rating, 5)
+    }
+
+    func testScopedFilterCountsMatchOfflinePhotoVisibility() async throws {
+        let fixture = try await fixture()
+        defer { fixture.clean() }
+        let library = fixture.library
+        library.selectedProjectID = fixture.projectID
+        for filter in LibraryFilter.allCases {
+            library.filter = filter
+            XCTAssertEqual(library.count(for: filter), library.visiblePhotos.count, "\(filter)")
+        }
+        library.selectedProjectID = nil
+        library.filter = .all
+        XCTAssertEqual(library.count(for: .all), 1)
+        XCTAssertEqual(library.sidebarCounts.smartCollections[LibraryFilter.picked.rawValue], 1)
+    }
+
+    func testCommandSelectionAndBinRemovalLeaveOriginalReferences() async throws {
+        let fixture = try await fixture()
+        defer { fixture.clean() }
+        let library = fixture.library
+        let order = fixture.photos.map(\.file.url)
+        library.selectGridPhoto(order[0], in: order)
+        library.selectGridPhoto(order[1], toggling: true, in: order)
+        XCTAssertEqual(library.gridSelection.selected, Set(order))
+        library.selectGridPhoto(order[0], toggling: true, in: order)
+        XCTAssertEqual(library.gridSelection.selected, [order[1]])
+        XCTAssertEqual(library.selectedPhotoURL, order[1])
+        library.removeFromBin([fixture.photos[1]], binID: fixture.binID)
+        XCTAssertEqual(library.photos.count, 2)
+        XCTAssertFalse(library.photos[1].albumIDs.contains(fixture.binID))
+        XCTAssertEqual(library.projects.first?.photoPaths.count, 2)
+        XCTAssertEqual(library.folders.count, 1)
+    }
+
+    func testAnEmptyScopeClearsInspectorAndSelection() async throws {
+        let fixture = try await fixture()
+        defer { fixture.clean() }
+        let library = fixture.library
+        let order = fixture.photos.map(\.file.url)
+        library.selectGridPhoto(order[0], in: order)
+        library.pruneGridSelection(to: [])
+        XCTAssertTrue(library.gridSelection.selected.isEmpty)
+        XCTAssertNil(library.selectedPhotoURL)
+    }
+
+    func testFailedFolderImportStillPersistsItsReference() async throws {
+        let fixture = try await fixture()
+        defer { fixture.clean() }
+        let library = fixture.library
+        await library.importFolders([fixture.root.appendingPathComponent("another-offline-folder")])
+        library.flushPersistence()
+        let object = try JSONSerialization.jsonObject(with: Data(contentsOf: fixture.root.appendingPathComponent("catalog.json"))) as? [String: Any]
+        XCTAssertEqual((object?["folders"] as? [[String: Any]])?.count, 2)
+        XCTAssertNotNil(library.error)
+    }
+}

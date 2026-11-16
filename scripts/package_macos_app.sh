@@ -94,6 +94,23 @@ fi
 
 rm -rf "$DIST_DIR"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources" "$APP_BUNDLE/Contents/Frameworks" "$RELEASE_DIR"
+# SwiftPM builds the Swift sources but does not compile Xcode asset catalogs.
+# Prefer Apple's compiler; use the pinned clean-room compiler for the single
+# named color catalog when building with Command Line Tools alone.
+if [[ -d macos/Assets.xcassets ]]; then
+    asset_compiler="$(xcrun --find actool 2>/dev/null || true)"
+    if [[ -n "$asset_compiler" ]]; then
+        "$asset_compiler" --compile "$APP_BUNDLE/Contents/Resources" --platform macosx \
+            --minimum-deployment-target "$MACOSX_DEPLOYMENT_TARGET" --accent-color AccentColor \
+            macos/Assets.xcassets
+    else
+        actool_target="$BUILD_TARGET_DIR/actool"
+        cargo build --locked --release --manifest-path vendor/actool/Cargo.toml --target-dir "$actool_target"
+        "$actool_target/release/actool" --compile "$APP_BUNDLE/Contents/Resources" --platform macosx \
+            --minimum-deployment-target "$MACOSX_DEPLOYMENT_TARGET" --accent-color AccentColor \
+            macos/Assets.xcassets
+    fi
+fi
 # Preserve framework symlinks, executable bits and Sparkle’s nested signatures.
 ditto "${swift_bin_dirs[0]}/Sparkle.framework" "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
 sparkle_bundle="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
@@ -119,7 +136,14 @@ cp "$binary_dir/spektrafilm-native" "$APP_BUNDLE/Contents/MacOS/spektrafilm-nati
 cp "$binary_dir/spektrafilm" "$APP_BUNDLE/Contents/MacOS/spektrafilm"
 cp "$binary_dir/spektrafilm-f64" "$APP_BUNDLE/Contents/MacOS/spektrafilm-f64"
 cp -R data "$APP_BUNDLE/Contents/Resources/data"
+# Newsreader, subset by scripts/subset_newsreader.sh, with its licence (OFL 1.1).
+mkdir -p "$APP_BUNDLE/Contents/Resources/Fonts"
+cp macos/Fonts/Newsreader-Negs.ttf macos/Fonts/Newsreader-Negs-Italic.ttf macos/Fonts/OFL-Newsreader.txt \
+    macos/Fonts/JetBrainsMono-Negs.ttf macos/Fonts/JetBrainsMono-Negs-Italic.ttf \
+    macos/Fonts/OFL-JetBrainsMono.txt "$APP_BUNDLE/Contents/Resources/Fonts/"
 cp LICENSE "$APP_BUNDLE/Contents/Resources/LICENSE.txt"
+mkdir -p "$APP_BUNDLE/Contents/Resources/ThirdPartyLicenses"
+cp macos/ThirdPartyLicenses/Hncs-MIT.txt "$APP_BUNDLE/Contents/Resources/ThirdPartyLicenses/"
 # Referent is free to download but carries no redistribution grant. Bundle a
 # copy only into a local package when the user has installed their LUT; never
 # add it to source archives or the public repository.

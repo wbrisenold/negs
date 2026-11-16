@@ -6,202 +6,256 @@ struct LibraryWorkspaceView: View {
     @Bindable private var library: PhotoLibrary
     @AppStorage("negs.library.thumbnailSize") private var thumbnailSize = 176.0
     @AppStorage("negs.library.showInspector") private var showInspector = false
-    @State private var showingAlbumSheet = false
-    @State private var showingSmartSheet = false
+    @State private var librarySearchInput: String
     @State private var showingProjectSheet = false
+    @State private var showingProjectRenameSheet = false
+    @State private var projectToRename: UUID?
+    @State private var showingCategorySheet = false
+    @State private var categoryToRename: UUID?
+    @State private var categoryToReset: UUID?
+    @State private var categoryError: String?
     @State private var showingProjectPhotoPicker = false
+    @State private var showingCategoryResetConfirmation = false
     @State private var showingFilterOptions = false
     @State private var showingTopPickOptions = false
-    @State private var albumName = ""
-    @State private var smartName = ""
     @State private var projectName = ""
-    @State private var smartFilter: LibraryFilter = .picked
+    @FocusState private var librarySearchFocused: Bool
     @FocusState private var libraryGridFocused: Bool
     private var cullFilters: Set<CullFilterChip> { library.cullFilters }
 
     private var selected: LibraryPhoto? { library.selectedPhoto }
     private var hasLocationScope: Bool { library.selectedFolderID != nil || library.selectedProjectID != nil }
-    private func displayedPhotos(from visiblePhotos: [LibraryPhoto]) -> [LibraryPhoto] {
-        library.filteredPhotos(from: visiblePhotos)
-    }
-    private var topPickLabel: String {
-        let analyzed = library.visiblePhotos.filter { $0.cull != nil && !($0.cull?.failed ?? true) }.count
-        let selected = library.topPickURLs(in: library.visiblePhotos).count
-        guard analyzed > 0 else { return "Top Picks · Not analyzed" }
-        let quota = library.topPickUnit == .percent ? " · \(library.topPickValue)%" : ""
-        return "Top \(selected) of \(analyzed)\(quota)"
+    private func displayedPhotos(from visiblePhotos: [LibraryPhoto], topPicks: Set<URL>? = nil) -> [LibraryPhoto] {
+        library.filteredPhotos(from: visiblePhotos, topPicks: topPicks)
     }
     private var addableCullFilters: [CullFilterChip] {
         CullFilterChip.allCases.filter { $0 != .topPicks }
     }
-    private func filterTitle(_ filter: CullFilterChip) -> String {
+    private func filterTitle(_ filter: CullFilterChip, topPickLabel: String) -> String {
         filter == .topPicks ? topPickLabel : filter.title
     }
 
     init(model: EditorModel) {
         self.model = model
         self._library = Bindable(wrappedValue: model.photoLibrary)
+        self._librarySearchInput = State(initialValue: model.photoLibrary.searchText)
     }
 
     var body: some View {
         let visiblePhotos = library.visiblePhotos
-        let topPickURLs: Set<URL> = visiblePhotos.contains(where: { $0.cull != nil })
-            ? library.topPickURLs(in: visiblePhotos) : []
+        let analyzedTopPicks = visiblePhotos.reduce(into: 0) { count, photo in
+            if photo.cull != nil && !(photo.cull?.failed ?? true) { count += 1 }
+        }
+        let topPickURLs = analyzedTopPicks > 0 ? library.topPickURLs(in: visiblePhotos) : []
+        let topPickQuota = library.topPickUnit == .percent ? " · \(library.topPickValue)%" : ""
+        let topPickLabel = analyzedTopPicks == 0
+            ? "Top Picks · Not analyzed"
+            : "Top \(topPickURLs.count) of \(analyzedTopPicks)\(topPickQuota)"
         return HSplitView {
             sidebar.frame(minWidth: 172, idealWidth: 196, maxWidth: 228)
                 .padding(StudioStyle.Space.paneInset)
-                .studioWorkspacePane(surface: StudioStyle.sidebar)
-            content(visiblePhotos: visiblePhotos, topPickURLs: topPickURLs)
+                .background(Theme.film)
+            content(visiblePhotos: visiblePhotos, topPickURLs: topPickURLs, topPickLabel: topPickLabel)
                 .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.vertical, StudioStyle.Space.paneInset)
             if showInspector {
                 inspector(topPickURLs: topPickURLs)
                     .frame(minWidth: 270, idealWidth: 310, maxWidth: 350)
                     .padding(StudioStyle.Space.paneInset)
-                    .studioWorkspacePane(surface: StudioStyle.sidebar)
+                    .background(Theme.panel)
             }
         }
-        .background(StudioStyle.window)
+        .background(Theme.film)
         .preferredColorScheme(.dark)
+        .buttonStyle(OutlinedButtonStyle())
         .task { await library.load() }
-        .sheet(isPresented: $showingAlbumSheet) { albumSheet }
-        .sheet(isPresented: $showingSmartSheet) { smartCollectionSheet }
+        .onChange(of: model.librarySearchFocusRequest) { _, _ in focusLibrarySearch() }
+        .onAppear {
+            if model.librarySearchFocusRequest > 0 { focusLibrarySearch() }
+        }
         .sheet(isPresented: $showingProjectSheet) { projectSheet }
+        .sheet(isPresented: $showingProjectRenameSheet) { projectRenameSheet }
+        .sheet(isPresented: $showingCategorySheet) { categorySheet }
         .sheet(isPresented: $showingProjectPhotoPicker) {
             if let projectID = library.selectedProjectID {
                 ProjectPhotoPicker(library: library, projectID: projectID, addSourceFolder: importFolders)
             }
         }
+        .confirmationDialog("Reset all edits in this group?", isPresented: $showingCategoryResetConfirmation,
+                            titleVisibility: .visible) {
+            Button("Reset Group Edits", role: .destructive) {
+                guard let id = categoryToReset else { return }
+                model.resetEdits(of: library.photos.filter { $0.albumIDs.contains(id) && !$0.missing }.map { $0.file.url })
+                categoryToReset = nil
+            }
+            Button("Cancel", role: .cancel) { categoryToReset = nil }
+        } message: {
+            Text("Online photos in this group will return to their default edits. Offline photos are left unchanged until they’re available. Original files are kept.")
+        }
     }
 
     private var sidebar: some View {
-        ScrollView {
+        return ScrollView {
             VStack(alignment: .leading, spacing: StudioStyle.Space.section) {
-                sidebarSection("LIBRARY") {
-                    ForEach(LibraryFilter.allCases.filter { $0 != .missing || hasLocationScope }) { filter in
-                        NavigationRow(title: filter.title, symbol: filter.symbol,
-                                      count: library.count(for: filter), selected: library.selectedAlbumID == nil
-                                        && library.selectedFolderID == nil && library.selectedSmartCollectionID == nil
-                                        && library.selectedProjectID == nil
-                                        && library.filter == filter) {
-                            library.filter = filter
-                            if filter != .missing {
-                                library.selectedFolderID = nil
-                                library.selectedAlbumID = nil
-                                library.selectedSmartCollectionID = nil
-                                library.selectedProjectID = nil
-                            }
-                        }
-                    }
-                }
-                sidebarSection("PROJECTS", actionTitle: "New Project…", action: {
+                sidebarSection("PROJECTS", subtitle: "Each project keeps its photos and groups together.", actionTitle: "New Project…", action: {
                     projectName = ""
                     showingProjectSheet = true
                 }) {
-                    ForEach(library.projects) { project in
-                        NavigationRow(title: project.name, symbol: "briefcase",
-                                      count: library.count(for: project), selected: library.selectedProjectID == project.id) {
-                            library.selectedProjectID = project.id
-                            library.selectedFolderID = nil
-                            library.selectedAlbumID = nil
-                            library.selectedSmartCollectionID = nil
-                            library.filter = .all
-                        }
-                        .help("Curated photo set. Add selected images from any source folder.")
-                        .contextMenu {
-                            Button("Delete Project", systemImage: "trash", role: .destructive) {
-                                library.deleteProject(project.id)
-                            }
-                        }
-                    }
-                }
-                if library.selectedProjectID == nil {
-                sidebarSection("SOURCE FOLDERS", actionTitle: "Add Folder…", action: importFolders) {
-                    ForEach(library.folders) { folder in
-                        HStack(spacing: 2) {
-                            NavigationRow(title: folder.name, symbol: "folder", count: library.photos.filter { $0.folderID == folder.id }.count,
-                                          selected: library.selectedFolderID == folder.id) {
-                                library.filter = .all
-                                library.selectedFolderID = folder.id
+                    if library.projects.isEmpty {
+                        Text("No projects yet. Create one for a client or job.")
+                            .font(Theme.ui(10)).foregroundStyle(Theme.dim)
+                            .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 7)
+                    } else {
+                        ForEach(library.projects) { project in
+                            NavigationRow(title: project.name, symbol: "briefcase",
+                                          count: library.count(for: project), selected: library.selectedProjectID == project.id) {
+                                library.selectedProjectID = project.id
+                                library.selectedFolderID = nil
                                 library.selectedAlbumID = nil
                                 library.selectedSmartCollectionID = nil
-                                library.selectedProjectID = nil
+                                library.filter = .all
                             }
-                            .help("Source folder on disk. Photos stay organized at this location.")
+                            .help("Open this project and its groups. Original files stay in place.")
                             .contextMenu {
-                                Button("Refresh Folder", systemImage: "arrow.clockwise") { Task { await library.refresh() } }
-                                Button("Remove from Library", systemImage: "minus.circle", role: .destructive) { library.removeFolder(folder.id) }
+                                Button("Rename Project…", systemImage: "pencil") {
+                                    projectToRename = project.id
+                                    projectName = project.name
+                                    showingProjectRenameSheet = true
+                                }
+                                Button("Export Project…", systemImage: "square.and.arrow.up") {
+                                    exportProjectPanel(project.id)
+                                }
+                                Divider()
+                                Button("Delete Project", systemImage: "trash", role: .destructive) {
+                                    library.deleteProject(project.id)
+                                }
                             }
                         }
                     }
                 }
-                }
-                sidebarSection("ALBUMS") {
-                    ForEach(library.albums) { album in
-                        NavigationRow(title: album.name, symbol: "rectangle.stack", count: library.photos.filter { $0.albumIDs.contains(album.id) }.count,
-                                      selected: library.selectedAlbumID == album.id) {
-                            library.filter = .all
-                            library.selectedAlbumID = album.id
-                            library.selectedFolderID = nil
-                            library.selectedSmartCollectionID = nil
-                            library.selectedProjectID = nil
-                        }
-                        .contextMenu {
-                                Button(role: .destructive) { library.deleteAlbum(album.id) } label: {
-                                    Label("Delete Album", systemImage: "trash")
-                                }
-                        }
-                    }
-                    Button { albumName = ""; showingAlbumSheet = true } label: {
-                        Label("New Album…", systemImage: "plus")
-                            .font(.callout).frame(maxWidth: .infinity, alignment: .leading)
-                    }.buttonStyle(.plain).foregroundStyle(.tint)
-                }
-                sidebarSection("SMART COLLECTIONS") {
-                    ForEach(library.smartCollections) { collection in
-                        NavigationRow(title: collection.name, symbol: collection.filter.symbol,
-                                      count: library.photos.filter { $0.matches(collection.filter) }.count,
-                                      selected: library.selectedSmartCollectionID == collection.id) {
-                            library.selectedSmartCollectionID = collection.id
+                if let project = library.projects.first(where: { $0.id == library.selectedProjectID }) {
+                    sidebarSection("REVIEW") {
+                        NavigationRow(title: "All Photos", symbol: "square.grid.2x2",
+                                      count: library.count(for: project),
+                                      selected: library.selectedFolderID == nil && library.selectedAlbumID == nil
+                                        && library.selectedSmartCollectionID == nil && library.filter == .all) {
                             library.selectedFolderID = nil
                             library.selectedAlbumID = nil
-                            library.selectedProjectID = nil
+                            library.selectedSmartCollectionID = nil
+                            library.filter = .all
                         }
-                        .contextMenu {
-                            Button(role: .destructive) { library.deleteSmartCollection(collection.id) } label: {
-                                Label("Delete Smart Collection", systemImage: "trash")
+                        ForEach(LibraryFilter.allCases.filter { $0 != .all && ($0 != .missing || hasLocationScope) }) { filter in
+                            NavigationRow(title: filter.title, symbol: filter.symbol, count: library.count(for: filter),
+                                          selected: library.selectedFolderID == nil && library.selectedAlbumID == nil
+                                            && library.selectedSmartCollectionID == nil && library.filter == filter) {
+                                library.selectedFolderID = nil
+                                library.selectedAlbumID = nil
+                                library.selectedSmartCollectionID = nil
+                                library.filter = filter
                             }
                         }
                     }
-                    Button { smartName = ""; showingSmartSheet = true } label: {
-                        Label("Save Smart Collection…", systemImage: "plus")
-                            .font(.callout).frame(maxWidth: .infinity, alignment: .leading)
-                    }.buttonStyle(.plain).foregroundStyle(.tint)
+                    sidebarSection("GROUPS", subtitle: "Collect related photos for a job or client.", actionTitle: "New Group…", action: {
+                        categoryToRename = nil
+                        projectName = ""
+                        categoryError = nil
+                        showingCategorySheet = true
+                    }) {
+                        ForEach(library.categories(for: project.id)) { category in
+                            NavigationRow(title: category.name, symbol: "square.grid.2x2",
+                                          count: library.count(for: category), selected: library.selectedAlbumID == category.id) {
+                                library.selectedFolderID = nil
+                                library.selectedAlbumID = category.id
+                                library.selectedSmartCollectionID = nil
+                                library.filter = .all
+                            }
+                            .contextMenu { categoryActions(category) }
+                        }
+                        if library.categories(for: project.id).isEmpty {
+                            Text("No groups yet. Create one to collect related photos.")
+                                .font(Theme.ui(10)).foregroundStyle(Theme.dim)
+                                .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 7)
+                        }
+                    }
+                } else {
+                    ContentUnavailableView("Create a Project", systemImage: "briefcase",
+                                           description: Text("Projects contain All Photos and their own groups."))
+                        .font(Theme.ui(10)).frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             .padding(.horizontal, 10).padding(.vertical, 14)
         }
-        .background(StudioStyle.sidebar)
+        .background(Theme.bg)
     }
 
-    private func content(visiblePhotos: [LibraryPhoto], topPickURLs: Set<URL>) -> some View {
-        let displayedPhotos = displayedPhotos(from: visiblePhotos)
+    private func content(visiblePhotos: [LibraryPhoto], topPickURLs: Set<URL>, topPickLabel: String) -> some View {
+        let displayedPhotos = displayedPhotos(from: visiblePhotos, topPicks: topPickURLs)
         let editablePhotos = displayedPhotos.filter { !$0.missing }
+        let selectedURLs = library.gridSelection.selected.union(library.selectedPhotoURL.map { Set([$0]) } ?? [])
+        let selectedPhotos = displayedPhotos.filter { selectedURLs.contains($0.file.url) }
+        let selectedReady = editablePhotos.filter { selectedURLs.contains($0.file.url) }
+        // An explicit selection containing only offline files must not fall
+        // through to editing every available photo in the view.
+        let editTargets = selectedURLs.isEmpty ? editablePhotos : selectedReady
+        let unqueuedSelectionCount = selectedReady.filter { !$0.selectedForExport }.count
         let offlineCount = displayedPhotos.count - editablePhotos.count
         let projectIsEmpty = library.selectedProjectID.flatMap { id in library.projects.first { $0.id == id } }
-            .map { $0.photoPaths.isEmpty } ?? false
+            .map { $0.folderIDs.isEmpty && $0.photoPaths.isEmpty } ?? true
         return VStack(spacing: 0) {
             HStack(spacing: StudioStyle.Space.compact) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(currentScopeLabel).font(.system(size: 10, weight: .semibold)).tracking(1.0).foregroundStyle(.secondary)
+                    Text(currentScopeLabel).font(Theme.ui(10, weight: .semibold)).tracking(1.0).foregroundStyle(Theme.dim)
                     HStack(spacing: 7) {
-                        Text(currentTitle).font(.system(size: 20, weight: .semibold)).lineLimit(1)
-                        Text("\(displayedPhotos.count) photos").font(.system(size: 11, weight: .medium, design: .rounded).monospacedDigit()).foregroundStyle(.secondary)
+                        Text(currentTitle).font(Theme.ui(18, weight: .semibold)).foregroundStyle(Theme.paper)
+                            .lineLimit(1).truncationMode(.tail)
+                        Text("\(displayedPhotos.count) photos").font(Theme.metadata(10.5)).foregroundStyle(Theme.dim)
+                            .lineLimit(1).fixedSize(horizontal: true, vertical: false)
+                            .help(library.selectedProjectID != nil
+                                  ? "Project membership and library changes are saved automatically on this Mac."
+                                  : "Photographs in the current Library view.")
+                        if library.analyzingCull {
+                            Text("Analyzing \(library.cullProgress) / \(library.cullTotal)")
+                                .font(Theme.ui(10)).foregroundStyle(Theme.dim)
+                        }
+                        if library.refreshing {
+                            ProgressView().controlSize(.small)
+                            Text("Scanning \(library.refreshProgress) / \(library.refreshTotal) sources")
+                                .font(Theme.ui(10)).foregroundStyle(Theme.dim).monospacedDigit()
+                                .help("Folder scans run in the background; the Library remains available while they finish.")
+                        }
                     }
                 }
-                Spacer(minLength: 18)
-                TextField("Search Library", text: $library.searchText)
-                    .textFieldStyle(.roundedBorder).controlSize(.small).frame(width: 170)
+                Spacer(minLength: 8)
+                if !library.photos.isEmpty {
+                TextField("Search Library", text: $librarySearchInput)
+                    .textFieldStyle(.roundedBorder).controlSize(.small).frame(width: 145)
+                    .focused($librarySearchFocused)
+                    .onSubmit { library.searchText = librarySearchInput }
+                    .task(id: librarySearchInput) {
+                        guard librarySearchInput != library.searchText else { return }
+                        try? await Task.sleep(nanoseconds: 180_000_000)
+                        guard !Task.isCancelled else { return }
+                        library.searchText = librarySearchInput
+                    }
+                    .overlay(alignment: .trailing) {
+                        if !librarySearchInput.isEmpty {
+                            Button {
+                                librarySearchInput = ""
+                                library.searchText = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Clear library search")
+                            .padding(.trailing, 6)
+                        }
+                    }
+                    .onChange(of: library.searchText) { _, value in
+                        if librarySearchInput != value { librarySearchInput = value }
+                    }
+                }
+                if !library.photos.isEmpty {
                 Menu {
                     ForEach(LibrarySort.allCases) { sort in
                         Button {
@@ -217,105 +271,111 @@ struct LibraryWorkspaceView: View {
                 }
                 .menuStyle(.borderlessButton).fixedSize().controlSize(.small)
                 .help("Sort photos")
+                }
                 Menu {
-                    Button("Add Source Folder…", systemImage: "folder.badge.plus", action: importFolders)
-                    Button("Refresh Folders", systemImage: "arrow.clockwise") { Task { await library.refresh() } }
-                    Divider()
-                    Button("Import Project…", systemImage: "square.and.arrow.down", action: openProjectPanel)
+                    Button("Open Project…", systemImage: "folder", action: openProjectPanel)
                     if let projectID = library.selectedProjectID {
-                        Button("Export Project…", systemImage: "square.and.arrow.up") {
+                        Button("Save Project…", systemImage: "square.and.arrow.down") {
                             exportProjectPanel(projectID)
                         }
                     }
                     Divider()
+                    Button(library.analyzingCull ? "Analyzing…" : library.photos.contains(where: { $0.cull != nil }) ? "Re-analyze with AI" : "Analyze with AI") {
+                        Task { await library.analyzeCull(replacingExisting: library.photos.allSatisfy { $0.cull != nil }) }
+                    }
+                    .disabled(library.analyzingCull || !library.photos.contains(where: { !$0.missing }))
+                    Divider()
+                    Button(library.refreshing ? "Refreshing…" : "Refresh Project Sources", systemImage: "arrow.clockwise") {
+                        Task { await library.refresh() }
+                    }
+                    .disabled(library.refreshing)
+                    Divider()
                     Slider(value: $thumbnailSize, in: 120...256) { Text("Thumbnail Size") }
                 } label: {
-                    Label("More", systemImage: "ellipsis.circle")
+                    Label("Actions", systemImage: "ellipsis.circle")
                 }
                 .menuStyle(.borderlessButton).fixedSize().controlSize(.small)
-                .help("Library actions and thumbnail size")
+                .help("Project, analysis and display actions")
                 Button { showInspector.toggle() } label: {
-                    Label("Details", systemImage: "sidebar.right")
-                        .foregroundStyle(showInspector ? Color.accentColor : Color.secondary)
+                    Text(showInspector ? "Hide Details" : "Details")
+                        .foregroundStyle(showInspector ? Theme.paper : Theme.dim)
                 }
-                .buttonStyle(.bordered).controlSize(.small)
+                .buttonStyle(OutlinedButtonStyle())
                 .help(showInspector ? "Hide photo details" : "Show photo details")
                 Spacer(minLength: 4)
             }
             .controlSize(.small)
             .padding(.horizontal, StudioStyle.Space.section).padding(.vertical, 11)
             Divider()
+            if let error = library.error {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.warn)
+                    Text(error).font(Theme.ui(11)).foregroundStyle(Theme.label)
+                        .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+                    Button("Retry") { Task { await library.refresh() } }
+                        .buttonStyle(OutlinedButtonStyle()).disabled(library.refreshing)
+                }
+                .padding(.horizontal, StudioStyle.Space.section).padding(.vertical, 7)
+                .background(Theme.warn.opacity(0.08))
+                Divider()
+            }
             HStack(spacing: 8) {
+                if !library.photos.isEmpty {
                 ScrollView(.horizontal) {
                     HStack(spacing: 8) {
-                Button {
-                    Task { await library.analyzeCull(replacingExisting: library.photos.allSatisfy { $0.cull != nil }) }
-                } label: {
-                    if library.analyzingCull { ProgressView().controlSize(.small) }
-                    else { Label(library.photos.contains(where: { $0.cull != nil }) ? "Re-analyze" : "AI Cull", systemImage: "sparkles") }
-                }
-                .buttonStyle(.borderedProminent).controlSize(.small)
-                .disabled(library.analyzingCull || !library.photos.contains(where: { !$0.missing }))
-                .help(library.analyzingCull ? "Analyzing photo \(library.cullProgress) of \(library.cullTotal)" : "Analyze photos locally with Apple Vision")
-                if library.analyzingCull {
-                    ProgressView(value: Double(library.cullProgress), total: Double(max(library.cullTotal, 1)))
-                        .frame(width: 64).help("AI culling progress")
-                }
-                if !cullFilters.isEmpty { Rectangle().fill(StudioStyle.outline).frame(width: 1, height: 20).padding(.horizontal, 2) }
                 Button { showingFilterOptions = true } label: {
-                    Label("Filters", systemImage: "line.3.horizontal.decrease.circle")
+                    Text("Filters")
                 }
-                .buttonStyle(.bordered).controlSize(.small).fixedSize()
+                .buttonStyle(OutlinedButtonStyle()).fixedSize()
                 .disabled(cullFilters.count >= addableCullFilters.count)
                 .popover(isPresented: $showingFilterOptions, arrowEdge: .bottom) {
                     VStack(alignment: .leading, spacing: StudioStyle.Space.tight) {
                         Text("FILTER PHOTOS")
-                            .font(.caption2.weight(.semibold)).tracking(0.5).foregroundStyle(.secondary)
+                            .font(Theme.ui(10, weight: .semibold)).tracking(0.5).foregroundStyle(Theme.dim)
                             .padding(.horizontal, 8).padding(.bottom, 2)
                         Text("All selected filters must match.")
-                            .font(.caption2).foregroundStyle(.tertiary).padding(.horizontal, 8)
+                            .font(Theme.text(13, italic: true)).foregroundStyle(Theme.dim).padding(.horizontal, 8)
                         ForEach(addableCullFilters.filter { !cullFilters.contains($0) }, id: \.self) { filter in
                             Button {
                                 library.cullFilters.insert(filter)
                                 showingFilterOptions = false
                             } label: {
-                                Label(filterTitle(filter), systemImage: filter.symbol)
+                                Label(filterTitle(filter, topPickLabel: topPickLabel), systemImage: filter.symbol)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
-                            .buttonStyle(.plain).padding(.horizontal, 8).padding(.vertical, 6)
+                            .buttonStyle(WordActionStyle()).padding(.horizontal, 8).padding(.vertical, 6)
                         }
                         if !cullFilters.isEmpty {
                             Divider().padding(.vertical, 3)
-                            Button("Clear Filters", systemImage: "xmark.circle") {
+                            Button("Clear Filters") {
                                 library.cullFilters.removeAll()
                                 showingFilterOptions = false
                             }
-                            .buttonStyle(.plain).padding(.horizontal, 8).padding(.vertical, 6)
+                            .buttonStyle(WordActionStyle()).padding(.horizontal, 8).padding(.vertical, 6)
                         }
                     }
                     .padding(10).frame(width: 210)
                 }
                 ForEach(CullFilterChip.allCases.filter { cullFilters.contains($0) }, id: \.self) { filter in
                     HStack(spacing: 4) {
-                        Text(filterTitle(filter))
+                        Text(filterTitle(filter, topPickLabel: topPickLabel))
                         Button { library.cullFilters.remove(filter) } label: {
                             Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                        }.buttonStyle(.plain).help("Remove \(filterTitle(filter)) filter")
+                        }.buttonStyle(WordActionStyle()).help("Remove \(filterTitle(filter, topPickLabel: topPickLabel)) filter")
                     }
-                    .font(.caption2.weight(.semibold)).padding(.horizontal, 7).padding(.vertical, 4)
-                    .background(StudioStyle.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 4))
-                    .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(StudioStyle.accent.opacity(0.19), lineWidth: 0.7))
+                    .font(Theme.ui(10, weight: .medium)).padding(.horizontal, 7).padding(.vertical, 4)
+                    .background(Theme.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 3))
+                    .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(Theme.accent.opacity(0.32), lineWidth: 0.7))
                 }
                 Button {
                     showingTopPickOptions = true
                 } label: {
-                    Label(cullFilters.contains(.topPicks) ? "Showing \(topPickLabel)" : topPickLabel,
-                          systemImage: cullFilters.contains(.topPicks) ? "rosette" : "slider.horizontal.3")
+                    Text(cullFilters.contains(.topPicks) ? "Top Picks · On" : "Top Picks…")
                 }
-                .buttonStyle(.bordered).controlSize(.small)
+                .buttonStyle(OutlinedButtonStyle())
                 .popover(isPresented: $showingTopPickOptions, arrowEdge: .bottom) {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("TOP PICKS").font(.caption.weight(.semibold)).tracking(0.5)
+                        Text("TOP PICKS").font(Theme.ui(10, weight: .semibold)).tracking(0.5).foregroundStyle(Theme.dim)
                         Picker("Choose by", selection: $library.topPickUnit) {
                             Text("Photos").tag(TopPickUnit.images)
                             Text("Percent").tag(TopPickUnit.percent)
@@ -350,78 +410,123 @@ struct LibraryWorkspaceView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         Divider()
-                        Text("Ranks analyzed photos in the current Library view, then keeps this number or percentage. Folder, project, search and category scope all apply.")
+                        Text("Ranks analyzed photos in the current Library view, then keeps this number or percentage. Project, search and group scope all apply.")
                             .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
                         Button {
                             if cullFilters.contains(.topPicks) { library.cullFilters.remove(.topPicks) }
                             else { library.cullFilters.insert(.topPicks) }
                             showingTopPickOptions = false
                         } label: {
-                            Label(cullFilters.contains(.topPicks) ? "Hide Top Picks" : "Show Top Picks",
-                                  systemImage: cullFilters.contains(.topPicks) ? "eye.slash" : "rosette")
-                                .frame(maxWidth: .infinity)
+                            Text(cullFilters.contains(.topPicks) ? "Hide Top Picks" : "Show Top Picks")
                         }
-                        .buttonStyle(.borderedProminent).controlSize(.small)
+                        .buttonStyle(OutlinedButtonStyle(prominent: true))
                     }
                     .padding(14).frame(width: 320)
-                }
-                if library.analyzingCull {
-                    Text("Analyzing \(library.cullProgress) / \(library.cullTotal)")
-                        .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
                 }
                     }
                 }
                 .scrollIndicators(.hidden)
+                }
                 Spacer(minLength: 4)
                 if offlineCount > 0 {
                     Text("\(editablePhotos.count) ready · \(offlineCount) offline")
                         .font(.caption).foregroundStyle(.secondary).monospacedDigit().lineLimit(1)
                 }
-                Button {
-                    editFiltered(editablePhotos)
-                } label: {
-                    Label("Edit \(editablePhotos.count)", systemImage: "slider.horizontal.3")
+                if library.gridSelection.selected.count > 1 {
+                    Text("\(library.gridSelection.selected.count) selected")
+                        .font(Theme.ui(10, weight: .medium)).foregroundStyle(Theme.dim).monospacedDigit()
+                        .help("Bulk selection for the visible Library grid")
+                    Button("Clear Selection") { library.gridSelection.deselectAll() }
+                        .buttonStyle(OutlinedButtonStyle()).help("Keep the current photo selected")
                 }
-                .buttonStyle(.borderedProminent).controlSize(.small)
-                .disabled(editablePhotos.isEmpty)
-                Button {
-                    exportFiltered(editablePhotos)
-                } label: {
-                    Label("Export \(editablePhotos.count)", systemImage: "square.and.arrow.up")
-                }
-                .buttonStyle(.bordered).controlSize(.small)
-                .disabled(editablePhotos.isEmpty)
-                if library.selectedProjectID != nil {
-                    Button("Add Photos…", systemImage: "plus", action: { showingProjectPhotoPicker = true })
-                        .buttonStyle(.bordered).controlSize(.small)
-                    if let projectID = library.selectedProjectID {
-                        Button("Remove from Project", systemImage: "minus.circle") {
-                            library.remove(editablePhotos, from: projectID)
+                if !selectedPhotos.isEmpty {
+                    Menu {
+                        Button("Pick Selected", systemImage: "flag.fill") {
+                            library.setFlag(.picked, for: selectedPhotos.map(\.file.url))
                         }
-                        .buttonStyle(.borderless).controlSize(.small)
-                        .disabled(editablePhotos.isEmpty)
+                        Button("Reject Selected", systemImage: "xmark.circle") {
+                            library.setFlag(.rejected, for: selectedPhotos.map(\.file.url))
+                        }
+                        Button("Clear Flags", systemImage: "flag.slash") {
+                            library.setFlag(.none, for: selectedPhotos.map(\.file.url))
+                        }
+                    } label: {
+                        Label("Mark \(selectedPhotos.count)", systemImage: "checkmark.circle")
                     }
-                } else if !library.projects.isEmpty {
+                    .menuStyle(.borderlessButton).fixedSize().controlSize(.small)
+                    .help("Pick, reject, or clear flags for all selected photos")
+                    if let projectID = library.selectedProjectID {
+                        let groups = library.categories(for: projectID)
+                        if !groups.isEmpty {
+                            Menu {
+                                ForEach(groups) { group in
+                                    Menu(group.name) {
+                                        Button("Add Selected Photos to Group", systemImage: "plus.circle") {
+                                            library.addToBin(selectedPhotos, binID: group.id)
+                                        }
+                                        Button("Remove Selected Photos from Group", systemImage: "minus.circle") {
+                                            library.removeFromBin(selectedPhotos, binID: group.id)
+                                        }
+                                    }
+                                }
+                            } label: {
+                                Label("Groups", systemImage: "square.grid.2x2")
+                            }
+                            .menuStyle(.borderlessButton).fixedSize().controlSize(.small)
+                            .help("Add or remove the selected photos from a project group")
+                        }
+                    }
+                }
+                if !editTargets.isEmpty {
+                    Button {
+                        editFiltered(editTargets)
+                    } label: {
+                        Text(selectedURLs.isEmpty ? "Edit All \(editTargets.count)" : "Edit Selected \(editTargets.count)")
+                    }
+                    .buttonStyle(OutlinedButtonStyle(prominent: true))
+                    if !selectedReady.isEmpty {
+                        Button {
+                            library.setExportQueued(true, for: selectedReady.map(\.file.url))
+                        } label: {
+                            Text(unqueuedSelectionCount == 0 ? "Queued \(selectedReady.count)" : "Queue \(unqueuedSelectionCount)")
+                        }
+                        .buttonStyle(OutlinedButtonStyle())
+                        .disabled(unqueuedSelectionCount == 0)
+                        .help("Add the selected photos to the Export Queue")
+                    }
+                }
+                if library.selectedProjectID != nil {
+                    Button("Add Photos…", action: { showingProjectPhotoPicker = true })
+                        .buttonStyle(OutlinedButtonStyle())
+                    if let projectID = library.selectedProjectID {
+                        if !selectedPhotos.isEmpty {
+                            Button("Remove Selected from Project") {
+                                library.remove(selectedPhotos, from: projectID)
+                            }
+                            .buttonStyle(OutlinedButtonStyle())
+                            .help("Remove only the selected photographs from this project.")
+                        }
+                    }
+                } else if !selectedReady.isEmpty && !library.projects.isEmpty {
                     Menu {
                         ForEach(library.projects.filter { $0.id != library.selectedProjectID }) { project in
-                            Button(project.name, systemImage: "briefcase") {
-                                library.add(editablePhotos, to: project.id)
+                            Button(project.name) {
+                                library.add(selectedReady, to: project.id)
                             }
                         }
                     } label: {
-                        Label("Add to Project", systemImage: "briefcase")
+                        Text("Add Selected to Project")
                     }
                     .menuStyle(.borderlessButton).fixedSize().controlSize(.small)
-                    .help("Add the filtered photos to a project")
-                    .disabled(editablePhotos.isEmpty)
+                    .help("Add only the selected photographs to a project.")
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, StudioStyle.Space.section).padding(.vertical, StudioStyle.Space.compact)
             Divider()
             if offlineCount > 0 {
-                Label("\(offlineCount) photos in this view are offline. Check the source folder and refresh.", systemImage: "externaldrive.badge.exclamationmark")
-                    .font(.callout).foregroundStyle(.orange).padding(10)
+                Text("\(offlineCount) photographs are offline. Check the source location and refresh.")
+                    .font(Theme.text(15, italic: true)).foregroundStyle(Theme.warn).padding(10)
             }
             if !library.loaded || library.refreshing && library.photos.isEmpty {
                 ProgressView("Loading Library…").frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -429,16 +534,42 @@ struct LibraryWorkspaceView: View {
                 VStack(spacing: 12) {
                     if projectIsEmpty {
                         ContentUnavailableView("Project Ready", systemImage: "briefcase",
-                                               description: Text("Add photographs from your imported source folders. The project keeps a curated set; originals stay where they are."))
-                        Button("Add Photos…", systemImage: "plus", action: { showingProjectPhotoPicker = true })
-                            .buttonStyle(.borderedProminent)
+                                               description: Text("Add photos to this project. Originals stay where they are."))
+                        Button("Add Photos…", systemImage: "photo.badge.plus", action: importFolders)
+                            .buttonStyle(OutlinedButtonStyle(prominent: true))
+                        Button("Select Photos…", action: { showingProjectPhotoPicker = true })
+                            .buttonStyle(OutlinedButtonStyle())
+                    } else if !library.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        ContentUnavailableView("No Photos Match", systemImage: "magnifyingglass",
+                                               description: Text("Try another name or clear the search to see the photographs in this view."))
+                        Button("Clear Search", systemImage: "xmark.circle") {
+                            librarySearchInput = ""
+                            library.searchText = ""
+                        }
+                        .buttonStyle(OutlinedButtonStyle(prominent: true))
+                    } else if !visiblePhotos.isEmpty || library.filter != .all || !library.cullFilters.isEmpty {
+                        ContentUnavailableView("Filters Hide Every Photo", systemImage: "line.3.horizontal.decrease.circle",
+                                               description: Text("Clear the active Library and culling filters to show this view’s photographs."))
+                        Button("Clear Filters", systemImage: "xmark.circle") {
+                            library.filter = .all
+                            library.selectedSmartCollectionID = nil
+                            library.cullFilters.removeAll()
+                        }
+                        .buttonStyle(OutlinedButtonStyle(prominent: true))
                     } else {
-                        ContentUnavailableView("No Photos Match", systemImage: "photo.on.rectangle.angled",
-                                               description: Text(library.folders.isEmpty
-                                                ? "Add a source folder to index photographs in place. Negs leaves the originals on disk."
-                                                : "Adjust the active filters or choose another Library, project, or source folder."))
-                        if library.folders.isEmpty {
-                            Button("Add Source Folder…", action: importFolders).buttonStyle(.borderedProminent)
+                        ContentUnavailableView(projectIsEmpty ? "Set Up Your Project" : "No Photos Available",
+                                               systemImage: projectIsEmpty ? "photo.badge.plus" : "photo.on.rectangle.angled",
+                                               description: Text(projectIsEmpty
+                                                ? "Add photos to this project. Your originals stay where they are."
+                                                : "No photographs are currently available. Refresh this project’s sources to check for changes."))
+                        if projectIsEmpty {
+                            Button("Add Photos…", systemImage: "photo.badge.plus", action: importFolders)
+                                .buttonStyle(OutlinedButtonStyle(prominent: true))
+                        } else {
+                            Button("Refresh Project Photos", systemImage: "arrow.clockwise") {
+                                Task { await library.refresh() }
+                            }
+                            .buttonStyle(OutlinedButtonStyle(prominent: true))
                         }
                     }
                 }
@@ -464,17 +595,26 @@ struct LibraryWorkspaceView: View {
                 }
             }
         }
-        .background(StudioStyle.window)
+        .onAppear { library.pruneGridSelection(to: displayedPhotos.map(\.file.url)) }
+        .onChange(of: displayedPhotos.map(\.file.url)) { _, urls in library.pruneGridSelection(to: urls) }
+        .background(Theme.bg)
+    }
+
+    private func focusLibrarySearch() {
+        Task { @MainActor in
+            await Task.yield()
+            librarySearchFocused = true
+        }
     }
 
     private func inspector(topPickURLs: Set<URL>) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: StudioStyle.Space.standard) {
-                Text("Selected Photo").font(.headline)
+                    Text("Photo Details").font(Theme.ui(17, weight: .semibold)).foregroundStyle(Theme.paper)
                 if let photo = selected {
                     LibraryPreview(file: photo.file, size: 205)
-                    Text(photo.file.name).font(.headline).textSelection(.enabled).lineLimit(3)
-                    metadataRow("Folder", library.folders.first { $0.id == photo.folderID }?.name ?? "Unavailable")
+                    Text(photo.file.name).font(Theme.text(16, weight: 600)).foregroundStyle(Theme.paper).textSelection(.enabled).lineLimit(3)
+                    metadataRow("Source", library.folders.first { $0.id == photo.folderID }?.name ?? "Unavailable")
                     metadataRow("Format", photo.file.url.pathExtension.uppercased())
                     metadataRow("File Size", photo.file.size.map(formatBytes) ?? "—")
                     metadataRow("Modified", photo.file.modified?.formatted(date: .abbreviated, time: .shortened) ?? "—")
@@ -482,149 +622,88 @@ struct LibraryWorkspaceView: View {
                         Label("Original is offline", systemImage: "externaldrive.badge.exclamationmark").foregroundStyle(.orange)
                     }
                     Divider()
-                    Text("Rating").font(.subheadline.weight(.semibold))
+                    Text("Rating").font(Theme.ui(11, weight: .semibold)).foregroundStyle(Theme.label)
                     HStack(spacing: 3) {
                         ForEach(1...5, id: \.self) { score in
                             Button { library.setRating(score) } label: {
                                 Image(systemName: score <= photo.rating ? "star.fill" : "star")
-                                    .foregroundStyle(score <= photo.rating ? .yellow : .secondary)
-                            }.buttonStyle(.plain).help("Rate \(score) stars")
+                                    .foregroundStyle(score <= photo.rating ? Theme.accent : Theme.dim)
+                            }.buttonStyle(WordActionStyle()).help("Rate \(score) stars")
                         }
                         Button { library.setRating(0) } label: { Image(systemName: "xmark.circle") }
-                            .buttonStyle(.plain).help("Clear rating")
+                            .buttonStyle(WordActionStyle()).help("Clear rating")
                     }
                     Divider()
-                    Text("Culling Analysis").font(.subheadline.weight(.semibold))
-                    Text("AI-assisted, not AI-only: Vision models assess aesthetics and face quality; sharpness, exposure and framing are measured signals. The combined score is a ranking aid, not confidence or a personal preference model.")
-                        .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Text("CULLING").font(Theme.text(10, weight: 700)).tracking(1).foregroundStyle(Theme.dim)
+                        .help("AI-assisted ranking combines visual quality estimates with measured image signals. Treat the score as a review aid.")
                     if let cull = photo.cull {
                         if cull.failed {
                             Label("Analysis unavailable", systemImage: "exclamationmark.triangle")
                                 .font(.caption).foregroundStyle(.orange)
                         } else {
                             HStack(alignment: .firstTextBaseline, spacing: 5) {
-                                Text("\(cull.score)").font(.title2.weight(.bold).monospacedDigit())
-                                Text("/ 100").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                Text("\(cull.score)").font(Theme.text(22, weight: 650)).foregroundStyle(Theme.paper)
+                                Text("/ 100").font(Theme.ui(11)).foregroundStyle(Theme.dim)
                                 Text(cull.hardReject ? "Reject" : topPickURLs.contains(photo.file.url) ? "Top of View" : "Review")
                                     .font(.caption.weight(.semibold))
-                                    .foregroundStyle(cull.hardReject ? StudioStyle.negative : topPickURLs.contains(photo.file.url) ? StudioStyle.positive : .secondary)
+                                    .foregroundStyle(cull.hardReject ? Theme.warn : topPickURLs.contains(photo.file.url) ? Theme.accent : Theme.dim)
                             }
-                            metadataRow("Sharpness", "\(cull.sharpness) / 100")
-                            if let faceSharpness = cull.faceSharpness {
-                                metadataRow("Face Focus", "\(faceSharpness) / 100")
+                            DisclosureGroup("Analysis details") {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    metadataRow("Sharpness", "\(cull.sharpness) / 100")
+                                    if let faceSharpness = cull.faceSharpness { metadataRow("Face Focus", "\(faceSharpness) / 100") }
+                                    if let faceCaptureQuality = cull.faceCaptureQuality { metadataRow("Face Quality", "\(faceCaptureQuality) / 100") }
+                                    if let exposure = cull.exposure { metadataRow("Exposure", "\(exposure) / 100") }
+                                    if let faceExposure = cull.faceExposure { metadataRow("Face Exposure", "\(faceExposure) / 100") }
+                                    if let clipped = cull.clippedHighlightsPercent { metadataRow("Clipped Highlights", String(format: "%.1f%%", clipped)) }
+                                    if let crushed = cull.crushedShadowsPercent { metadataRow("Crushed Shadows", String(format: "%.1f%%", crushed)) }
+                                    metadataRow("Aesthetic AI", cull.aesthetics.map { "\($0) / 100" } ?? "Unavailable")
+                                    metadataRow("Composition", cull.composition.map { "\($0) / 100 · subject placement" } ?? "Unavailable")
+                                    metadataRow("Eyes", cull.eyesOpen.map { $0 ? "Open" : "Possibly closed" } ?? "Not applicable / unknown")
+                                    metadataRow("Faces", "\(cull.faceCount)")
+                                    ForEach(cull.reasons, id: \.self) { reason in
+                                        Label(reason, systemImage: "info.circle")
+                                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
+                                .padding(.top, 6)
                             }
-                            if let faceCaptureQuality = cull.faceCaptureQuality {
-                                metadataRow("Face Quality", "\(faceCaptureQuality) / 100")
-                            }
-                            if let exposure = cull.exposure {
-                                metadataRow("Exposure", "\(exposure) / 100")
-                            }
-                            if let faceExposure = cull.faceExposure {
-                                metadataRow("Face Exposure", "\(faceExposure) / 100")
-                            }
-                            if let clipped = cull.clippedHighlightsPercent {
-                                metadataRow("Clipped Highlights", String(format: "%.1f%%", clipped))
-                            }
-                            if let crushed = cull.crushedShadowsPercent {
-                                metadataRow("Crushed Shadows", String(format: "%.1f%%", crushed))
-                            }
-                            metadataRow("Aesthetic AI", cull.aesthetics.map { "\($0) / 100" } ?? "Unavailable")
-                            metadataRow("Composition", cull.composition.map { "\($0) / 100 · subject placement" } ?? "Unavailable")
-                            metadataRow("Eyes", cull.eyesOpen.map { $0 ? "Open" : "Possibly closed" } ?? "Not applicable / unknown")
-                            metadataRow("Faces", "\(cull.faceCount)")
-                            ForEach(cull.reasons, id: \.self) { reason in
-                                Label(reason, systemImage: "info.circle")
-                                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                            }
+                            .font(Theme.ui(11, weight: .medium)).foregroundStyle(Theme.label)
                         }
                     } else {
                         Text("Run AI Cull for focus, eyes, composition and aesthetic scores on this Mac.")
                             .font(.caption).foregroundStyle(.secondary)
-                        Button("Analyze Library", systemImage: "sparkles") {
+                        Button("Analyze Library") {
                             Task { await library.analyzeCull() }
-                        }.buttonStyle(.bordered)
+                        }.buttonStyle(OutlinedButtonStyle())
                     }
                     Divider()
                     HStack(spacing: 8) {
                         Button {
                             library.setFlag(photo.flag == .picked ? .none : .picked)
                         } label: {
-                            Label(photo.flag == .picked ? "Picked" : "Pick", systemImage: "flag.fill")
+                            Text(photo.flag == .picked ? "Picked" : "Pick")
                         }
-                        .buttonStyle(.bordered)
-                        .tint(photo.flag == .picked ? .accentColor : .secondary)
+                        .buttonStyle(OutlinedButtonStyle(prominent: photo.flag == .picked))
                         Button {
                             library.setFlag(photo.flag == .rejected ? .none : .rejected)
                         } label: {
-                            Label("Reject", systemImage: "xmark.circle")
+                            Text(photo.flag == .rejected ? "Rejected" : "Reject")
                         }
-                        .buttonStyle(.bordered)
-                        .tint(photo.flag == .rejected ? .red : .secondary)
+                        .buttonStyle(OutlinedButtonStyle(prominent: photo.flag == .rejected))
                     }
                     Toggle("Client Pick", isOn: Binding(get: { photo.clientPicked }, set: { library.setClientPick($0) }))
                     Toggle("Queue for Export", isOn: Binding(get: { photo.selectedForExport }, set: { library.setExportQueued($0) }))
-                    if !library.albums.isEmpty {
-                        Menu("Add to Album", systemImage: "rectangle.stack.badge.plus") {
-                            ForEach(library.albums) { album in
-                                Button(album.name) { library.addSelectedPhoto(to: album.id) }
-                            }
-                        }
-                    }
-                    if !library.projects.isEmpty {
-                        Menu("Project Membership", systemImage: "folder.badge.plus") {
-                            ForEach(library.projects) { project in
-                                let contains = project.photoPaths.contains(photo.file.url.standardizedFileURL.path)
-                                Button {
-                                    library.toggleSelectedPhoto(in: project.id)
-                                } label: {
-                                    Label(project.name, systemImage: contains ? "checkmark" : "plus")
-                                }
-                            }
-                        }
-                    }
-                    Button("Edit Photo", systemImage: "slider.horizontal.3") { model.open(photo.file.url) }
-                        .buttonStyle(.borderedProminent).frame(maxWidth: .infinity, alignment: .leading)
+                    Button("Edit Selected Photo") { model.openLibraryPhoto(photo.file.url) }
+                        .buttonStyle(PencilButtonStyle(height: 32))
+                        .disabled(photo.missing)
                 } else {
                     ContentUnavailableView("No Selection", systemImage: "photo")
                 }
             }
             .padding(16)
         }
-        .background(StudioStyle.sidebar)
-    }
-
-    private var albumSheet: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("New Album").font(.headline)
-            TextField("Album name", text: $albumName)
-                .textFieldStyle(.roundedBorder).frame(width: 320)
-            HStack {
-                Spacer()
-                Button("Cancel") { showingAlbumSheet = false }
-                Button("Create") {
-                    library.createAlbum(named: albumName)
-                    showingAlbumSheet = false
-                }.keyboardShortcut(.defaultAction).disabled(albumName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-        }.padding(20)
-    }
-
-    private var smartCollectionSheet: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Save Smart Collection").font(.headline)
-            TextField("Collection name", text: $smartName).textFieldStyle(.roundedBorder).frame(width: 320)
-            Picker("Rule", selection: $smartFilter) {
-                ForEach(LibraryFilter.allCases.filter { $0 != .all }) { filter in Text(filter.title).tag(filter) }
-            }
-            HStack {
-                Spacer()
-                Button("Cancel") { showingSmartSheet = false }
-                Button("Save") {
-                    library.createSmartCollection(named: smartName, filter: smartFilter)
-                    showingSmartSheet = false
-                }.keyboardShortcut(.defaultAction).disabled(smartName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-        }.padding(20)
+        .background(Theme.panel)
     }
 
     private var projectSheet: some View {
@@ -632,7 +711,7 @@ struct LibraryWorkspaceView: View {
             Text("New Project").font(.headline)
             TextField("Project name", text: $projectName)
                 .textFieldStyle(.roundedBorder).frame(width: 320)
-            Text("A project is a work set of photos. Add images from any source folder; originals stay in their folders.")
+            Text("A project keeps its photos and groups together. Original files stay in place.")
                 .font(.caption).foregroundStyle(.secondary).frame(width: 320, alignment: .leading)
             HStack {
                 Spacer()
@@ -642,57 +721,164 @@ struct LibraryWorkspaceView: View {
                     showingProjectSheet = false
                 }.keyboardShortcut(.defaultAction).disabled(projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-        }.padding(20)
+        }.padding(20).background(Theme.panel).preferredColorScheme(.dark)
+    }
+
+    private var projectRenameSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Rename Project").font(.headline)
+            TextField("Project name", text: $projectName)
+                .textFieldStyle(.roundedBorder).frame(width: 320)
+            Text(projectRenameDescription)
+                .font(.caption).foregroundStyle(.secondary).frame(width: 320, alignment: .leading)
+            HStack {
+                Spacer()
+                Button("Cancel") { showingProjectRenameSheet = false }
+                Button("Rename") {
+                    guard let id = projectToRename else { return }
+                    do {
+                        try library.renameProject(id, to: projectName)
+                        showingProjectRenameSheet = false
+                    } catch { Self.showProjectError(error) }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }.padding(20).background(Theme.panel).preferredColorScheme(.dark)
+    }
+
+    private var categorySheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(categoryToRename == nil ? "New Group" : "Rename Group").font(.headline)
+            TextField("Group name", text: $projectName)
+                .textFieldStyle(.roundedBorder).frame(width: 320)
+            if let categoryError {
+                Text(categoryError).font(.caption).foregroundStyle(Theme.warn)
+                    .fixedSize(horizontal: false, vertical: true).frame(width: 320, alignment: .leading)
+            } else {
+                Text("Groups collect this project’s photos without moving the original files.")
+                    .font(.caption).foregroundStyle(.secondary).frame(width: 320, alignment: .leading)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { showingCategorySheet = false }
+                Button(categoryToRename == nil ? "Create Group" : "Rename Group") {
+                    let name = projectName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !name.isEmpty else { return }
+                    let ownerID = categoryToRename
+                        .flatMap { id in library.albums.first(where: { $0.id == id })?.projectID }
+                        ?? library.selectedProjectID
+                    guard let ownerID else { return }
+                    if let id = categoryToRename {
+                        if library.categories(for: ownerID).contains(where: {
+                            $0.id != id && $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+                        }) {
+                            categoryError = "A group with that name already exists in this project."
+                        } else {
+                            library.renameCategory(id, to: name)
+                            showingCategorySheet = false
+                        }
+                    } else if library.categories(for: ownerID).contains(where: {
+                        $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+                    }) {
+                        categoryError = "A group with that name already exists in this project."
+                    } else {
+                        library.createAlbum(named: name)
+                        showingCategorySheet = false
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }.padding(20).background(Theme.panel).preferredColorScheme(.dark)
     }
 
     private var currentTitle: String {
-        if let project = library.projects.first(where: { $0.id == library.selectedProjectID }) { return project.name }
         if let album = library.albums.first(where: { $0.id == library.selectedAlbumID }) { return album.name }
         if let collection = library.smartCollections.first(where: { $0.id == library.selectedSmartCollectionID }) { return collection.name }
         if let folder = library.folders.first(where: { $0.id == library.selectedFolderID }) { return folder.name }
+        if let project = library.projects.first(where: { $0.id == library.selectedProjectID }) { return project.name }
         return library.filter.title
     }
 
+    private var projectRenameDescription: String {
+        guard let id = projectToRename,
+              let path = library.projects.first(where: { $0.id == id })?.projectFilePath,
+              FileManager.default.fileExists(atPath: path) else {
+            return "This project has not been saved as a .negproject file yet. Its new name will be used when you export it."
+        }
+        return "Its saved .negproject file will also be renamed in the same location."
+    }
+
     private var currentScopeLabel: String {
-        if library.selectedProjectID != nil { return "PROJECT · CURATED SET" }
-        if library.selectedFolderID != nil { return "FOLDER · SOURCE LOCATION" }
-        if library.selectedAlbumID != nil { return "ALBUM · MANUAL SELECTION" }
+        if library.selectedAlbumID != nil { return "PROJECT · GROUP" }
+        if library.selectedFolderID != nil { return "PROJECT · ALL PHOTOS" }
+        if library.selectedProjectID != nil { return "PROJECT · ALL PHOTOS" }
         if library.selectedSmartCollectionID != nil { return "SMART COLLECTION" }
         return "LIBRARY"
     }
 
-    private func sidebarSection<Content: View>(_ title: String, actionTitle: String? = nil,
+    private func sidebarSection<Content: View>(_ title: String, subtitle: String? = nil, actionTitle: String? = nil,
                                                action: (() -> Void)? = nil,
                                                @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
-                Text(title).font(.caption2.weight(.semibold)).tracking(0.65).foregroundStyle(.secondary)
+                Text(title).font(Theme.text(10, weight: 600)).tracking(1.25).foregroundStyle(Theme.dim)
                 Spacer(minLength: 4)
                 if let actionTitle, let action {
-                    Button(actionTitle, action: action)
-                        .buttonStyle(.plain).font(.caption.weight(.medium)).foregroundStyle(.tint)
+                    WordButton(title: actionTitle, size: 12, action: action)
                 }
             }
             .padding(.horizontal, 7)
+            if let subtitle {
+                Text(subtitle)
+                    .font(Theme.text(9.5))
+                    .foregroundStyle(Theme.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 7)
+                    .padding(.bottom, 2)
+            }
             content()
+        }
+    }
+
+    @ViewBuilder private func categoryActions(_ category: LibraryAlbum) -> some View {
+        Button("Rename Group…", systemImage: "pencil") {
+            categoryToRename = category.id
+            projectName = category.name
+            categoryError = nil
+            showingCategorySheet = true
+        }
+        Button("Export Group…", systemImage: "square.and.arrow.up") { exportCategory(category) }
+            .disabled(!library.photos.contains { $0.albumIDs.contains(category.id) && !$0.missing })
+        Button("Reset Group Edits…", systemImage: "arrow.counterclockwise", role: .destructive) {
+            categoryToReset = category.id
+            showingCategoryResetConfirmation = true
+        }
+        Divider()
+        Button("Delete Group", systemImage: "trash", role: .destructive) {
+            library.deleteAlbum(category.id)
         }
     }
 
     private func metadataRow(_ label: String, _ value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(label).foregroundStyle(.secondary)
-            Spacer(minLength: 4)
-            Text(value).multilineTextAlignment(.trailing).textSelection(.enabled)
-        }.font(.caption)
+            Text(label).foregroundStyle(Theme.dim).frame(width: 92, alignment: .leading)
+            Text(value).frame(maxWidth: .infinity, alignment: .trailing)
+                .multilineTextAlignment(.trailing).textSelection(.enabled)
+        }.font(Theme.ui(11)).foregroundStyle(Theme.label)
     }
 
     private func photoGrid(_ photos: [LibraryPhoto], topPickURLs: Set<URL>) -> some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: thumbnailSize), spacing: 9)], spacing: 11) {
+        let order = photos.map(\.file.url)
+        return LazyVGrid(columns: [GridItem(.adaptive(minimum: thumbnailSize), spacing: 12)], spacing: 14) {
             ForEach(photos) { photo in
-                LibraryPhotoCard(photo: photo, selected: photo.file.url == library.selectedPhotoURL,
+                LibraryPhotoCard(photo: photo,
+                                 selected: library.gridSelection.selected.contains(photo.file.url) || photo.file.url == library.selectedPhotoURL,
                                  isTopPick: topPickURLs.contains(photo.file.url) && photo.cull?.hardReject != true,
                                  size: CGFloat(thumbnailSize)) {
-                    library.selectedPhotoURL = photo.file.url
+                    library.selectGridPhoto(photo.file.url, extending: NSEvent.modifierFlags.contains(.shift),
+                                            toggling: NSEvent.modifierFlags.contains(.command), in: order)
                     libraryGridFocused = true
                 } open: {
                     model.openLibraryPhoto(photo.file.url)
@@ -710,7 +896,7 @@ struct LibraryWorkspaceView: View {
         guard !photos.isEmpty else { return }
         let current = photos.firstIndex { $0.file.url == library.selectedPhotoURL }
         let next = min(max((current ?? (offset > 0 ? -1 : photos.count)) + offset, 0), photos.count - 1)
-        library.selectedPhotoURL = photos[next].file.url
+        library.selectGridPhoto(photos[next].file.url, in: photos.map(\.file.url))
     }
 
     private func editFiltered(_ editablePhotos: [LibraryPhoto]) {
@@ -719,15 +905,10 @@ struct LibraryWorkspaceView: View {
         model.editLibrarySelection(urls)
     }
 
-    private func exportFiltered(_ editablePhotos: [LibraryPhoto]) {
-        editFiltered(editablePhotos)
-        model.exportPanel()
-    }
-
     @MainActor private func importFolders() {
         let panel = NSOpenPanel()
-        panel.title = "Import Folders into Library"
-        panel.prompt = "Import"
+        panel.title = "Add Photos to Project"
+        panel.prompt = "Add Photos"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
@@ -735,6 +916,14 @@ struct LibraryWorkspaceView: View {
             guard response == .OK else { return }
             Task { await library.importFolders(panel.urls) }
         }
+    }
+
+    private func exportCategory(_ category: LibraryAlbum) {
+        let urls = library.photos.filter { $0.albumIDs.contains(category.id) && !$0.missing }
+            .map { $0.file.url }
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        guard !urls.isEmpty else { return }
+        model.exportLibraryPhotos(urls)
     }
 
     @MainActor private func openProjectPanel() {
@@ -773,7 +962,7 @@ struct LibraryWorkspaceView: View {
 
     @MainActor private static func showProjectError(_ error: Error) {
         let alert = NSAlert()
-        alert.messageText = "Project Couldn’t Be Opened or Exported"
+        alert.messageText = "Project Action Failed"
         alert.informativeText = error.localizedDescription
         alert.alertStyle = .warning
         alert.runModal()
@@ -783,6 +972,16 @@ struct LibraryWorkspaceView: View {
         ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
     }
 
+}
+
+private struct WordActionStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(Theme.ui(12, weight: .medium))
+            .foregroundStyle(configuration.isPressed ? Theme.paper : Theme.label)
+            .opacity(configuration.isPressed ? 0.62 : 1)
+            .contentShape(Rectangle())
+    }
 }
 
 private struct NavigationRow: View {
@@ -795,25 +994,27 @@ private struct NavigationRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 8) {
-                Image(systemName: symbol).frame(width: 17)
-                Text(title).lineLimit(1).truncationMode(.middle)
+                Image(systemName: symbol).frame(width: 15)
+                Text(title).lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: 3)
                 Text("\(count)").font(.caption2).monospacedDigit().foregroundStyle(.secondary)
             }
-            .font(.callout)
-            .padding(.horizontal, 8).padding(.vertical, 6)
-            .background(selected ? StudioStyle.accent.opacity(0.15) : .clear,
-                        in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .font(Theme.text(10.5))
+            .padding(.leading, 8).padding(.trailing, 7).padding(.vertical, 6)
+            .background(selected ? Theme.accent.opacity(0.13) : .clear,
+                        in: RoundedRectangle(cornerRadius: 2, style: .circular))
             .overlay {
                 if selected {
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .strokeBorder(StudioStyle.accent.opacity(0.28), lineWidth: 0.7)
+                    HStack(spacing: 0) {
+                        RoundedRectangle(cornerRadius: 1).fill(Theme.accent).frame(width: 2)
+                        Spacer(minLength: 0)
+                    }
                 }
             }
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(selected ? Color.accentColor : Color.primary)
+        .buttonStyle(WordActionStyle())
+        .foregroundStyle(selected ? Theme.accent : Theme.label)
     }
 }
 
@@ -832,6 +1033,8 @@ private struct ProjectPhotoPicker: View {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         return library.photos.filter { photo in
             !photo.missing
+                && (!project.folderIDs.contains(photo.folderID)
+                    || project.excludedPhotoPaths.contains(photo.file.url.standardizedFileURL.path))
                 && !project.photoPaths.contains(photo.file.url.standardizedFileURL.path)
                 && (sourceFolderID == nil || photo.folderID == sourceFolderID)
                 && (query.isEmpty || photo.file.name.localizedCaseInsensitiveContains(query))
@@ -848,14 +1051,14 @@ private struct ProjectPhotoPicker: View {
                 }
                 Spacer()
                 Menu {
-                    Button("All Source Folders") { sourceFolderID = nil }
+                    Button("All Sources") { sourceFolderID = nil }
                     Divider()
                     ForEach(library.folders) { folder in
                         Button(folder.name) { sourceFolderID = folder.id }
                     }
                 } label: {
-                    Label(library.folders.first { $0.id == sourceFolderID }?.name ?? "All Source Folders",
-                          systemImage: "folder")
+                    Label(library.folders.first { $0.id == sourceFolderID }?.name ?? "All Sources",
+                          systemImage: "externaldrive")
                 }
                 .menuStyle(.borderlessButton).fixedSize()
                 TextField("Search filenames", text: $searchText)
@@ -867,9 +1070,9 @@ private struct ProjectPhotoPicker: View {
                 Text("\(candidates.count) available")
                     .foregroundStyle(.secondary).monospacedDigit()
                 Button("Select All") { selectedURLs.formUnion(candidates.map(\.file.url)) }
-                    .buttonStyle(.borderless).disabled(candidates.isEmpty)
+                    .buttonStyle(OutlinedButtonStyle()).disabled(candidates.isEmpty)
                 Button("Clear") { selectedURLs.removeAll() }
-                    .buttonStyle(.borderless).disabled(selectedURLs.isEmpty)
+                    .buttonStyle(OutlinedButtonStyle()).disabled(selectedURLs.isEmpty)
                 Spacer()
                 Text("\(selectedURLs.count) selected")
                     .foregroundStyle(.secondary).monospacedDigit()
@@ -881,11 +1084,11 @@ private struct ProjectPhotoPicker: View {
                 VStack(spacing: 12) {
                     ContentUnavailableView("No Available Photos", systemImage: "photo.on.rectangle.angled",
                                            description: Text(library.folders.isEmpty
-                                            ? "Add a source folder to the Library first."
-                                            : "Every photo in this source is already in the project, or no photos match your search."))
+                                            ? "Import photos to this project first."
+                                            : "Every matching photo is already in the project, or no photos match your search."))
                     if library.folders.isEmpty {
-                        Button("Add Source Folder…", action: addSourceFolder)
-                            .buttonStyle(.borderedProminent)
+                        Button("Import Photos…", action: addSourceFolder)
+                            .buttonStyle(OutlinedButtonStyle(prominent: true))
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -914,7 +1117,7 @@ private struct ProjectPhotoPicker: View {
                     library.add(library.photos.filter { selectedURLs.contains($0.file.url) }, to: projectID)
                     dismiss()
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(PencilButtonStyle(height: 32))
                 .keyboardShortcut(.defaultAction)
                 .disabled(selectedURLs.isEmpty)
             }
@@ -935,7 +1138,7 @@ private struct ProjectPhotoChoice: View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 6) {
                 ZStack(alignment: .topTrailing) {
-                    RoundedRectangle(cornerRadius: 8).fill(StudioStyle.plot)
+                    RoundedRectangle(cornerRadius: 3).fill(Theme.film)
                     if let image {
                         Image(decorative: image, scale: 2).resizable().scaledToFit().padding(5)
                     } else {
@@ -943,18 +1146,18 @@ private struct ProjectPhotoChoice: View {
                     }
                     Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                         .font(.title3).symbolRenderingMode(.palette)
-                        .foregroundStyle(selected ? StudioStyle.accent : .white.opacity(0.85), .black.opacity(0.55))
+                        .foregroundStyle(selected ? Theme.accent : Theme.paper.opacity(0.85), .black.opacity(0.55))
                         .padding(7)
                 }
                 .frame(height: 124)
-                Text(photo.file.name).font(.caption).lineLimit(1).truncationMode(.middle)
-                    .foregroundStyle(.primary)
+            Text(photo.file.name).font(Theme.ui(12)).lineLimit(1).truncationMode(.middle)
+                .foregroundStyle(Theme.label)
             }
             .padding(5)
-            .background(selected ? StudioStyle.accent.opacity(0.14) : .clear,
+            .background(selected ? Theme.accent.opacity(0.14) : .clear,
                         in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(selected ? StudioStyle.accent : StudioStyle.outline, lineWidth: selected ? 1.2 : 0.7))
+                .strokeBorder(selected ? Theme.accent : Theme.line, lineWidth: selected ? 1.2 : 0.7))
         }
         .buttonStyle(.plain)
         .task(id: photo.file) {
@@ -974,13 +1177,20 @@ private struct LibraryPhotoCard: View {
     let open: () -> Void
     let setFlag: (LibraryFlag) -> Void
     let setRating: (Int) -> Void
+    @Environment(\.displayScale) private var displayScale
     @State private var image: CGImage?
     @State private var hovered = false
+
+    private var thumbnailRequest: LibraryThumbnailRequest {
+        LibraryThumbnailRequest(photo: photo.file,
+                                size: .grid(points: size, scale: displayScale))
+    }
 
     var body: some View {
         Button(action: select) { cardContent }
         .buttonStyle(.plain)
-        .onTapGesture(count: 2, perform: open)
+        .simultaneousGesture(TapGesture(count: 2).onEnded { open() })
+        .help("Click to select · Double-click to edit")
         .contextMenu {
             Button("Open in Editor", systemImage: "slider.horizontal.3", action: open)
             Divider()
@@ -999,9 +1209,12 @@ private struct LibraryPhotoCard: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(photo.file.name)
         .accessibilityValue("\(photo.rating) stars, \(photo.flag.title)")
-        .task(id: photo.file) {
+        .task(id: thumbnailRequest) {
             guard !photo.missing else { image = nil; return }
-            let request = Task.detached(priority: .utility) { await PhotoThumbnails.shared.image(for: photo.file) }
+            let thumbnailRequest = thumbnailRequest
+            let request = Task.detached(priority: .utility) {
+                await PhotoThumbnails.shared.image(for: thumbnailRequest.photo, size: thumbnailRequest.size)
+            }
             let result = await withTaskCancellationHandler { await request.value } onCancel: { request.cancel() }
             guard !Task.isCancelled else { return }
             image = result
@@ -1020,17 +1233,16 @@ private struct LibraryPhotoCard: View {
                         .font(.system(size: 9, weight: .semibold, design: .rounded)).monospacedDigit()
                     if isTopPick { Text("TOP PICK").font(.system(size: 8, weight: .bold)).tracking(0.3) }
                 }
-                .foregroundStyle(isTopPick ? StudioStyle.positive : cull.hardReject ? StudioStyle.negative : Color.secondary)
+                .foregroundStyle(isTopPick ? Theme.accent : cull.hardReject ? Theme.warn : Theme.dim)
             }
         }
         .padding(3)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(selected ? StudioStyle.panel.opacity(0.88) : hovered ? StudioStyle.panel.opacity(0.48) : .clear,
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .background(selected ? Theme.panel : hovered ? Theme.panel.opacity(0.45) : .clear,
+                    in: RoundedRectangle(cornerRadius: 3))
         .overlay {
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .strokeBorder(selected ? StudioStyle.accent.opacity(0.95) : Color.white.opacity(hovered ? 0.10 : 0),
-                              lineWidth: selected ? 1.2 : 0.7)
+            RoundedRectangle(cornerRadius: 3)
+                .strokeBorder(selected ? Theme.accent : Theme.line.opacity(hovered ? 0.9 : 0), lineWidth: 1)
         }
         .onHover { hovered = $0 }
         .animation(.easeOut(duration: 0.12), value: hovered)
@@ -1040,14 +1252,19 @@ private struct LibraryPhotoCard: View {
 
     private var thumbnail: some View {
         ZStack(alignment: .topTrailing) {
-            RoundedRectangle(cornerRadius: 8, style: .continuous).fill(StudioStyle.plot)
+            RoundedRectangle(cornerRadius: 3).fill(Theme.film)
             if let image {
                 Image(decorative: image, scale: 2).resizable().scaledToFit().padding(4)
             } else if photo.missing {
-                Image(systemName: "externaldrive.badge.exclamationmark")
-                    .font(.title2).foregroundStyle(.orange)
+                Text("Offline").font(Theme.text(15, italic: true)).foregroundStyle(Theme.warn)
             } else {
-                Image(systemName: "photo").foregroundStyle(.tertiary)
+                VStack(spacing: 5) {
+                    Image(systemName: "photo").font(.system(size: 17, weight: .regular))
+                    Text("No Preview").font(Theme.ui(10, weight: .medium))
+                }
+                .foregroundStyle(Theme.dim)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Theme.blank)
             }
             if photo.flag == .picked {
                 Image(systemName: "flag.fill").foregroundStyle(.green).padding(7)
@@ -1059,26 +1276,31 @@ private struct LibraryPhotoCard: View {
         // legible at the user's chosen thumbnail size.
         .frame(height: size)
         .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(selected ? StudioStyle.accent : Color.white.opacity(0.045), lineWidth: selected ? 1.2 : 0.6)
+            RoundedRectangle(cornerRadius: 3)
+                .strokeBorder(selected ? Theme.accent : Theme.line, lineWidth: selected ? 1.2 : 0.6)
         }
     }
 
     private var photoBadges: some View {
         HStack(spacing: 2) {
             ForEach(1...5, id: \.self) { score in
-                Image(systemName: score <= photo.rating ? "star.fill" : "star")
-                    .font(.system(size: 9)).foregroundStyle(score <= photo.rating ? Color.yellow : Color.secondary)
+                    Image(systemName: score <= photo.rating ? "star.fill" : "star")
+                    .font(.system(size: 9)).foregroundStyle(score <= photo.rating ? Theme.accent : Theme.dim)
             }
             if photo.clientPicked {
-                Image(systemName: "heart.fill").font(.system(size: 9)).foregroundStyle(.pink).padding(.leading, 4)
+                Text("Client Pick").font(Theme.ui(9)).foregroundStyle(Theme.label).padding(.leading, 4)
             }
             Spacer(minLength: 0)
             if photo.selectedForExport {
-                Image(systemName: "square.and.arrow.up").font(.system(size: 9)).foregroundStyle(.secondary)
+                Text("Queued").font(Theme.ui(9)).foregroundStyle(Theme.dim)
             }
         }
     }
+}
+
+private struct LibraryThumbnailRequest: Equatable {
+    let photo: PhotoFile
+    let size: PhotoThumbnails.Size
 }
 
 private struct LibraryPreview: View {
@@ -1088,14 +1310,17 @@ private struct LibraryPreview: View {
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 6).fill(.primary.opacity(0.045))
+            RoundedRectangle(cornerRadius: 3).fill(Theme.film)
             if let image { Image(decorative: image, scale: 2).resizable().scaledToFit().padding(5) }
-            else { Image(systemName: "photo").foregroundStyle(.tertiary) }
+            else { Theme.blank }
         }
         .frame(maxWidth: .infinity).frame(height: size * 0.66)
         .task(id: file) {
+            image = nil
             let request = Task.detached(priority: .utility) { await PhotoThumbnails.shared.image(for: file) }
-            image = await request.value
+            let result = await withTaskCancellationHandler { await request.value } onCancel: { request.cancel() }
+            guard !Task.isCancelled else { return }
+            image = result
         }
     }
 }

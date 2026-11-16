@@ -13,7 +13,7 @@ struct Histogram: Equatable, Sendable {
     var blue = [UInt32](repeating: 0, count: 256)
 
     static func of(_ surface: IOSurface, crop: CropSettings, maxSamples: Int = 1 << 20) -> Histogram {
-        ImageScopes.of(surface, crop: crop, maxSamples: maxSamples).histogram
+        ImageScopes.of(surface, crop: crop, maxSamples: maxSamples, mode: .histogram).histogram
     }
 
     /// The tallest bin, leaving out pure black and white so clipping doesn't
@@ -46,13 +46,18 @@ struct Waveform: Equatable, Sendable {
         var pixels = [UInt8](repeating: 0, count: paradeWidth * 256 * 4)
         if peak > 0 {
             func intensity(_ count: UInt32) -> UInt8 {
-                count == 0 ? 0 : UInt8((232 * (0.16 + 0.84 * log1p(Double(count)) / normalizer)).rounded())
+                // A waveform is a density trace. The old 16–100% floor made
+                // every occupied bin look equally loud, turning fine detail
+                // into a noisy block on high-resolution previews.
+                count == 0 ? 0 : UInt8((168 * (0.035 + 0.965 * log1p(Double(count)) / normalizer)).rounded())
             }
-            for level in 0..<256 {
-                for x in 0..<width {
-                    let source = level * width + x
-                    let row = (255 - level) * paradeWidth
-                    for (channel, counts) in [red, green, blue].enumerated() {
+            // Keep the channel list out of the per-bin loop: constructing it
+            // for all 65,536 bins creates needless arrays on Intel.
+            for (channel, counts) in [red, green, blue].enumerated() {
+                for level in 0..<256 {
+                    for x in 0..<width {
+                        let source = level * width + x
+                        let row = (255 - level) * paradeWidth
                         let value = intensity(counts[source])
                         let pixel = (row + channel * width + x) * 4
                         pixels[pixel + channel] = value
@@ -87,7 +92,8 @@ struct ImageScopes: Equatable, Sendable {
     /// visible even when the weighted luma remains below white. Generated
     /// only when the viewer overlay is on.
     static func clippingOverlay(_ surface: IOSurface, low: Double, high: Double) -> CGImage? {
-        guard surface.bytesPerElement >= 4 else { return nil }
+        guard surface.width > 0, surface.height > 0, surface.bytesPerElement == 4,
+              surface.planeCount <= 1, !Task.isCancelled else { return nil }
         surface.lock(options: .readOnly, seed: nil)
         defer { surface.unlock(options: .readOnly, seed: nil) }
         let sourceWidth = surface.width, sourceHeight = surface.height
@@ -98,9 +104,10 @@ struct ImageScopes: Equatable, Sendable {
         let rowBytes = surface.bytesPerRow
         var rgba = [UInt8](repeating: 0, count: width * height * 4)
         for y in 0..<height {
+            if Task.isCancelled { return nil }
+            let sy = min(sourceHeight - 1, Int((Double(y) + 0.5) * Double(sourceHeight) / Double(height)))
             for x in 0..<width {
                 let sx = min(sourceWidth - 1, Int((Double(x) + 0.5) * Double(sourceWidth) / Double(width)))
-                let sy = min(sourceHeight - 1, Int((Double(y) + 0.5) * Double(sourceHeight) / Double(height)))
                 let src = sy * rowBytes + sx * surface.bytesPerElement
                 let r = source[src + 2], g = source[src + 1], b = source[src]
                 let offset = (y * width + x) * 4
@@ -124,7 +131,8 @@ struct ImageScopes: Equatable, Sendable {
     /// It is generated only while enabled and capped at one megapixel so it
     /// remains a lightweight diagnostic overlay rather than a develop stage.
     static func falseColorOverlay(_ surface: IOSurface) -> CGImage? {
-        guard surface.bytesPerElement >= 4 else { return nil }
+        guard surface.width > 0, surface.height > 0, surface.bytesPerElement == 4,
+              surface.planeCount <= 1, !Task.isCancelled else { return nil }
         surface.lock(options: .readOnly, seed: nil)
         defer { surface.unlock(options: .readOnly, seed: nil) }
         let sourceWidth = surface.width, sourceHeight = surface.height
@@ -135,11 +143,13 @@ struct ImageScopes: Equatable, Sendable {
         let rowBytes = surface.bytesPerRow, alpha = 224.0 / 255.0
         var rgba = [UInt8](repeating: 0, count: width * height * 4)
         for y in 0..<height {
+            if Task.isCancelled { return nil }
             let sy = min(sourceHeight - 1, Int((Double(y) + 0.5) * Double(sourceHeight) / Double(height)))
             for x in 0..<width {
                 let sx = min(sourceWidth - 1, Int((Double(x) + 0.5) * Double(sourceWidth) / Double(width)))
                 let src = sy * rowBytes + sx * surface.bytesPerElement
-                let luma = (54 * Int(source[src]) + 183 * Int(source[src + 1]) + 19 * Int(source[src + 2])) >> 8
+                // IOSurface preview pixels are BGRA; luma weights are RGB.
+                let luma = (19 * Int(source[src]) + 183 * Int(source[src + 1]) + 54 * Int(source[src + 2])) >> 8
                 let color: (UInt8, UInt8, UInt8)
                 switch luma {
                 case ..<13: color = (14, 8, 52)       // 0–5 IRE: near-black
@@ -166,10 +176,17 @@ struct ImageScopes: Equatable, Sendable {
                        provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
     }
 
-    static func of(_ surface: IOSurface, crop: CropSettings, rotation: Int = 0, maxSamples: Int = 1 << 20) -> ImageScopes {
+    static func of(_ surface: IOSurface, crop: CropSettings, rotation: Int = 0, maxSamples: Int = 1 << 20,
+                   mode: ScopeMode? = nil) -> ImageScopes {
+        guard surface.width > 0, surface.height > 0, surface.bytesPerElement == 4,
+              surface.planeCount <= 1, !Task.isCancelled else { return ImageScopes() }
         let size = CGSize(width: surface.width, height: surface.height)
         let area = crop.pixels(in: size)
         guard area.width >= 1, area.height >= 1, maxSamples > 0 else { return ImageScopes() }
+        let wantsHistogram = mode == nil || mode == .histogram
+        let wantsWaveform = mode == nil || mode == .waveform
+        let wantsVectorscope = mode == nil || mode == .vectorscope || mode == .skin
+        let wantsSkin = mode == nil || mode == .skin
         let width = Int(area.width), height = Int(area.height)
         // This also bounds very thin panoramas: a single common pixel stride
         // can exceed the budget when one of the dimensions is much shorter.
@@ -177,24 +194,25 @@ struct ImageScopes: Equatable, Sendable {
         let rows = min(height, max(1, maxSamples / columns))
         let turn = (rotation % 4 + 4) % 4
         let shownColumns = turn % 2 == 0 ? columns : rows
-        let waveWidth = min(256, shownColumns)
-        var red = [UInt32](repeating: 0, count: waveWidth * 256)
+        let waveWidth = wantsWaveform ? min(256, shownColumns) : 1
+        var red = [UInt32](repeating: 0, count: wantsWaveform ? waveWidth * 256 : 0)
         var green = red, blue = red
         var histogram = Histogram()
         let vectorSize = 128
-        var vectorBins = [UInt16](repeating: 0, count: vectorSize * vectorSize)
-        var skinBins = vectorBins
+        var vectorBins = [UInt16](repeating: 0, count: wantsVectorscope ? vectorSize * vectorSize : 0)
+        var skinBins = [UInt16](repeating: 0, count: wantsSkin ? vectorSize * vectorSize : 0)
         var skinAngles: Double = 0
         var skinSamples = 0
         var onTarget = 0, tooMagenta = 0, tooGreen = 0
         let sampleCount = columns * rows
-        let faceBoxes: [CGRect] = autoreleasepool {
+        if Task.isCancelled { return ImageScopes() }
+        let faceBoxes: [CGRect] = wantsSkin ? autoreleasepool {
             let request = VNDetectFaceRectanglesRequest()
             do {
                 try VNImageRequestHandler(ciImage: CIImage(ioSurface: surface), options: [:]).perform([request])
-                return (request.results ?? []).map(\.boundingBox)
+                return (request.results ?? []).map { $0.boundingBox.insetBy(dx: -0.025, dy: -0.025) }
             } catch { return [] }
-        }
+        } : []
         surface.lock(options: .readOnly, seed: nil)
         defer { surface.unlock(options: .readOnly, seed: nil) }
         let base = surface.baseAddress.assumingMemoryBound(to: UInt8.self)
@@ -204,6 +222,7 @@ struct ImageScopes: Equatable, Sendable {
         let (sin, cos) = (Foundation.sin(-crop.angle * .pi / 180), Foundation.cos(-crop.angle * .pi / 180))
         let (cx, cy) = (size.width / 2, size.height / 2)
         for row in 0..<rows {
+            if Task.isCancelled { return ImageScopes() }
             for column in 0..<columns {
                 let dx = area.minX + (Double(column) + 0.5) * area.width / Double(columns) - cx
                 let dy = area.minY + (Double(row) + 0.5) * area.height / Double(rows) - cy
@@ -212,30 +231,40 @@ struct ImageScopes: Equatable, Sendable {
                 guard x >= 0, x < surface.width, y >= 0, y < surface.height else { continue }
                 let pixel = base + y * rowBytes + x * 4
                 let (r, g, b) = (Int(pixel[2]), Int(pixel[1]), Int(pixel[0]))
-                histogram.red[r] += 1; histogram.green[g] += 1; histogram.blue[b] += 1
-                let rf = Double(r) / 255, gf = Double(g) / 255, bf = Double(b) / 255
-                let luma = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf
-                let cb = (bf - luma) / (2 * (1 - 0.0722))
-                let cr = (rf - luma) / (2 * (1 - 0.2126))
-                let vx = min(vectorSize - 1, max(0, Int(((cb + 0.5) * Double(vectorSize - 1)).rounded())))
-                let vy = min(vectorSize - 1, max(0, Int(((0.5 - cr) * Double(vectorSize - 1)).rounded())))
-                vectorBins[vy * vectorSize + vx] = min(UInt16.max, vectorBins[vy * vectorSize + vx] &+ 1)
+                if wantsHistogram {
+                    histogram.red[r] += 1; histogram.green[g] += 1; histogram.blue[b] += 1
+                }
+                var vx = 0, vy = 0, cr = 0.0, cb = 0.0, rf = 0.0, gf = 0.0, bf = 0.0, luma = 0.0
+                if wantsVectorscope {
+                    (rf, gf, bf) = (Double(r) / 255, Double(g) / 255, Double(b) / 255)
+                    luma = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf
+                    cb = (bf - luma) / (2 * (1 - 0.0722))
+                    cr = (rf - luma) / (2 * (1 - 0.2126))
+                    vx = min(vectorSize - 1, max(0, Int(((cb + 0.5) * Double(vectorSize - 1)).rounded())))
+                    vy = min(vectorSize - 1, max(0, Int(((0.5 - cr) * Double(vectorSize - 1)).rounded())))
+                    let bin = vy * vectorSize + vx
+                    if vectorBins[bin] < UInt16.max { vectorBins[bin] += 1 }
+                }
                 // Skin estimate follows the studio vectorscope's hue analysis,
                 // limited to a broad chroma envelope. It is not a semantic mask.
-                let point = CGPoint(x: Double(x) / Double(surface.width), y: 1 - Double(y) / Double(surface.height))
-                let withinFace = faceBoxes.contains { $0.insetBy(dx: -0.025, dy: -0.025).contains(point) }
-                let looksLikeSkin = withinFace && luma > 0.08 && cr > 0.025 && cr < 0.28 && cb > -0.18 && cb < 0.12
-                    && rf > gf && gf > bf * 0.72
-                if looksLikeSkin {
-                    skinSamples += 1
-                    let angle = atan2(cr, cb) * 180 / .pi
-                    let delta = wrappedDegrees(angle - 123)
-                    skinAngles += delta
-                    if abs(delta) <= 12 { onTarget += 1 }
-                    else if delta < 0 { tooMagenta += 1 }
-                    else { tooGreen += 1 }
-                    skinBins[vy * vectorSize + vx] = min(UInt16.max, skinBins[vy * vectorSize + vx] &+ 1)
+                if wantsSkin {
+                    let point = CGPoint(x: Double(x) / Double(surface.width), y: 1 - Double(y) / Double(surface.height))
+                    let withinFace = faceBoxes.contains { $0.contains(point) }
+                    let looksLikeSkin = withinFace && luma > 0.08 && cr > 0.025 && cr < 0.28 && cb > -0.18 && cb < 0.12
+                        && rf > gf && gf > bf * 0.72
+                    if looksLikeSkin {
+                        skinSamples += 1
+                        let angle = atan2(cr, cb) * 180 / .pi
+                        let delta = wrappedDegrees(angle - 123)
+                        skinAngles += delta
+                        if abs(delta) <= 12 { onTarget += 1 }
+                        else if delta < 0 { tooMagenta += 1 }
+                        else { tooGreen += 1 }
+                        let bin = vy * vectorSize + vx
+                        if skinBins[bin] < UInt16.max { skinBins[bin] += 1 }
+                    }
                 }
+                guard wantsWaveform else { continue }
                 let shownColumn: Int
                 switch turn {
                 case 1: shownColumn = rows - 1 - row
@@ -253,8 +282,9 @@ struct ImageScopes: Equatable, Sendable {
             tooMagentaPercent: skinSamples > 0 ? 100 * Double(tooMagenta) / Double(skinSamples) : 0,
             tooGreenPercent: skinSamples > 0 ? 100 * Double(tooGreen) / Double(skinSamples) : 0)
         return ImageScopes(histogram: histogram,
-            waveform: Waveform(width: waveWidth, red: red, green: green, blue: blue),
-            vectorscope: Vectorscope(size: vectorSize, bins: vectorBins, skinBins: skinBins), skinAnalysis: analysis)
+            waveform: wantsWaveform ? Waveform(width: waveWidth, red: red, green: green, blue: blue) : Waveform(),
+            vectorscope: wantsVectorscope ? Vectorscope(size: vectorSize, bins: vectorBins, skinBins: skinBins) : Vectorscope(),
+            skinAnalysis: wantsSkin ? analysis : SkinAnalysis())
     }
 }
 
@@ -325,7 +355,7 @@ struct HistogramView: View {
             }
         }
         .padding(.horizontal, 4).padding(.top, 6)
-        .background(Color(white: 0.075), in: RoundedRectangle(cornerRadius: 6))
+        .background(Theme.bg, in: RoundedRectangle(cornerRadius: 3))
         .accessibilityElement()
         .accessibilityLabel("Histogram")
         .accessibilityValue(histogram == nil ? "No developed photograph" : "Red, green, and blue tones of the developed photograph")
@@ -339,17 +369,17 @@ struct WaveformView: View {
         HStack(spacing: 4) {
             VStack {
                 ForEach([100, 75, 50, 25, 0], id: \.self) { level in
-                    Text("\(level)").font(.system(size: 9, design: .monospaced)).foregroundStyle(Color.white.opacity(0.6))
+                    Text("\(level)").font(.system(size: 9, design: .monospaced)).foregroundStyle(Theme.dim)
                     if level != 0 { Spacer(minLength: 0) }
                 }
             }
             .frame(width: 22)
             Canvas { context, size in
-                scopeGrid(context: &context, size: size)
+                let labelHeight: CGFloat = 13
+                let plot = CGRect(x: 0, y: labelHeight, width: size.width,
+                                  height: max(0, size.height - labelHeight))
                 if let image = waveform?.image {
-                    let labelHeight: CGFloat = 13
-                    context.draw(Image(decorative: image, scale: 1), in: CGRect(x: 0, y: labelHeight,
-                                  width: size.width, height: max(0, size.height - labelHeight)))
+                    context.draw(Image(decorative: image, scale: 1), in: plot)
                     for (index, label) in ["R", "G", "B"].enumerated() {
                         let tint: Color = [Color(red: 1, green: 0.36, blue: 0.34),
                                            Color(red: 0.38, green: 0.9, blue: 0.48),
@@ -358,17 +388,26 @@ struct WaveformView: View {
                         context.draw(Text(label).font(.system(size: 9, weight: .bold, design: .monospaced))
                             .foregroundColor(tint.opacity(0.86)), at: CGPoint(x: center, y: 7))
                     }
-                    var separators = Path()
-                    for fraction in [1.0 / 3, 2.0 / 3] {
-                        separators.move(to: CGPoint(x: size.width * fraction, y: 0))
-                        separators.addLine(to: CGPoint(x: size.width * fraction, y: size.height))
-                    }
-                    context.stroke(separators, with: .color(.white.opacity(0.12)), lineWidth: 0.7)
                 }
+                // Draw the graticule over the density image so the levels
+                // remain readable at a glance without overpowering the trace.
+                var grid = Path()
+                for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                    let y = plot.minY + plot.height * fraction
+                    grid.move(to: CGPoint(x: 0, y: y))
+                    grid.addLine(to: CGPoint(x: size.width, y: y))
+                }
+                context.stroke(grid, with: .color(.white.opacity(0.12)), lineWidth: 0.6)
+                var separators = Path()
+                for fraction in [1.0 / 3, 2.0 / 3] {
+                    separators.move(to: CGPoint(x: size.width * fraction, y: plot.minY))
+                    separators.addLine(to: CGPoint(x: size.width * fraction, y: plot.maxY))
+                }
+                context.stroke(separators, with: .color(.white.opacity(0.16)), lineWidth: 0.7)
             }
         }
         .padding(6)
-        .background(Color(white: 0.075), in: RoundedRectangle(cornerRadius: 6))
+        .background(Theme.bg, in: RoundedRectangle(cornerRadius: 3))
         .accessibilityElement()
         .accessibilityLabel("RGB waveform")
         .accessibilityValue(waveform == nil ? "No developed photograph" : "Red, green, and blue signal levels from zero to one hundred percent across the developed photograph")
@@ -381,10 +420,10 @@ private func scopeGrid(context: inout GraphicsContext, size: CGSize) {
         grid.move(to: CGPoint(x: 0, y: size.height * fraction))
         grid.addLine(to: CGPoint(x: size.width, y: size.height * fraction))
     }
-    context.stroke(grid, with: .color(.white.opacity(0.09)), lineWidth: 0.5)
+    context.stroke(grid, with: .color(Theme.line), lineWidth: 0.5)
 }
 
-enum ScopeMode: String, CaseIterable {
+enum ScopeMode: String, CaseIterable, Sendable {
     case histogram = "Histogram", waveform = "Waveform", vectorscope = "Vectorscope", skin = "Skin Analysis"
 
     var symbol: String {
@@ -410,6 +449,8 @@ struct ScopePanelView: View {
     let waveform: Waveform?
     let vectorscope: Vectorscope?
     let skinAnalysis: SkinAnalysis?
+    var isUpdating = false
+    var setScopeMode: (ScopeMode) -> Void = { _ in }
     var clippingEnabled = false
     var setClippingEnabled: (Bool) -> Void = { _ in }
     var falseColorEnabled = false
@@ -429,25 +470,29 @@ struct ScopePanelView: View {
     var body: some View {
         VStack(spacing: StudioStyle.Space.compact) {
             scopeToolbar
-            if falseColorEnabled {
-                FalseColorLegend().padding(.horizontal, 3)
-            }
             Group {
-                switch mode {
-                case .histogram: HistogramView(histogram: histogram)
-                case .waveform: WaveformView(waveform: waveform)
-                case .vectorscope: VectorscopeView(vectorscope: vectorscope, skinOnly: false)
-                case .skin: VectorscopeView(vectorscope: vectorscope, skinOnly: true, skinAnalysis: skinAnalysis)
+                VStack(spacing: StudioStyle.Space.compact) {
+                    if falseColorEnabled { FalseColorLegend().padding(.horizontal, 3) }
+                    switch mode {
+                    case .histogram: HistogramView(histogram: histogram)
+                    case .waveform: WaveformView(waveform: waveform)
+                    case .vectorscope: VectorscopeView(vectorscope: vectorscope, skinOnly: false)
+                    case .skin: VectorscopeView(vectorscope: vectorscope, skinOnly: true, skinAnalysis: skinAnalysis)
+                    }
                 }
             }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Scope view")
             .frame(height: Self.clamped(dragHeight ?? height))
             .overlay {
                 if histogram == nil {
-                    Text("No developed photograph").font(.caption).foregroundStyle(Color.white.opacity(0.6))
+                    Text("No developed photograph").font(Theme.text(13, italic: true)).foregroundStyle(Theme.dim)
                 }
             }
             resizeHandle
         }
+        .onAppear { setScopeMode(mode) }
+        .onChange(of: mode) { _, value in setScopeMode(value) }
     }
 
     private var scopeToolbar: some View {
@@ -468,6 +513,9 @@ struct ScopePanelView: View {
                 .fixedSize()
                 .controlSize(.small)
                 .accessibilityLabel("Scope view")
+                if isUpdating {
+                    ProgressView().controlSize(.mini).help("Updating scope for the current preview")
+                }
                 Button {
                     setClippingEnabled(!clippingEnabled)
                 } label: {
@@ -506,7 +554,7 @@ struct ScopePanelView: View {
 
     /// A grabber under the scope: drag to resize, double-click for the default height.
     private var resizeHandle: some View {
-        Capsule().fill(.tertiary).frame(width: 32, height: 4)
+        Capsule().fill(Theme.track).frame(width: 32, height: 3)
             .frame(maxWidth: .infinity, minHeight: 8)
             .contentShape(Rectangle())
             .onHover { inside in if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() } }
@@ -570,7 +618,9 @@ private struct VectorscopeView: View {
                 let side = min(size.width, size.height)
                 let origin = CGPoint(x: (size.width - side) / 2, y: (size.height - side) / 2)
                 let center = CGPoint(x: origin.x + side / 2, y: origin.y + side / 2)
-                let radius = side * 0.39
+                // Use more of the scope well so the actual signal is easy to
+                // read at the compact inspector size.
+                let radius = side * 0.435
                 let plot = CGRect(x: center.x - radius, y: center.y - radius,
                                   width: radius * 2, height: radius * 2)
                 context.fill(Path(ellipseIn: plot), with: .color(StudioStyle.plot))
@@ -582,7 +632,7 @@ private struct VectorscopeView: View {
                 for fraction in [0.25, 0.5, 0.75, 1.0] {
                     let rect = CGRect(x: center.x - radius * fraction, y: center.y - radius * fraction,
                                       width: radius * fraction * 2, height: radius * fraction * 2)
-                    let opacity = fraction == 1 ? 0.58 : fraction == 0.75 ? 0.30 : 0.17
+                    let opacity = fraction == 1 ? 0.48 : fraction == 0.75 ? 0.34 : 0.14
                     context.stroke(Path(ellipseIn: rect), with: .color(.primary.opacity(opacity)),
                                    lineWidth: fraction == 1 ? 0.9 : 0.65)
                 }
@@ -633,9 +683,13 @@ private struct VectorscopeView: View {
                         let ny = Double(y) / Double(vectorscope.size - 1) * 2 - 1
                         guard nx * nx + ny * ny <= 1.05 else { continue }
                         let point = CGPoint(x: center.x + nx * radius, y: center.y + ny * radius)
-                        let dot = max(1.8, side / CGFloat(vectorscope.size) * 1.15)
+                        // Fine, softly weighted points preserve sparse chroma
+                        // detail without filling the whole gamut cloud into a
+                        // hard-edged, opaque blob.
+                        let dot = max(1.35, side / CGFloat(vectorscope.size) * 0.92)
                         let rect = CGRect(x: point.x - dot / 2, y: point.y - dot / 2, width: dot, height: dot)
-                        let strength = min(0.94, 0.32 + log1p(Double(count)) / log1p(peak) * 0.62)
+                        let density = log1p(Double(count)) / log1p(peak)
+                        let strength = min(0.62, 0.055 + pow(density, 0.72) * 0.48)
                         let angle = atan2(-ny, nx) * 180 / .pi
                         let tint = skinOnly
                             ? Color(hue: 0.105, saturation: 0.82, brightness: 1)

@@ -37,6 +37,12 @@ pub struct PrepParams {
     pub color_boost: f32,
     pub saturation: f32,
     pub midtone_detail: f32,
+    /// Darktable-style shadow/highlight colour-board points as [hue degrees, strength percent].
+    pub color_correction_shadows: [f32; 2],
+    pub color_correction_highlights: [f32; 2],
+    /// Global chroma offset wheel as [hue degrees, strength percent].
+    pub color_correction_offset: [f32; 2],
+    pub color_correction_saturation: f32,
 }
 
 /// [`PrepParams`] as read, before validation.
@@ -53,6 +59,10 @@ struct UncheckedPrepParams {
     color_boost: f32,
     saturation: f32,
     midtone_detail: f32,
+    color_correction_shadows: [f32; 2],
+    color_correction_highlights: [f32; 2],
+    color_correction_offset: [f32; 2],
+    color_correction_saturation: f32,
 }
 
 impl TryFrom<UncheckedPrepParams> for PrepParams {
@@ -69,6 +79,10 @@ impl TryFrom<UncheckedPrepParams> for PrepParams {
             color_boost: p.color_boost,
             saturation: p.saturation,
             midtone_detail: p.midtone_detail,
+            color_correction_shadows: p.color_correction_shadows,
+            color_correction_highlights: p.color_correction_highlights,
+            color_correction_offset: p.color_correction_offset,
+            color_correction_saturation: p.color_correction_saturation,
         };
         params.validate()?;
         Ok(params)
@@ -115,6 +129,29 @@ impl PrepParams {
                 ));
             }
         }
+        for (name, point) in [
+            ("color_correction_shadows", self.color_correction_shadows),
+            (
+                "color_correction_highlights",
+                self.color_correction_highlights,
+            ),
+            ("color_correction_offset", self.color_correction_offset),
+        ] {
+            if !point[0].is_finite()
+                || !(0.0..=360.0).contains(&point[0])
+                || !point[1].is_finite()
+                || !(0.0..=100.0).contains(&point[1])
+            {
+                return Err(format!(
+                    "Invalid Prep {name}; expected hue 0–360 and strength 0–100"
+                ));
+            }
+        }
+        if !self.color_correction_saturation.is_finite()
+            || !(-100.0..=100.0).contains(&self.color_correction_saturation)
+        {
+            return Err("Invalid Prep color_correction_saturation; expected a finite value from -100 to 100".into());
+        }
         Ok(())
     }
 }
@@ -128,7 +165,7 @@ pub struct PreparedKey {
     input_color_space: String,
     autoexposure_ev: u64,
     exposure_compensation_ev: u32,
-    prep: [u32; 10],
+    prep: [u32; 17],
 }
 
 impl PreparedKey {
@@ -155,6 +192,13 @@ impl PreparedKey {
                 p.color_boost,
                 p.saturation,
                 p.midtone_detail,
+                p.color_correction_shadows[0],
+                p.color_correction_shadows[1],
+                p.color_correction_highlights[0],
+                p.color_correction_highlights[1],
+                p.color_correction_offset[0],
+                p.color_correction_offset[1],
+                p.color_correction_saturation,
             ]
             .map(f32::to_bits),
         }
@@ -211,6 +255,10 @@ struct Settings {
     gain: f32,
     contrast: f32,
     detail: f32,
+    color_correction_shadows: [f32; 2],
+    color_correction_highlights: [f32; 2],
+    color_correction_offset: [f32; 2],
+    color_correction_saturation: f32,
 }
 impl From<&PrepParams> for Settings {
     fn from(p: &PrepParams) -> Self {
@@ -224,6 +272,10 @@ impl From<&PrepParams> for Settings {
             gain: p.gain,
             contrast: p.contrast,
             detail: p.midtone_detail,
+            color_correction_shadows: p.color_correction_shadows,
+            color_correction_highlights: p.color_correction_highlights,
+            color_correction_offset: p.color_correction_offset,
+            color_correction_saturation: p.color_correction_saturation,
         }
     }
 }
@@ -322,8 +374,20 @@ fn core(
 ) -> [f32; 3] {
     let p = rgb.map(|x| x * 0.5);
     let mut y = luma(p);
-    let a = p[0] * 0.5 - p[1] * 0.25 - p[2] * 0.25;
-    let b = p[1] * 0.433012701892219 - p[2] * 0.433012701892219;
+    let mut a = p[0] * 0.5 - p[1] * 0.25 - p[2] * 0.25;
+    let mut b = p[1] * 0.433012701892219 - p[2] * 0.433012701892219;
+    // The global wheel is an input-side color correction: apply it after
+    // camera white balance and exposure, before tone controls and the film
+    // scan. This keeps its behavior consistent with a WB-stage adjustment.
+    if s.color_correction_offset[1] != 0.0 {
+        let angle = s.color_correction_offset[0].to_radians();
+        // Quadratic response leaves small values precise near neutral while
+        // preserving the full correction range at 100%.
+        let normalized_strength = s.color_correction_offset[1] / 100.0;
+        let offset = 0.18 * normalized_strength * normalized_strength;
+        a += offset * angle.cos();
+        b += offset * angle.sin();
+    }
     let mut c = (a * a + b * b).sqrt();
     let mut hue = b.atan2(a) / (2. * std::f32::consts::PI);
     if hue < 0. {
@@ -357,11 +421,22 @@ fn core(
     if weight != 0. {
         c = (c + c.powf(0.4) * weight * 0.25).max(0.);
     }
-    c = (c * (1. + s.saturation / 100.)).max(0.);
+    c = (c * (1. + s.saturation / 100.) * (1. + s.color_correction_saturation / 100.)).max(0.);
+    let shadows_weight = 1. - smoothstep(0.05, 0.62, y);
+    let highlights_weight = smoothstep(0.38, 0.95, y);
+    let shadow_angle = s.color_correction_shadows[0].to_radians();
+    let highlight_angle = s.color_correction_highlights[0].to_radians();
+    let color_scale = 0.18 / 100.;
+    let a = c * (hue * 2. * std::f32::consts::PI).cos()
+        + color_scale
+            * (s.color_correction_shadows[1] * shadows_weight * shadow_angle.cos()
+                + s.color_correction_highlights[1] * highlights_weight * highlight_angle.cos());
+    let b = c * (hue * 2. * std::f32::consts::PI).sin()
+        + color_scale
+            * (s.color_correction_shadows[1] * shadows_weight * shadow_angle.sin()
+                + s.color_correction_highlights[1] * highlights_weight * highlight_angle.sin());
     let mut out = [y; 3];
-    if c > 0. {
-        let a = c * (hue * 2. * std::f32::consts::PI).cos();
-        let b = c * (hue * 2. * std::f32::consts::PI).sin();
+    if c > 0. || a != 0. || b != 0. {
         out = [
             y + a * 4. / 3.,
             y - a * 2. / 3. + b * 1.154700538379252,
@@ -373,6 +448,12 @@ fn core(
         }
     }
     out.map(|v| ((2. * v - 0.5) * contrast + 0.5) * affine.0 + affine.1)
+}
+
+#[inline]
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// Apply Prep to linear pixels in `input_color_space`, returning to that same
@@ -559,6 +640,10 @@ mod tests {
                 gain: p[5],
                 contrast: p[6],
                 detail: p[7],
+                color_correction_shadows: [0.0; 2],
+                color_correction_highlights: [0.0; 2],
+                color_correction_offset: [0.0; 2],
+                color_correction_saturation: 0.0,
             };
             let lut = tone_lut(s.highlights, s.shadows);
             let actual = core(
