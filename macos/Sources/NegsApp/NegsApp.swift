@@ -409,27 +409,55 @@ struct CanvasArea: View {
             }
         }
         .overlay {
-            if model.comparisonMode == .wipe, model.comparisonOriginal != nil {
+            if (model.comparisonMode == .wipe && model.comparisonOriginal != nil)
+                || model.comparisonMode == .versionWipe {
                 GeometryReader { proxy in
                     let y = Self.captionBand
                     let height = max(proxy.size.height - Self.captionBand - Self.labelBand, 1)
                     let print = shownPrint ?? CGRect(x: 0, y: y, width: proxy.size.width, height: height)
                     ZStack {
-                        Rectangle().fill(.white.opacity(0.9)).frame(width: 2, height: height)
-                            .position(x: print.minX + print.width * model.wipePosition, y: y + height / 2)
+                        if wipeComparisonImage != nil {
+                            Capsule().fill(.black.opacity(0.38)).frame(width: 28, height: height)
+                                .overlay(Rectangle().fill(.white.opacity(0.95)).frame(width: 2, height: height - 12))
+                                .position(x: print.minX + print.width * model.wipePosition, y: y + height / 2)
+                                .contentShape(Rectangle())
+                                .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("wipeCanvas"))
+                                    .onChanged { value in
+                                        model.wipePosition = min(max((value.location.x - print.minX) / max(print.width, 1), 0.02), 0.98)
+                                    })
+                        } else {
+                            Text("Save Version 1 and Version 2 to compare them")
+                                .font(.system(size: 13, weight: .medium, design: .monospaced))
+                                .padding(10).background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 7))
+                                .position(x: proxy.size.width / 2, y: y + height / 2)
+                        }
                         HStack {
-                            Text("BEFORE").padding(.leading, 12)
+                            Text(model.comparisonMode == .versionWipe ? "VERSION 1" : "BEFORE").padding(.leading, 12)
                             Spacer()
-                            Text("CURRENT").padding(.trailing, 12)
+                            Text(model.comparisonMode == .versionWipe ? "VERSION 2" : "CURRENT").padding(.trailing, 12)
                         }
                         .font(.system(size: 10, weight: .semibold, design: .rounded))
                         .foregroundStyle(.white).shadow(color: .black.opacity(0.7), radius: 3)
                         .frame(height: 24).position(x: proxy.size.width / 2, y: y + 16)
+                        HStack(spacing: 5) {
+                            Button { model.canvasScale.zoom(by: 0.8) } label: { Image(systemName: "minus.magnifyingglass") }
+                                .help("Zoom out")
+                            Button { model.zoom(fit: true) } label: { Text("Fit") }
+                                .help("Fit the full photograph in the preview")
+                            Button { model.canvasScale.zoom(by: 1.25) } label: { Image(systemName: "plus.magnifyingglass") }
+                                .help("Zoom in")
+                            Divider().frame(height: 16)
+                            Button("Exit Wipe") { model.comparisonMode = .off }
+                                .help("Return to the edited photograph")
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .padding(.horizontal, 9).padding(.vertical, 6)
+                        .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 7))
+                        .foregroundStyle(.white)
+                        .position(x: proxy.size.width - 100, y: y + 16)
                     }
-                    .contentShape(Rectangle())
-                    .gesture(DragGesture(minimumDistance: 0).onChanged { value in
-                        model.wipePosition = min(max((value.location.x - print.minX) / max(print.width, 1), 0.02), 0.98)
-                    })
+                    .coordinateSpace(name: "wipeCanvas")
                 }
             }
         }
@@ -549,12 +577,21 @@ struct CanvasArea: View {
     }
 
     private func canvas(_ image: AnyObject, size: CGSize, rotation: Int) -> some View {
-        PreviewCanvas(image: image, size: size, rotation: rotation, crop: model.crop, border: previewBorder(for: model.crop.size(of: size)), filmTexture: model.filmTexture,
-                      filmStrip: model.filmStrip, diagnosticOverlay: model.original == nil ? model.diagnosticOverlay : nil,
-                      comparisonImage: model.comparisonMode == .wipe ? model.comparisonOriginal : nil, wipeFraction: model.wipePosition,
+        let wipeBase: AnyObject = model.comparisonMode == .versionWipe ? (model.versionImages[1] ?? image) : image
+        return PreviewCanvas(image: wipeBase, size: size, rotation: rotation, crop: model.crop, border: previewBorder(for: model.crop.size(of: size)), filmTexture: model.filmTexture,
+                      filmStrip: model.filmStrip, diagnosticOverlay: model.comparisonMode == .off && model.original == nil ? model.diagnosticOverlay : nil,
+                      comparisonImage: wipeComparisonImage, wipeFraction: model.wipePosition,
                       zoomCommand: model.zoomCommand, fit: model.fitImage, scale: model.canvasScale, geometry: geometry,
                       upsideDown: model.upsideDown, settled: model.original != nil || model.showsSettledFrame,
                       doubleClick: { [model] in model.doubleClickPhotograph(zoomed: $0) })
+    }
+
+    private var wipeComparisonImage: AnyObject? {
+        switch model.comparisonMode {
+        case .wipe: model.comparisonOriginal
+        case .versionWipe: model.versionImages[2]
+        case .off, .threeUp: nil
+        }
     }
 
     @ViewBuilder private var comparePanels: some View {

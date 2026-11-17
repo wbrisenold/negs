@@ -86,6 +86,12 @@ struct ImageScopes: Equatable, Sendable {
     var vectorscope = Vectorscope()
     var skinAnalysis = SkinAnalysis()
 
+    /// BT.709 luma from the developed display-referred 8-bit RGB values.
+    /// Keep the viewer diagnostics on the same signal and rounding rule.
+    private static func displayLuma(red: UInt8, green: UInt8, blue: UInt8) -> UInt8 {
+        UInt8((54 * Int(red) + 183 * Int(green) + 19 * Int(blue)) >> 8)
+    }
+
     /// Transparent false-colour mask for clipped highlights (red) and
     /// crushed shadows (blue). Highlights include either clipped luma or an
     /// individually clipped RGB channel, so saturated colour clipping is
@@ -111,7 +117,10 @@ struct ImageScopes: Equatable, Sendable {
                 let src = sy * rowBytes + sx * surface.bytesPerElement
                 let r = source[src + 2], g = source[src + 1], b = source[src]
                 let offset = (y * width + x) * 4
-                let y = (0.299 * Double(r) + 0.587 * Double(g) + 0.114 * Double(b)) / 255
+                // Match false colour's luma exactly. The red indicator still
+                // means actual output clipping; false colour starts its top
+                // highlight band earlier, at 96 IRE.
+                let y = Double(displayLuma(red: r, green: g, blue: b)) / 255
                 let channelClipped = Double(max(r, max(g, b))) / 255 >= high
                 if y <= low {
                     rgba[offset] = 12; rgba[offset + 1] = 34; rgba[offset + 2] = 230; rgba[offset + 3] = 230
@@ -149,7 +158,7 @@ struct ImageScopes: Equatable, Sendable {
                 let sx = min(sourceWidth - 1, Int((Double(x) + 0.5) * Double(sourceWidth) / Double(width)))
                 let src = sy * rowBytes + sx * surface.bytesPerElement
                 // IOSurface preview pixels are BGRA; luma weights are RGB.
-                let luma = (19 * Int(source[src]) + 183 * Int(source[src + 1]) + 54 * Int(source[src + 2])) >> 8
+                let luma = Int(displayLuma(red: source[src + 2], green: source[src + 1], blue: source[src]))
                 let color: (UInt8, UInt8, UInt8)
                 switch luma {
                 case ..<13: color = (14, 8, 52)       // 0–5 IRE: near-black

@@ -712,7 +712,6 @@ extension AdjustmentInspector {
 struct PaneHeader: View {
     let model: EditorModel
     @AppStorage("negs.reset.keepGroups") private var resetKeepGroups = ""
-    @AppStorage("negs.reset.savedAt") private var resetDefaultsSavedAt = 0.0
     @State private var showingResetOptions = false
 
     var body: some View {
@@ -727,6 +726,7 @@ struct PaneHeader: View {
                 WordButton(title: "Import…", help: "Import presets (⇧⌘O)", action: model.importPresetsPanel)
                     .disabled(!model.canChangePresets)
             } else if model.source != nil {
+                let hasResetBaseline = model.globalResetSavedAt != nil
                 let edits = InspectorTab.allCases.map { InspectorEdits.count($0, model) }.reduce(0, +)
                 if edits > 0 {
                     (Text("\(edits)").font(Theme.text(14, weight: 700, italic: true)).foregroundColor(Theme.paper)
@@ -734,7 +734,7 @@ struct PaneHeader: View {
                         .accessibilityLabel("\(edits) \(edits == 1 ? "edit" : "edits")")
                 }
                 WordButton(title: "Reset",
-                           help: resetKeepGroups.isEmpty || resetDefaultsSavedAt == 0
+                           help: !hasResetBaseline
                                 ? "Restore defaults on all tabs while keeping the film, paper, rotation, crop, border, and Image Size. You can undo this."
                                 : "Apply your saved global reset defaults and restore the rest. You can undo this.",
                            action: model.reset)
@@ -767,11 +767,10 @@ struct PaneHeader: View {
                             Divider().padding(.vertical, 2)
                             Button("Save Current Values as Global Default") {
                                 model.saveGlobalResetDefaults()
-                                resetDefaultsSavedAt = Date().timeIntervalSince1970
                             }
                             .disabled(resetKeepGroups.isEmpty || model.source == nil)
                             .buttonStyle(.borderedProminent)
-                            if resetDefaultsSavedAt > 0 {
+                            if model.globalResetSavedAt != nil {
                                 Text("Global reset preset saved")
                                     .font(Theme.ui(10)).foregroundStyle(Theme.dim)
                             }
@@ -926,6 +925,7 @@ struct AdjustmentInspector: View {
     @AppStorage("expandedAdjustments") private var expanded = "Enlarger"
     @AppStorage("inspectorTab") private var tab = InspectorTab.prep
     @AppStorage("negs.whiteBalance.linkTemperatureTint") private var linkTemperatureTint = false
+    @AppStorage("negs.whiteBalance.fineTuneExpanded") private var fineTuneWhiteBalance = false
     /// View › Show All Controls: every control, as the Lab's Advanced
     /// controls switch did. Off, each module shows the few most photographs
     /// need, plus any setting that is off its default.
@@ -1001,7 +1001,7 @@ struct AdjustmentInspector: View {
                 ],
                           selection: selectedWhiteBalance,
                           changed: model.isModified("io.raw_white_balance.mode"),
-                          help: "As Shot is the recorded camera balance. D50–D93 are standard daylight targets; Custom accepts any Kelvin and tint.") { option in
+                          help: "As Shot uses the recorded camera balance. Named daylight targets set Kelvin and neutral tint for the selected adaptation method; Custom accepts any Kelvin and tint.") { option in
                     switch option {
                     case "as_shot", "tungsten": model.setWhiteBalanceMode(option)
                     case "d50": model.setWhiteBalancePreset(5003)
@@ -1013,45 +1013,6 @@ struct AdjustmentInspector: View {
                     default: model.setWhiteBalanceMode("custom")
                     }
                 }
-                if whiteBalanceMode == "custom" {
-                    RevealedRows {
-                        TickRow(title: "Link tint to temperature", isOn: $linkTemperatureTint, changed: false,
-                                help: "When enabled, warming also shifts tint toward green; cooling shifts tint toward magenta.")
-                        let defaultTemperature = model.defaultValue("io.raw_white_balance.temperature").double
-                        LabeledSlider(title: "Temperature", value: model.whiteBalanceTemperature(linkTint: linkTemperatureTint),
-                                      range: 1667...25000, step: 1, unit: " K", defaultValue: model.defaultValue("io.raw_white_balance.temperature").double,
-                                      modified: model.isModified("io.raw_white_balance.temperature"),
-                                      reset: { model.setWhiteBalanceTemperature(model.defaultValue("io.raw_white_balance.temperature").double,
-                                                                               linkTint: linkTemperatureTint) },
-                                      editing: { $0 ? model.beginInteraction() : model.endInteraction() },
-                                      help: "Lower Kelvin settings cool the image; higher settings warm it. Click the readout to type an exact Kelvin value.",
-                                      endLabels: ("Cooler", "Warmer"),
-                                      trackValue: model.whiteBalanceTemperaturePosition(linkTint: linkTemperatureTint),
-                                      trackRange: -100...100, trackStep: 1,
-                                      trackNeutral: model.whiteBalanceTemperaturePosition(defaultTemperature),
-                                      trackDefault: model.whiteBalanceTemperaturePosition(defaultTemperature))
-                        LabeledSlider(title: "Tint", value: model.whiteBalanceTintAmount(),
-                                      range: -100...100, step: 0.1, defaultValue: 0,
-                                      modified: model.isModified("io.raw_white_balance.tint"),
-                                      reset: { model.set("io.raw_white_balance.tint", .number(model.defaultValue("io.raw_white_balance.tint").double)) },
-                                      editing: { $0 ? model.beginInteraction() : model.endInteraction() },
-                                      help: "Zero is neutral. Drag left to counter a green cast with magenta, or right to counter a magenta cast with green. Click the readout to type the correction.",
-                                      endLabels: ("Magenta", "Green"),
-                                      trackNeutral: 0, trackDefault: 0)
-                        ChoiceRow(title: "Method", items: [
-                            .option("CAT02", tag: "cat02"),
-                            .option("XYZ Scaling", tag: "xyz_scaling")
-                        ], selection: model.value("io.raw_white_balance.method").string.isEmpty ? "cat02" : model.value("io.raw_white_balance.method").string,
-                                  changed: model.isModified("io.raw_white_balance.method"),
-                                  help: "Choose how the source white is adapted to neutral. CAT02 adapts in cone-response space; XYZ Scaling directly scales CIE X, Y and Z.") {
-                            model.set("io.raw_white_balance.method", .string($0))
-                        }
-                        HintText(model.value("io.raw_white_balance.method").string == "xyz_scaling"
-                                 ? "XYZ Scaling · direct channel adaptation."
-                                 : "CAT02 · chromatic adaptation. Tint: magenta ← 0 → green.")
-                    }
-                }
-                ColorCorrectionWheel(model: model)
             }
         }
         InkSection(title: "Light", edited: InspectorEdits.brightnessCount(model) > 0) {
@@ -1081,6 +1042,7 @@ struct AdjustmentInspector: View {
             }
         }
         controlSection("Tone", prepToneControls)
+        if model.isRaw { whiteBalanceFineTune }
         InkSection(title: "Color", edited: [
             "prep.color_correction_offset", "prep.color_correction_saturation"
         ].contains(where: model.isModified) || prepColorControls.contains { InspectorEdits.isModified($0, model) }) {
@@ -1111,6 +1073,55 @@ struct AdjustmentInspector: View {
         } else {
             inputColour
         }
+    }
+
+    @ViewBuilder private var whiteBalanceFineTune: some View {
+        let whiteBalanceMode = model.value("io.raw_white_balance.mode").string
+        DisclosureGroup("WB + CAT adaptation", isExpanded: $fineTuneWhiteBalance) {
+            VStack(alignment: .leading, spacing: 7) {
+                if whiteBalanceMode == "custom" {
+                    let defaultTemperature = model.defaultValue("io.raw_white_balance.temperature").double
+                    LabeledSlider(title: "Temperature", value: model.whiteBalanceTemperature(linkTint: linkTemperatureTint),
+                                  range: 1667...25000, step: 1, unit: " K", defaultValue: defaultTemperature,
+                                  modified: model.isModified("io.raw_white_balance.temperature"),
+                                  reset: { model.resetValue("io.raw_white_balance.temperature") },
+                                  editing: { $0 ? model.beginInteraction() : model.endInteraction() },
+                                  help: "Lower Kelvin settings cool the image; higher settings warm it. Click the readout to type an exact Kelvin value.",
+                                  endLabels: ("Cooler", "Warmer"),
+                                  trackValue: model.whiteBalanceTemperaturePosition(linkTint: linkTemperatureTint),
+                                  trackRange: -100...100, trackStep: 1,
+                                  trackNeutral: model.whiteBalanceTemperaturePosition(defaultTemperature),
+                                  trackDefault: model.whiteBalanceTemperaturePosition(defaultTemperature))
+                    LabeledSlider(title: "Tint", value: model.whiteBalanceTintAmount(),
+                                  range: -100...100, step: 0.1, defaultValue: 0,
+                                  modified: model.isModified("io.raw_white_balance.tint"),
+                                  reset: { model.set("io.raw_white_balance.tint", .number(model.defaultValue("io.raw_white_balance.tint").double)) },
+                                  editing: { $0 ? model.beginInteraction() : model.endInteraction() },
+                                  help: "Zero is neutral. Drag left toward magenta or right toward green. Click the readout to type a correction.",
+                                  endLabels: ("Magenta", "Green"), trackNeutral: 0, trackDefault: 0)
+                    TickRow(title: "Link tint to temperature", isOn: $linkTemperatureTint, changed: false,
+                            help: "When enabled, warming shifts tint toward green; cooling shifts it toward magenta.")
+                } else {
+                    HintText("Choose Custom above to adjust temperature and tint.")
+                }
+                ChoiceRow(title: "Adaptation", items: [
+                    .option("CAT02", tag: "cat02"),
+                    .option("XYZ Scaling", tag: "xyz_scaling")
+                ], selection: model.value("io.raw_white_balance.method").string.isEmpty ? "cat02" : model.value("io.raw_white_balance.method").string,
+                          changed: model.isModified("io.raw_white_balance.method"),
+                          help: "Choose how the source white is adapted to neutral. CAT02 adapts in cone-response space; XYZ Scaling directly scales CIE X, Y and Z.") {
+                    model.set("io.raw_white_balance.method", .string($0))
+                }
+                HintText(model.value("io.raw_white_balance.method").string == "xyz_scaling"
+                         ? "XYZ Scaling · direct channel adaptation."
+                         : "CAT02 · adapts the selected illuminant white to D65. Tint is applied separately; magenta ← 0 → green.")
+                ColorCorrectionWheel(model: model)
+            }
+            .padding(.top, 4)
+        }
+        .font(Theme.ui(11, weight: .medium))
+        .padding(.horizontal, Theme.Size.gutter)
+        .padding(.top, 4)
     }
 
     private func controlSection(_ title: String, _ controls: [Adjustment]) -> some View {

@@ -14,7 +14,7 @@ enum EditorWorkspace {
 }
 
 /// Adjustment families that can come from the global reset preset.
-enum ResetKeepGroup: String, CaseIterable, Identifiable {
+enum ResetKeepGroup: String, CaseIterable, Identifiable, Codable {
     case exposure = "Exposure & Tone"
     case whiteBalance = "White Balance"
     case color = "Color"
@@ -49,13 +49,68 @@ enum ResetKeepGroup: String, CaseIterable, Identifiable {
     }
 }
 
+/// The saved global reset is one atomic baseline: its selected groups and the
+/// values they preserve can never drift apart.
+private struct GlobalResetBaseline: Codable {
+    var groups: Set<ResetKeepGroup>
+    var params: JSONValue
+    var film: String
+    var paper: String
+    var previewSpace: String
+    var crop: CropSettings
+    var border: BorderSettings
+    var savedAt: Date
+
+    static let key = "negs.reset.baseline.v1"
+
+    static func load() -> GlobalResetBaseline? {
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: key),
+           let baseline = try? JSONDecoder().decode(Self.self, from: data) {
+            return baseline
+        }
+        // Migrate the earlier split keys once; the versioned blob becomes the
+        // only active source of truth after this read.
+        guard let paramData = defaults.data(forKey: "negs.reset.savedParams"),
+              let params = try? JSONDecoder().decode(JSONValue.self, from: paramData) else { return nil }
+        let groups = Set((defaults.string(forKey: "negs.reset.keepGroups") ?? "")
+            .split(separator: "|").compactMap { ResetKeepGroup(rawValue: String($0)) })
+        guard !groups.isEmpty else { return nil }
+        let decoder = JSONDecoder()
+        let baseline = GlobalResetBaseline(
+            groups: groups, params: params,
+            film: defaults.string(forKey: "negs.reset.savedFilm") ?? "",
+            paper: defaults.string(forKey: "negs.reset.savedPaper") ?? "",
+            previewSpace: SaveSettings.colorSpaces[SaveSettings.chosenSpace],
+            crop: defaults.data(forKey: "negs.reset.savedCrop").flatMap { try? decoder.decode(CropSettings.self, from: $0) } ?? CropSettings(),
+            border: defaults.data(forKey: "negs.reset.savedBorder").flatMap { try? decoder.decode(BorderSettings.self, from: $0) } ?? BorderSettings(),
+            savedAt: Date(timeIntervalSince1970: defaults.double(forKey: "negs.reset.savedAt")))
+        baseline.persist()
+        return baseline
+    }
+
+    func persist() {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        UserDefaults.standard.set(data, forKey: Self.key)
+    }
+
+    func value(for path: String, fallback: JSONValue) -> JSONValue {
+        groups.contains(where: { $0.keeps(path) }) ? params[path] : fallback
+    }
+}
+
 /// Observation tracks each property separately, so a finished render only
 /// updates the canvas and status bar, and an edit doesn't redraw the canvas.
 enum PreviewCompareMode: String, CaseIterable, Identifiable {
-    case off, wipe, threeUp
+    case off, wipe, versionWipe, threeUp
     var id: String { rawValue }
     var title: String {
-        switch self { case .off: "Edit preview"; case .wipe: "Before / Current wipe"; case .threeUp: "Before / Version 1 / Version 2" }
+        switch self {
+        case .off: "Edit preview"
+        case .wipe: "Before / Current wipe"
+        case .versionWipe: "Version 1 / Version 2 wipe"
+        case .threeUp: "Before / Version 1 / Version 2"
+        }
     }
 }
 
@@ -349,6 +404,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     var recentFiles: [URL] = []
     @ObservationIgnored weak var undoManager: UndoManager?
     @ObservationIgnored private var defaults: JSONValue = .object([:])
+    private var resetBaseline = GlobalResetBaseline.load()
     @ObservationIgnored private var catalog: JSONValue = .null
     @ObservationIgnored private var catalogRequest: Task<(Int, JSONValue), Error>?
     @ObservationIgnored private var engine: EngineClient?
@@ -785,9 +841,12 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         }
         updateFilmStrip()
     }
-    func defaultValue(_ path: String) -> JSONValue { defaults[path] }
+    var globalResetSavedAt: Date? { resetBaseline?.savedAt }
+    func defaultValue(_ path: String) -> JSONValue {
+        resetBaseline?.value(for: path, fallback: defaults[path]) ?? defaults[path]
+    }
     func isModified(_ path: String) -> Bool {
-        let (current, original) = (value(path), defaults[path])
+        let (current, original) = (value(path), defaultValue(path))
         if case .number(let a) = current, case .number(let b) = original {
             // Rust defaults arrive as widened f32 values; slider edits are decimal.
             return abs(a - b) > 1e-6 * max(1, abs(b))
@@ -815,9 +874,13 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         var next = state
         next.params["io.raw_white_balance.mode"] = .string("custom")
         next.params["io.raw_white_balance.temperature"] = .number(Self.snap(temperature, to: 1667...25000, step: 1))
+        // A named illuminant lies on the daylight/Planckian locus. Start with
+        // neutral tint so the selected target maps through the chosen CAT
+        // (CAT02 by default), instead of carrying a prior custom green/magenta cast.
+        next.params["io.raw_white_balance.tint"] = .number(1)
         apply(next, action: "Set RAW White Balance Preset")
     }
-    func resetValue(_ path: String) { set(path, defaults[path]) }
+    func resetValue(_ path: String) { set(path, defaultValue(path)) }
     func number(_ path: String, range: ClosedRange<Double>, step: Double) -> Binding<Double> {
         Binding(get: { self.value(path).double }, set: { self.set(path, .number(Self.snap($0, to: range, step: step))) })
     }
@@ -879,7 +942,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         next.params["io.raw_white_balance.mode"] = .string("custom")
         next.params["io.raw_white_balance.temperature"] = .number(Self.snap(temperature, to: 1667...25000, step: 1))
         next.params["io.raw_white_balance.tint"] = .number(Self.snap(whiteBalanceTintValue(for: tintAmount), to: 0.01...4, step: 0.001))
-        next.params["prep.color_correction_offset"] = defaults["prep.color_correction_offset"]
+        next.params["prep.color_correction_offset"] = defaultValue("prep.color_correction_offset")
         apply(next, action: "Color Correction White Balance")
     }
     /// Applies direct, normalized RAW white-balance pad coordinates.
@@ -893,18 +956,18 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         next.params["io.raw_white_balance.mode"] = .string("custom")
         next.params["io.raw_white_balance.temperature"] = .number(Self.snap(temperature, to: 1667...25000, step: 1))
         next.params["io.raw_white_balance.tint"] = .number(Self.snap(whiteBalanceTintValue(for: tintAmount), to: 0.01...4, step: 0.001))
-        next.params["prep.color_correction_offset"] = defaults["prep.color_correction_offset"]
+        next.params["prep.color_correction_offset"] = defaultValue("prep.color_correction_offset")
         apply(next, action: "Color Correction White Balance")
     }
     func resetColorCorrection() {
         var next = state
         for path in ["prep.color_correction_offset", "prep.color_correction_saturation"] {
-            next.params[path] = defaults[path]
+            next.params[path] = defaultValue(path)
         }
         if isRaw {
             for path in ["io.raw_white_balance.mode", "io.raw_white_balance.temperature",
                          "io.raw_white_balance.tint", "io.raw_white_balance.method"] {
-                next.params[path] = defaults[path]
+                next.params[path] = defaultValue(path)
             }
         }
         apply(next, action: "Reset Color Correction")
@@ -986,7 +1049,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     func resetFilterShift(_ path: String) {
         guard filterLink != .separate else { return resetValue(path) }
         var next = state
-        for shift in [FilterLink.magenta, FilterLink.yellow] { next.params[shift] = defaults[shift] }
+        for shift in [FilterLink.magenta, FilterLink.yellow] { next.params[shift] = defaultValue(shift) }
         apply(next, action: "Change Adjustment")
     }
     /// A double-click on a shift's track. Its first click moved the shift to
@@ -1004,6 +1067,13 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     var filmIsBW: Bool { films.first { $0.id == film }?.bw ?? false }
     func stockDefaults(_ path: String) -> [Double] {
         let field = path.split(separator: ".").last.map(String.init) ?? path
+        if let baseline = resetBaseline, baseline.groups.contains(.filmPrint) {
+            let saved = baseline.params[path].array.map(\.double)
+            if !saved.isEmpty { return saved }
+            if case .null = baseline.params[path] {
+                return films.first { $0.id == baseline.film }?.grain[field].array.map(\.double) ?? []
+            }
+        }
         return films.first { $0.id == film }?.grain[field].array.map(\.double) ?? []
     }
     func stockDefault(_ path: String, _ index: Int) -> Double {
@@ -1225,10 +1295,9 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     func reset() {
         guard !cropping else { return }
         var next = state; next.params = defaults
-        let keepGroups = Set((UserDefaults.standard.string(forKey: "negs.reset.keepGroups") ?? "")
-            .split(separator: "|").compactMap { ResetKeepGroup(rawValue: String($0)) })
-        let savedParams = UserDefaults.standard.data(forKey: "negs.reset.savedParams")
-            .flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) }
+        let baseline = resetBaseline
+        let keepGroups = baseline?.groups ?? []
+        let savedParams = baseline?.params
         func restore(_ value: JSONValue, path: String) {
             if case .object(let fields) = value {
                 for (key, child) in fields {
@@ -1239,18 +1308,10 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
             }
         }
         if let savedParams { restore(savedParams, path: "") }
-        if keepGroups.contains(.filmStock), let savedFilm = UserDefaults.standard.string(forKey: "negs.reset.savedFilm") {
-            next.film = savedFilm
-        }
-        if keepGroups.contains(.paperStock), let savedPaper = UserDefaults.standard.string(forKey: "negs.reset.savedPaper") {
-            next.paper = savedPaper
-        }
+        if keepGroups.contains(.filmStock), let baseline { next.film = baseline.film }
+        if keepGroups.contains(.paperStock), let baseline { next.paper = baseline.paper }
         if keepGroups.contains(.output) {
-            let decoder = JSONDecoder()
-            if let data = UserDefaults.standard.data(forKey: "negs.reset.savedCrop"),
-               let savedCrop = try? decoder.decode(CropSettings.self, from: data) { next.crop = savedCrop }
-            if let data = UserDefaults.standard.data(forKey: "negs.reset.savedBorder"),
-               let savedBorder = try? decoder.decode(BorderSettings.self, from: data) { next.border = savedBorder }
+            if let baseline { next.crop = baseline.crop; next.border = baseline.border }
         }
         next.brightnessMatch = autoPlaceNewImages ? BrightnessMatch() : nil
         if keepGroups.contains(.exposure), let savedParams,
@@ -1262,22 +1323,19 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         next.params["io.scan_film"] = .bool(films.first(where: { $0.id == next.film })?.positive ?? false)
         customFilmFormat = false
         apply(next, action: "Reset Adjustments")
+        if keepGroups.contains(.output), let baseline { choosePreviewSpace(baseline.previewSpace) }
     }
     /// Captures the selected adjustment families as a global baseline used by
     /// Reset on every photograph. Values are a small JSON parameter snapshot.
     func saveGlobalResetDefaults() {
         let groups = Set((UserDefaults.standard.string(forKey: "negs.reset.keepGroups") ?? "")
             .split(separator: "|").compactMap { ResetKeepGroup(rawValue: String($0)) })
-        guard !groups.isEmpty, let data = try? JSONEncoder().encode(state.params) else { return }
-        UserDefaults.standard.set(data, forKey: "negs.reset.savedParams")
-        UserDefaults.standard.set(state.film, forKey: "negs.reset.savedFilm")
-        UserDefaults.standard.set(state.paper, forKey: "negs.reset.savedPaper")
-        if groups.contains(.output) {
-            let encoder = JSONEncoder()
-            if let data = try? encoder.encode(state.crop) { UserDefaults.standard.set(data, forKey: "negs.reset.savedCrop") }
-            if let data = try? encoder.encode(state.border) { UserDefaults.standard.set(data, forKey: "negs.reset.savedBorder") }
-        }
-        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "negs.reset.savedAt")
+        guard !groups.isEmpty else { return }
+        let baseline = GlobalResetBaseline(groups: groups, params: state.params, film: state.film, paper: state.paper,
+                                           previewSpace: previewSpace,
+                                           crop: state.crop, border: state.border, savedAt: Date())
+        baseline.persist()
+        resetBaseline = baseline
     }
     /// Puts the controls `targets` name back to their defaults, in one undo
     /// step (the ↺ on a tab's list of edits, and Reset on the tab).
@@ -1285,12 +1343,12 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         guard !cropping, !targets.isEmpty else { return }
         var next = state
         var lanes: [String: [Int]] = [:]
-        var space = false
+        var spaceToRestore: String?
         // Exposure first: turning matching on after it sets Exposure to 0.
         if targets.contains(.exposure) { next.params["prep.exposure_ev"] = .number(matchedEV) }
         for target in targets {
             switch target {
-            case .param(let path): next.params[path] = defaults[path]
+            case .param(let path): next.params[path] = defaultValue(path)
             case .stock(let path, let index): lanes[path, default: []].append(index)
             case .exposure: break
             case .matchBrightness:
@@ -1300,11 +1358,20 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
                 } else {
                     next.brightnessMatch = nil
                 }
-            case .scanFilm: next.params["io.scan_film"] = .bool(films.first(where: { $0.id == next.film })?.positive ?? false)
-            case .previewSpace: space = true
-            case .border: next.border = BorderSettings()
+            case .scanFilm:
+                let stock = resetBaseline.flatMap { $0.groups.contains(.filmStock) ? $0.film : nil } ?? next.film
+                next.params["io.scan_film"] = .bool(films.first(where: { $0.id == stock })?.positive ?? false)
+            case .previewSpace:
+                spaceToRestore = resetBaseline?.groups.contains(.output) == true
+                    ? resetBaseline?.previewSpace : SaveSettings.colorSpaces[0]
+            case .border:
+                if let baseline = resetBaseline, baseline.groups.contains(.output) {
+                    next.border = baseline.border
+                } else {
+                    next.border = BorderSettings()
+                }
             case .filmFormat:
-                next.params[FilmFormatPicker.path] = defaults[FilmFormatPicker.path]
+                next.params[FilmFormatPicker.path] = defaultValue(FilmFormatPicker.path)
                 customFilmFormat = false
             }
         }
@@ -1316,7 +1383,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
             next.params[path] = atPreset ? .null : .array(values.map(JSONValue.number))
         }
         apply(next, action: action)
-        if space { choosePreviewSpace(SaveSettings.colorSpaces[0]) }
+        if let spaceToRestore { choosePreviewSpace(spaceToRestore) }
     }
     /// Reset on one tab: every control the tab's count stands for.
     func resetEdits(tab: InspectorTab) {
@@ -1931,7 +1998,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         // fresh bounded proxy for each saved edit.
         versionImages[slot] = nil
         persistVersions()
-        if comparisonMode == .threeUp { renderVersionPreviews() }
+        if comparisonMode == .threeUp || comparisonMode == .versionWipe { renderVersionPreviews() }
     }
 
     func applyVersion(_ slot: Int) {
@@ -1947,11 +2014,12 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
             comparisonOriginal = nil
             if originalLoad == nil { loadOriginal() }
         }
-        if comparisonMode == .threeUp { renderVersionPreviews() }
+        if comparisonMode == .threeUp || comparisonMode == .versionWipe { renderVersionPreviews() }
     }
 
     private func renderVersionPreviews() {
-        guard comparisonMode == .threeUp, versionPreviewTask == nil, let source, let engine else { return }
+        guard comparisonMode == .threeUp || comparisonMode == .versionWipe,
+              versionPreviewTask == nil, let source, let engine else { return }
         let missing = savedVersions.filter { versionImages[$0.slot] == nil }
         guard !missing.isEmpty else { return }
         let generation = sourceGeneration, space = previewSpace
@@ -1960,7 +2028,8 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
             defer { if !Task.isCancelled { self.versionPreviewTask = nil } }
             for version in missing {
                 guard !Task.isCancelled, !self.closing, generation == self.sourceGeneration,
-                      self.comparisonMode == .threeUp, space == self.previewSpace else { return }
+                      (self.comparisonMode == .threeUp || self.comparisonMode == .versionWipe),
+                      space == self.previewSpace else { return }
                 let buffer = engine.directory.appendingPathComponent("compare-\(UUID().uuidString).rgba")
                 defer { try? FileManager.default.removeItem(at: buffer) }
                 var state = version.state
@@ -1982,7 +2051,8 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
                                              displaySpace: result["display_color_space"].string)
                     }.value
                     guard !Task.isCancelled, !self.closing, generation == self.sourceGeneration,
-                          self.comparisonMode == .threeUp, space == self.previewSpace,
+                          (self.comparisonMode == .threeUp || self.comparisonMode == .versionWipe),
+                          space == self.previewSpace,
                           self.savedVersions.contains(version) else { return }
                     self.versionImages[version.slot] = preview
                 } catch {
@@ -2528,8 +2598,9 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         }
     }
 
-    func copyEdits(from item: URL? = nil, groups: Set<EditGroup> = EditGroup.standard) {
+    func copyEdits(from item: URL? = nil, groups: Set<EditGroup>? = nil) {
         guard canChangeEdits, let item = item ?? copySource else { return }
+        let groups = groups ?? copyGroups
         guard let (edits, edited) = userEdits(of: item) else {
             libraryNote = LibraryNote(text: "Edits Not Copied", detail: "Its .negs file can’t be read", serial: (libraryNote?.serial ?? 0) + 1)
             return

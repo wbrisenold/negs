@@ -91,6 +91,7 @@ struct PreviewCanvas: NSViewRepresentable {
         guard let view, let window = view.window, view.magnification > 0 else { return nil }
         return view.magnification * window.backingScaleFactor
     }
+    func zoom(by factor: CGFloat) { view?.zoom(by: factor) }
 }
 
 final class CenteringClipView: NSClipView {
@@ -147,6 +148,14 @@ final class ImageScrollView: NSScrollView {
         let size = documentView.frame.size
         let amount = Self.magnification(fitting: fitting, document: size, viewport: fitViewport, backingScale: window?.backingScaleFactor ?? 2)
         setMagnification(min(max(amount, minMagnification), maxMagnification), centeredAt: NSPoint(x: size.width / 2, y: size.height / 2))
+        reportGeometry()
+        photograph?.refreshSharp()
+    }
+    func zoom(by factor: CGFloat) {
+        guard factor.isFinite, factor > 0, documentView != nil else { return }
+        fitting = false
+        let center = CGPoint(x: contentView.bounds.midX, y: contentView.bounds.midY)
+        setMagnification(min(max(magnification * factor, minMagnification), maxMagnification), centeredAt: center)
         reportGeometry()
         photograph?.refreshSharp()
     }
