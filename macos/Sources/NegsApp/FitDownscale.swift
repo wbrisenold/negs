@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreImage
 import CoreVideo
 import Foundation
 import IOSurface
@@ -72,8 +73,8 @@ final class FitResampler: @unchecked Sendable {
         return (device, queue, MPSImageLanczosScale(device: device))
     }
 
-    /// `source` resampled to `width` × `height`, tagged with its colour space,
-    /// or nil if the GPU can't. Calls `done` on the main queue.
+/// `source` resampled to `width` × `height`, tagged with its colour space,
+/// or nil if the accelerated and Core Image paths both fail. Calls `done` on the main queue.
     func resample(_ source: IOSurface, width: Int, height: Int, done: @escaping @MainActor @Sendable (IOSurface?) -> Void) {
         queue.async { [self] in
             let result = resampleNow(source, width: width, height: height)
@@ -82,19 +83,26 @@ final class FitResampler: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    /// Core Image provides a high-quality fallback on Intel Macs, where MPS
+    /// image kernels are not available. Its context selects the platform's
+    /// available renderer and can be reused safely across resamples.
+    private lazy var fallbackContext = CIContext(options: [.cacheIntermediates: false])
 
     /// Synchronous, on the caller's thread; for tests and measurements.
     func resampleNow(_ source: IOSurface, width: Int, height: Int) -> IOSurface? {
         lock.lock(); defer { lock.unlock() }
         if pipeline == nil { pipeline = .some(makePipeline()) }
-        guard let made = pipeline, let (device, commands, lanczos) = made,
-              width > 0, height > 0, FitDownscale.canResample(source),
+        guard width > 0, height > 0, FitDownscale.canResample(source),
               let tag = IOSurfaceCopyValue(source, kIOSurfaceColorSpace),
+              let colorSpace = CGColorSpace(propertyListPlist: tag as CFPropertyList),
               let target = IOSurface(properties: [
                   .width: width, .height: height, .bytesPerElement: 4,
                   .bytesPerRow: IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, width * 4),
                   .pixelFormat: kCVPixelFormatType_32BGRA
               ]) else { return nil }
+        guard let made = pipeline, let (device, commands, lanczos) = made else {
+            return resampleWithCoreImage(source, target: target, width: width, height: height, colorSpace: colorSpace, tag: tag)
+        }
         // sRGB formats: the GPU decodes reads to linear light and encodes writes.
         let input = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm_srgb, width: source.width, height: source.height, mipmapped: false)
         input.usage = .shaderRead
@@ -112,6 +120,21 @@ final class FitResampler: @unchecked Sendable {
         buffer.waitUntilCompleted()
         guard buffer.status == .completed else { return nil }
         IOSurfaceSetValue(target, kIOSurfaceColorSpace, tag)
+        return target
+    }
+
+    private func resampleWithCoreImage(_ source: IOSurface, target: IOSurface, width: Int, height: Int,
+                                       colorSpace: CGColorSpace, tag: AnyObject) -> IOSurface? {
+        let input = CIImage(ioSurface: source, options: [.colorSpace: colorSpace])
+        guard let filter = CIFilter(name: "CILanczosScaleTransform") else { return nil }
+        let scale = CGFloat(width) / CGFloat(source.width)
+        let yScale = CGFloat(height) / CGFloat(source.height)
+        filter.setValue(input, forKey: kCIInputImageKey)
+        filter.setValue(scale, forKey: kCIInputScaleKey)
+        filter.setValue(yScale / scale, forKey: "inputAspectRatio")
+        guard let output = filter.outputImage?.cropped(to: CGRect(x: 0, y: 0, width: width, height: height)) else { return nil }
+        fallbackContext.render(output, to: target, bounds: CGRect(x: 0, y: 0, width: width, height: height), colorSpace: colorSpace)
+        IOSurfaceSetValue(target, kIOSurfaceColorSpace, tag as CFPropertyList)
         return target
     }
 }

@@ -224,6 +224,56 @@ struct StockGroup: Identifiable {
 
 extension Stock {
     var isMotionPicturePrint: Bool { paper && (name.contains("Vision") || name.contains("Print Film")) }
+
+    /// Short, photography-focused hover help for stock pickers and preview tiles.
+    /// Specific notes are limited to well-documented stocks; the category
+    /// fallback stays useful for profiles without manufacturer descriptions.
+    var guidance: String {
+        let known: [String: String] = [
+            "kodak_portra_160": "A fine-grained color-negative profile with natural skin tones and smooth color. Commonly used for portraits, weddings, and detailed people photography.",
+            "kodak_portra_400": "A versatile color-negative profile known for natural skin tones and smooth color. Commonly used for portraits, weddings, and mixed-light assignments.",
+            "kodak_portra_800": "A faster color-negative profile with Portra-style natural color. Useful for portraits and events when light is limited or subjects are moving.",
+            "kodak_ektar_100": "A fine-grained, sharply rendered color-negative profile with vivid, saturated color. Often used for landscapes, travel, fashion, products, and outdoor work.",
+            "kodak_gold_200": "A warm, lively everyday color-negative profile. A familiar choice for daylight snapshots, family photos, and travel.",
+            "fujifilm_c200": "A balanced everyday color-negative profile. Commonly used for family, travel, and daylight photography.",
+            "fujifilm_pro_160ns": "A fine-grained professional color-negative profile with restrained, natural color. Often used for portraits, weddings, and studio work.",
+            "fujifilm_pro_400h": "A soft, fine-grained color-negative profile with gentle color and skin tones. Often chosen for portraits and weddings.",
+            "fujifilm_astia_100f": "A color-slide profile with softer contrast and more restrained color than vivid slide stocks. Often used for portraits and fashion.",
+            "fujifilm_provia_100f": "A fine-grained color-slide profile with balanced, clean color. A versatile choice for travel, nature, editorial, and product photography.",
+            "fujifilm_velvia_50": "A fine-grained color-slide profile with very vivid, saturated color. Often used for landscapes, nature, fashion, and products when bold color is wanted.",
+            "fujifilm_velvia_100": "A vivid, saturated color-slide profile with fine detail. Often used for landscapes, nature, and travel photography.",
+            "kodak_ektachrome_100": "A fine-grained daylight color-slide profile with clean, vibrant color. Often used for landscapes, nature, fashion, and products.",
+            "ilford_hp5_plus": "A fast, flexible black-and-white negative profile. Commonly used for available-light, documentary, travel, action, and everyday photography.",
+            "ilford_delta_3200": "A very high-speed black-and-white profile for dim conditions. Useful for concerts, interiors, night scenes, and available-light portraits.",
+            "ilford_fp4_plus": "A fine-grained, moderate-speed black-and-white profile for detailed tonal rendering. Often used for portraits, still life, and landscapes.",
+            "kodak_tri_x_400": "A classic, fast black-and-white negative profile with pronounced texture. Often used for street, documentary, and available-light photography.",
+            "cinestill_800t": "A high-speed, tungsten-balanced color-negative profile. Often used for night scenes, interiors, and mixed artificial lighting.",
+            "cinestill_400d": "A daylight-balanced color-negative profile with broad everyday flexibility. Useful for portraits, events, and outdoor scenes.",
+            "kodak_portra_endura": "A professional color-print paper profile designed for color-negative prints. Commonly used for portraits, weddings, and exhibition prints.",
+            "fujifilm_crystal_archive_typeii": "A color photographic-paper profile for finishing color-negative images. A general-purpose choice for portraits, events, and everyday prints.",
+            "ilford_mgrc_deluxe_grade2": "A grade 2 black-and-white enlarging-paper profile for silver-gelatin-style monochrome prints with moderate contrast.",
+        ]
+        if let text = known[id] { return text }
+        if paper {
+            if isMotionPicturePrint {
+                return "A motion-picture print-stock profile for making positive copies from cinema negatives. Typically used in film-printing and projection workflows."
+            }
+            if bw {
+                return "A black-and-white photographic-paper profile for monochrome prints. Typically used for darkroom-style silver prints and tonal fine-art work."
+            }
+            return "A color photographic-paper profile used to finish color-negative images. Typically chosen for portraits, events, and general color prints."
+        }
+        if isMotionPicturePrint || name.localizedCaseInsensitiveContains("Eterna") || name.localizedCaseInsensitiveContains("Vision") {
+            return "A motion-picture color-negative profile with a cinematic palette. Typically used for narrative scenes, controlled lighting, and film-style color work."
+        }
+        if positive {
+            return "A color-reversal (slide) profile that produces a direct positive with vivid color and tighter exposure latitude than negative film. Often used for landscapes, travel, and product photography."
+        }
+        if bw {
+            return "A black-and-white negative profile for monochrome images. Commonly used for documentary, street, portrait, and fine-art photography."
+        }
+        return "A color-negative profile with flexible tonal rendering. A versatile choice for portraits, everyday photography, and scenes intended for color printing."
+    }
 }
 
 /// Human-readable names for engine option identifiers.

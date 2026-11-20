@@ -192,6 +192,10 @@ private struct StockName: View {
 
     /// Its tray is open.
     private var open: Bool { model.tray?.paper == paper }
+    private var guidance: String {
+        (paper ? model.papers : model.films).first { $0.name == name }?.guidance
+            ?? "Choose a \(paper ? "paper" : "film") stock."
+    }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: PrintLabelLayout.inner + 1) {
@@ -212,7 +216,7 @@ private struct StockName: View {
                 }
                 .buttonStyle(.plain)
                 .onHover { hovered = $0 }
-                .help("Choose a \(paper ? "paper" : "film") stock")
+                .help("\(name). \(guidance)")
                 .accessibilityLabel("Choose \(paper ? "paper" : "film") stock")
                 .accessibilityValue(name)
                 .accessibilityAddTraits(.isButton)
@@ -236,7 +240,7 @@ private struct StockName: View {
         .contentShape(Rectangle())
         // Clicks on the two stock controls stay inside the tray's focus scope.
         .background(TrayHitArea(model: model))
-        .help(strike == .scanning ? "Not printed while scanning the film" : strike == .original ? "Showing the original" : name)
+        .help(strike == .scanning ? "Not printed while scanning the film" : strike == .original ? "Showing the original" : "\(name). \(guidance)")
     }
 
     private var stockName: some View {
@@ -280,11 +284,11 @@ private struct StockName: View {
         var items: [ChoiceItem] = []
         if !favorites.isEmpty {
             items.append(.header("Favourites"))
-            items += favorites.map { .option($0.name, tag: StockMenu.favoriteID($0.id)) }
+            items += favorites.map { .stock($0.name, tag: StockMenu.favoriteID($0.id), help: $0.guidance) }
         }
         for group in groups {
             items.append(.header(group.title))
-            items += group.stocks.map { .option($0.name, tag: $0.id) }
+            items += group.stocks.map { .stock($0.name, tag: $0.id, help: $0.guidance) }
         }
         popUpChoiceMenu(items, selected: paper ? model.paper : model.film, under: anchor.view) { tag in
             let id = StockMenu.stockID(tag: tag)

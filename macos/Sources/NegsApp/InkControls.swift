@@ -245,6 +245,8 @@ struct TickRow: View {
 /// One item of a choice's menu.
 enum ChoiceItem: Hashable {
     case option(String, tag: String)
+    /// A stock choice with hover help describing its character and common use.
+    case stock(String, tag: String, help: String)
     /// A section title in the menu.
     case header(String)
     case divider
@@ -268,11 +270,12 @@ struct AnchorView: NSViewRepresentable {
 /// A menu item that runs a closure.
 final class ClosureMenuItem: NSMenuItem {
     private let handler: () -> Void
-    init(_ title: String, checked: Bool = false, handler: @escaping () -> Void) {
+    init(_ title: String, checked: Bool = false, toolTip: String? = nil, handler: @escaping () -> Void) {
         self.handler = handler
         super.init(title: title, action: #selector(fire), keyEquivalent: "")
         target = self
         state = checked ? .on : .off
+        self.toolTip = toolTip
     }
     required init(coder: NSCoder) { fatalError() }
     @objc private func fire() { handler() }
@@ -287,6 +290,7 @@ final class ClosureMenuItem: NSMenuItem {
     for item in items {
         switch item {
         case .option(let title, let tag): menu.addItem(ClosureMenuItem(title, checked: tag == selected) { choose(tag) })
+        case .stock(let title, let tag, let help): menu.addItem(ClosureMenuItem(title, checked: tag == selected, toolTip: help) { choose(tag) })
         case .header(let title):
             if #available(macOS 14, *) { menu.addItem(.sectionHeader(title: title)) }
         case .divider: menu.addItem(.separator())
@@ -308,7 +312,13 @@ struct ChoiceRow: View {
     @State private var anchor = MenuAnchor()
 
     private var current: String {
-        for case .option(let title, let tag) in items where tag == selection { return title }
+        for item in items {
+            switch item {
+            case .option(let title, let tag) where tag == selection: return title
+            case .stock(let title, let tag, _) where tag == selection: return title
+            default: continue
+            }
+        }
         return selection
     }
 

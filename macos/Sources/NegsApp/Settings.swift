@@ -296,7 +296,7 @@ struct SettingsView: View {
 
     /// A stock menu's items, one section per group.
     static func items(_ groups: [StockGroup]) -> [ChoiceItem] {
-        groups.flatMap { group in [ChoiceItem.header(group.title)] + group.stocks.map { .option($0.name, tag: $0.id) } }
+        groups.flatMap { group in [ChoiceItem.header(group.title)] + group.stocks.map { .stock($0.name, tag: $0.id, help: $0.guidance) } }
     }
 }
 

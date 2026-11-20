@@ -418,7 +418,7 @@ private struct TrayTile: View {
         }
         .buttonStyle(.plain)
         .focusable(false)
-        .help(stock.name)
+        .help("\(stock.name). \(stock.guidance)")
         .accessibilityLabel(stock.name)
         .accessibilityValue(selected ? (before ? "" : "Trying") : before ? "Before" : "")
         .accessibilityAddTraits(selected ? .isSelected : [])
