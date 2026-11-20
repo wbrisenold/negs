@@ -167,7 +167,7 @@ async match lifecycle.
 - Add Match camera brightness / Match original brightness and the new-photo
   setting. `prep.exposure_ev` holds total exposure; the slider displays the
   user offset above the solved value. Reset resets the offset. Follow upstream
-  ±3 EV clamping, highlight-limit note and failure/retry behavior.
+  ±6 EV clamping, highlight-limit note and failure/retry behavior.
 - Port the exact match-dependency exclusions from current `state::match_inputs`
   / `EditorModel.matchInputs`: user Prep edits, print exposure, Post, grain,
   crop/rotation, output colour/encoding and serial grain do not initiate a new

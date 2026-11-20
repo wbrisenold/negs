@@ -493,7 +493,7 @@ lifecycle_test! {
 lifecycle_test! {
     /// A failed match shows the held frame and its note: for the photograph
     /// (a transparent PNG can't be matched) and for the look (one that would
-    /// need more than ±3 EV).
+    /// need more than ±6 EV).
     fn a_failed_match_shows_the_held_frame_and_its_note() {
         let Some(mut h) = Harness::start(harness::prefs(true)) else { return };
         // For the photograph: the match is refused once the frame is held.
@@ -518,8 +518,8 @@ lifecycle_test! {
         assert_eq!(h.renders().iter().filter(|r| r.generation == generation).count(), 1);
         assert!(h.errors.is_empty(), "a refused match is a note: {:?}", h.errors);
 
-        // For the look: with the print exposure not normalized, five stops
-        // under need more than the match's ±3 EV.
+        // For the look: with the print exposure not normalized, seven stops
+        // under need more than the match's ±6 EV.
         let photo = h.photo.clone();
         open_matched(&mut h, &photo);
         h.edit(|m| m.set("enlarger.normalize_print_exposure", serde_json::json!(false)));
@@ -527,14 +527,14 @@ lifecycle_test! {
         assert!(!h.model().brightness_match_pending() && h.model().preview_current);
         let previous = h.model().shown_frame;
         h.clear_logs();
-        h.edit(|m| m.set("camera.exposure_compensation_ev", serde_json::json!(-5.0)));
+        h.edit(|m| m.set("camera.exposure_compensation_ev", serde_json::json!(-7.0)));
         let edited = h.model().revision;
         let held = until_held(&mut h);
         assert_eq!(h.model().shown_frame, previous);
         h.idle();
         let m = h.model();
         let note = m.brightness_match_note();
-        assert_eq!(note.as_deref(), Some("Matching would take more than ±3 EV."));
+        assert_eq!(note.as_deref(), Some("Matching would take more than ±6 EV."));
         assert!(m.brightness_match_unavailable().is_none() && !m.brightness_match_active(), "a failure for this look, not the photograph");
         assert!(m.preview_current && m.held_frame().is_none() && m.revision == edited);
         assert_eq!(h.frames, [held]);

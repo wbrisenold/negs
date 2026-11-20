@@ -173,7 +173,7 @@ enum CameraBrightnessReference {
         if reason.contains("midtone quantiles") {
             return ("The camera preview is too dark or too bright to match.", true)
         }
-        if reason.contains("±3 EV") { return ("Matching would take more than ±3 EV.", false) }
+        if reason.contains("±6 EV") { return ("Matching would take more than ±6 EV.", false) }
         return ("No reliable brightness match with these settings.", false)
     }
 

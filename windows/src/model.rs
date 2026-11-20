@@ -2842,7 +2842,7 @@ impl Model {
         if self.brightness_match_active() { self.state.brightness_match.as_ref().and_then(|m| m.ev).unwrap_or(0.0) } else { 0.0 }
     }
 
-    /// The Exposure slider's range: the engine's total stays within ±3 EV.
+    /// The Exposure slider's range: the engine's total stays within ±6 EV.
     pub fn exposure_offset_range(&self) -> (f64, f64) {
         let matched = self.matched_ev();
         (state::PREP_EXPOSURE_RANGE.0 - matched, state::PREP_EXPOSURE_RANGE.1 - matched)
@@ -3679,7 +3679,7 @@ mod tests {
         assert!(!model.brightness_match_pending() && !model.exposure_offset_modified());
         assert_eq!(model.brightness_match_note().as_deref(), Some("Starts at +0.80 EV to match the camera."));
         let (low, high) = model.exposure_offset_range();
-        assert!((low + 3.8).abs() < 1e-9 && (high - 2.2).abs() < 1e-9, "The total stays within ±3 EV");
+        assert!((low + 6.8).abs() < 1e-9 && (high - 5.2).abs() < 1e-9, "The total stays within ±6 EV");
         // Prep and the print exposure are the user's: they never re-solve.
         model.set("prep.shadows", json!(20));
         model.set("enlarger.print_exposure", json!(1.2));
@@ -3754,8 +3754,8 @@ mod tests {
         model.set_matches_brightness(true);
         let inputs = state::match_inputs(&model.state);
         let generation = model.source_generation;
-        model.brightness_solved(model.match_request.load(std::sync::atomic::Ordering::Relaxed), generation, inputs, Err(anyhow!("Camera brightness requires exposure outside the supported ±3 EV range")));
-        assert_eq!(model.brightness_match_note().as_deref(), Some("Matching would take more than ±3 EV."));
+        model.brightness_solved(model.match_request.load(std::sync::atomic::Ordering::Relaxed), generation, inputs, Err(anyhow!("Camera brightness requires exposure outside the supported ±6 EV range")));
+        assert_eq!(model.brightness_match_note().as_deref(), Some("Matching would take more than ±6 EV."));
         assert!(!model.brightness_match_pending());
         model.choose_paper("crystal");
         assert!(model.brightness_match_pending(), "The next edit tries again");

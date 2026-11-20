@@ -107,8 +107,8 @@ impl PrepParams {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if !self.exposure_ev.is_finite() || !(-3.0..=3.0).contains(&self.exposure_ev) {
-            return Err("Invalid Prep exposure_ev; expected a finite value from -3 to 3".into());
+        if !self.exposure_ev.is_finite() || !(-6.0..=6.0).contains(&self.exposure_ev) {
+            return Err("Invalid Prep exposure_ev; expected a finite value from -6 to 6".into());
         }
         if !self.global_tone.is_finite() || !(-100.0..=100.0).contains(&self.global_tone) {
             return Err("Invalid Prep global_tone; expected a finite value from -100 to 100".into());
@@ -554,7 +554,7 @@ mod tests {
         let ok: PrepParams = serde_json::from_str(r#"{"highlights": -180}"#).unwrap();
         assert_eq!(ok.highlights, -180.0);
         assert!(serde_json::from_str::<PrepParams>(r#"{"gain": 101}"#).is_err());
-        assert!(serde_json::from_str::<PrepParams>(r#"{"exposure_ev": 3.5}"#).is_err());
+        assert!(serde_json::from_str::<PrepParams>(r#"{"exposure_ev": 6.5}"#).is_err());
         assert!(
             serde_json::from_str::<crate::params::RuntimeParams>(r#"{"prep": {"lift": -101}}"#)
                 .is_err()

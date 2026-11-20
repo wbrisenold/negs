@@ -17,7 +17,7 @@ use spektrafilm_math::{
 
 pub const POLICY: &str = "negs-camera-preview-placement-v1";
 const EDGE: u32 = 256;
-const MAX_EV: f64 = 3.;
+const MAX_EV: f64 = 6.;
 const MIN_SAMPLES: usize = 128;
 const QUANTILES: [f64; 9] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
 const EXTRA_WHITE_AREA: f64 = 0.01;
@@ -206,7 +206,7 @@ async fn solve_with(target: &Distribution, trials: &mut dyn Trials) -> Result<So
         .filter(|(_, v)| **v >= inverse_srgb(0.15) && **v <= inverse_srgb(0.85))
         .map(|(i, _)| i)
         .collect();
-    // The app matches "midtone quantiles" and "±3 EV" below to word its note
+    // The app matches "midtone quantiles" and "±6 EV" below to word its note
     // (CameraBrightnessReference.failure); keep those phrases.
     if selected.len() < 3 {
         return Err(
@@ -225,7 +225,8 @@ async fn solve_with(target: &Distribution, trials: &mut dyn Trials) -> Result<So
     let budget =
         (baseline.near_white_fraction.max(target.near_white_fraction) + EXTRA_WHITE_AREA).min(1.);
     let mut points = Vec::new();
-    for i in 0..=12 {
+    let steps = (MAX_EV * 4.) as usize;
+    for i in 0..=steps {
         let ev = -MAX_EV + i as f64 * 0.5;
         let d = trials.render(ev).await?;
         points.push((ev, residual(&d)));
@@ -235,8 +236,8 @@ async fn solve_with(target: &Distribution, trials: &mut dyn Trials) -> Result<So
     if points.windows(2).any(|p| p[1].1 + 0.025 < p[0].1) {
         return Err("Selected film response is not reliably monotone for Auto exposure".into());
     }
-    if points[0].1 > 0. || points[12].1 < 0. {
-        return Err("Camera brightness requires exposure outside the supported ±3 EV range".into());
+    if points[0].1 > 0. || points[steps].1 < 0. {
+        return Err("Camera brightness requires exposure outside the supported ±6 EV range".into());
     }
     let (mut lo, mut hi) = (-MAX_EV, MAX_EV);
     for pair in points.windows(2) {

@@ -683,8 +683,8 @@ pub const PREP_COLOR: &[Adjustment] = &[
     slider("Saturation", "prep.saturation", -100.0, 100.0, 1.0),
 ];
 pub const PREP_DETAIL: &[Adjustment] = &[slider("Midtone Detail", "prep.midtone_detail", -100.0, 100.0, 1.0)];
-/// The engine keeps Prep's exposure within ±3 EV; the slider moves in 0.05 EV.
-pub const PREP_EXPOSURE_RANGE: (f64, f64) = (-3.0, 3.0);
+/// The engine keeps Prep's exposure within ±6 EV; the slider moves in 0.05 EV.
+pub const PREP_EXPOSURE_RANGE: (f64, f64) = (-6.0, 6.0);
 pub const PREP_EXPOSURE_STEP: f64 = 0.05;
 
 /// Lab › Camera › Film format (`FilmFormatPicker`): stills formats by the long

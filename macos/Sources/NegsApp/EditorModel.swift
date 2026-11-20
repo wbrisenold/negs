@@ -294,6 +294,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         !backgroundMaskLayers.isEmpty || !value("post.background_mask_png_base64").string.isEmpty
     }
     private var backgroundMaskRequest = 0
+    private var backgroundMaskSourceGeneration = -1
     @ObservationIgnored private var backgroundMaskTask: Task<Void, Never>?
     @ObservationIgnored private var backgroundMaskPainter: MaskPainter?
     /// The developed preview's frame, uncropped, which the canvas lays out:
@@ -4098,6 +4099,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
                 showingInteractiveFrame = interactiveScale != nil
                 quickFrame = quick ? frame : nil
                 image = developed.0; clippingMask = developed.1; placeholder = nil; standIn = nil
+                refreshBackgroundMaskForImageUpdate(generation)
                 if comparisonMode != .off { prepareComparison() }
                 if revision == currentRevision { trialImage = nil }
                 updateHistogram()
@@ -4238,6 +4240,30 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
             return
         }
         backgroundMaskOverlay = activeBackgroundMaskOverlay()
+    }
+    /// Mask layers are stored with each photograph, but their displayed overlay
+    /// is transient. Rebind it when a new source generation finishes rendering
+    /// so switching photos cannot leave the previous image's affected region
+    /// visible (or leave a newly restored mask hidden).
+    private func refreshBackgroundMaskForImageUpdate(_ generation: Int) {
+        guard backgroundMaskSourceGeneration != generation else {
+            if backgroundMaskEnabled, hasBackgroundMask {
+                backgroundMaskOverlay = activeBackgroundMaskOverlay()
+            }
+            return
+        }
+        backgroundMaskSourceGeneration = generation
+        backgroundMaskRequest += 1
+        backgroundMaskTask?.cancel(); backgroundMaskTask = nil
+        guard !closing, backgroundMaskEnabled else {
+            backgroundMaskOverlay = nil; backgroundMaskGenerating = false
+            return
+        }
+        if hasBackgroundMask {
+            backgroundMaskOverlay = activeBackgroundMaskOverlay()
+        } else {
+            addBackgroundMask()
+        }
     }
     private func activeBackgroundMaskOverlay() -> CGImage? {
         let layers = backgroundMaskLayers
@@ -4782,17 +4808,17 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
 
     /// The Exposure slider: the user's exposure above the match.
     private var matchedEV: Double { brightnessMatchActive ? state.brightnessMatch?.ev ?? 0 : 0 }
-    /// Keeps the engine's total within its ±3 EV.
+    /// Keeps the engine's total within its ±6 EV.
     var exposureOffsetRange: ClosedRange<Double> {
         let matched = matchedEV
-        return (-3 - matched)...(3 - matched)
+        return (-6 - matched)...(6 - matched)
     }
     var exposureOffset: Binding<Double> {
         Binding(get: { self.value("prep.exposure_ev").double - self.matchedEV }, set: { value in
             let range = self.exposureOffsetRange
             let offset = min(max((value / 0.05).rounded() * 0.05, range.lowerBound), range.upperBound)
             let total = abs(offset) < 1e-9 ? self.matchedEV : self.matchedEV + offset
-            self.set("prep.exposure_ev", .number(min(3, max(-3, total))))
+            self.set("prep.exposure_ev", .number(min(6, max(-6, total))))
         })
     }
     var exposureOffsetModified: Bool { abs(value("prep.exposure_ev").double - matchedEV) > 1e-6 }
@@ -5058,7 +5084,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         let offset = next.params["prep.exposure_ev"].double - (match.ev ?? 0)
         if match.ev.map({ abs(ev - $0) >= 0.05 }) ?? true {
             match.ev = ev
-            next.params["prep.exposure_ev"] = .number(min(3, max(-3, abs(offset) < 1e-9 ? ev : ev + offset)))
+            next.params["prep.exposure_ev"] = .number(min(6, max(-6, abs(offset) < 1e-9 ? ev : ev + offset)))
         }
         match.inputs = inputs; match.highlightLimited = limited
         next.brightnessMatch = match

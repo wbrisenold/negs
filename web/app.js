@@ -286,13 +286,13 @@ function binding(c) {
   }
   if (c.kind === "offset") {
     // Prep's Exposure: the user's exposure above the match (macOS
-    // EditorModel.exposureOffset), within the engine's ±3 EV in all.
+    // EditorModel.exposureOffset), within the engine's ±6 EV in all.
     return {
       get: () => get(c.path) - matchedEv(),
       set: (v) => {
         const m = matchedEv();
-        const offset = Math.min(Math.max(Math.round(v / c.step) * c.step, -3 - m), 3 - m);
-        set(c.path, Math.min(3, Math.max(-3, Math.abs(offset) < 1e-9 ? m : m + offset)));
+        const offset = Math.min(Math.max(Math.round(v / c.step) * c.step, -6 - m), 6 - m);
+        set(c.path, Math.min(6, Math.max(-6, Math.abs(offset) < 1e-9 ? m : m + offset)));
       },
       initial: () => 0,
       modified: () => Math.abs(get(c.path) - matchedEv()) > 1e-6,
@@ -1821,7 +1821,7 @@ function applyMatch(ev, limited, inputs) {
   const offset = get("prep.exposure_ev") - (match.ev ?? 0);
   if (match.ev === null || Math.abs(ev - match.ev) >= 0.05) {
     match.ev = ev;
-    set("prep.exposure_ev", Math.min(3, Math.max(-3, Math.abs(offset) < 1e-9 ? ev : ev + offset)));
+    set("prep.exposure_ev", Math.min(6, Math.max(-6, Math.abs(offset) < 1e-9 ? ev : ev + offset)));
   }
   match.inputs = inputs;
   match.limited = limited;
@@ -2282,7 +2282,7 @@ async function open(name, data, sampleId = null) {
     const offset = (get("prep.exposure_ev") ?? 0) - (state.match?.ev ?? 0);
     photo = { ...opened(name, bytes, size), sampleId, ...developedAs(size, wb) };
     state.match = newMatch();
-    set("prep.exposure_ev", Math.min(3, Math.max(-3, offset)));
+    set("prep.exposure_ev", Math.min(6, Math.max(-6, offset)));
     crop = Crop.defaults();
     set("io.rotate_cw", 0);
     console.log(`decoded ${name} ${size.width}×${size.height} in ${(performance.now() - t).toFixed(0)} ms`);

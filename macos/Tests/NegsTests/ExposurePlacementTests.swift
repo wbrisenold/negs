@@ -388,8 +388,8 @@ final class ExposurePlacementTests: XCTestCase {
         let cases: [(String, String, Bool)] = [
             ("Camera preview has too few usable midtone quantiles; exposure unchanged",
              "The camera preview is too dark or too bright to match.", true),
-            ("Camera brightness requires exposure outside the supported ±3 EV range",
-             "Matching would take more than ±3 EV.", false),
+            ("Camera brightness requires exposure outside the supported ±6 EV range",
+             "Matching would take more than ±6 EV.", false),
             ("Selected film response is not reliably monotone for Auto exposure",
              "No reliable brightness match with these settings.", false),
         ]

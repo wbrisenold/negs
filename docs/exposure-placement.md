@@ -6,8 +6,10 @@ This matters because print compensation can largely cancel a camera exposure
 change when judging the finished print.
 
 **Match camera brightness** uses the RAW's embedded camera preview as a
-brightness reference. It solves one absolute Prep exposure within ±3 EV
-through the selected film and paper. Repeating the action replaces that value;
+brightness reference. It solves one absolute Prep exposure within ±6 EV
+through the selected film and paper. The wider range lets layered output looks,
+including the complete Referent transform followed by HNCS, reach the camera
+preview's brightness without bypassing either look. Repeating the action replaces that value;
 it does not add exposure to the previous result. The resulting value is saved
 with the edit and used by preview, Fast export and Reference export.
 
@@ -25,7 +27,7 @@ A failed match turns the button off and says why in a line below it, as
 long as trying again couldn't change the answer: for the photograph when the
 preview is the problem (none, too small, framed differently, in a colour
 space other than sRGB or Adobe RGB, too few midtones), until the next edit when no reliable match was
-found or it would take more than ±3 EV. The engine's own reasons are mapped to
+found or it would take more than ±6 EV. The engine's own reasons are mapped to
 these short notes, never shown as they are. An automatic match fails the same
 quiet way.
 

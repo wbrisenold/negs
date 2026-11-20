@@ -84,9 +84,9 @@ import XCTest
             default: return []
             }
         }
-        // The rows built by hand. Exposure's range moves with the matched EV,
-        // within ±3, so ±6 covers it.
-        specs += [Spec(title: "Exposure (EV)", range: -6...6, step: 0.05),
+        // The rows built by hand. Exposure's offset range moves with the matched EV,
+        // within ±6, so ±12 covers the most extreme offset readout.
+        specs += [Spec(title: "Exposure (EV)", range: -12...12, step: 0.05),
                   Spec(title: "Angle", range: -CropSettings.maxAngle...CropSettings.maxAngle, step: 0.1, unit: "°"),
                   Spec(title: "Width", range: 0...15, step: 0.1, unit: "%"),
                   Spec(title: "Line width", range: 0.05...2, step: 0.05, unit: "%")]

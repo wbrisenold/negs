@@ -56,7 +56,7 @@ export const PREP_SECTIONS = [
   { title: "Brightness", tab: "Prep", controls: [
     { kind: "match", label: "Match camera brightness", tutorial: "match",
       help: "Develops the RAW about as bright as the camera’s own preview, and keeps it there when you change film, paper or a preset. Exposure adds to it." },
-    { kind: "offset", label: "Exposure (EV)", path: "prep.exposure_ev", min: -3, max: 3, step: 0.05 },
+    { kind: "offset", label: "Exposure (EV)", path: "prep.exposure_ev", min: -6, max: 6, step: 0.05 },
     { kind: "note", label: "Camera brightness" },
     { ...toggle("Auto exposure", "camera.auto_exposure"), metering: true,
       help: "Meters the photograph and exposes the film so the metered area lands on mid-grey, as a camera's meter does. Exposure adds to it." },

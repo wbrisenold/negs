@@ -341,8 +341,8 @@ fn failure_reason(reason: &str) -> SolveFailure {
             "The camera preview is too dark or too bright to match.",
             true,
         )
-    } else if reason.contains("±3 EV") {
-        ("Matching would take more than ±3 EV.", false)
+    } else if reason.contains("±6 EV") {
+        ("Matching would take more than ±6 EV.", false)
     } else {
         ("No reliable brightness match with these settings.", false)
     };
@@ -446,7 +446,7 @@ pub fn pump(ui: &Rc<Editor>) {
             pump(&ui); ui.render_next(); return;
         }
         let result=match result {
-            Ok(Ok(Some(result)))=>match result["exposure_ev"].as_f64().filter(|ev|ev.is_finite() && (-3.0..=3.0).contains(ev)) {
+            Ok(Ok(Some(result)))=>match result["exposure_ev"].as_f64().filter(|ev|ev.is_finite() && (-6.0..=6.0).contains(ev)) {
                 Some(ev)=>Ok((ev,result["highlight_limited"]==true)),
                 None=>Err(failure_reason("Invalid solution")),
             },
@@ -579,7 +579,7 @@ mod tests {
             failure_reason("Camera preview has too few usable midtone quantiles").for_photo,
             true
         );
-        assert_eq!(failure_reason("outside ±3 EV range").for_photo, false);
+        assert_eq!(failure_reason("outside ±6 EV range").for_photo, false);
     }
 
     #[test]

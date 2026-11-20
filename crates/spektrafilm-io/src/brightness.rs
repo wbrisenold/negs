@@ -435,8 +435,8 @@ pub fn failure_reason(reason: &str) -> (String, bool) {
     if reason.contains("midtone quantiles") {
         return ("The camera preview is too dark or too bright to match.".into(), true);
     }
-    if reason.contains("±3 EV") {
-        return ("Matching would take more than ±3 EV.".into(), false);
+    if reason.contains("±6 EV") {
+        return ("Matching would take more than ±6 EV.".into(), false);
     }
     ("No reliable brightness match with these settings.".into(), false)
 }
@@ -547,7 +547,7 @@ mod tests {
     fn engine_reasons_become_short_notes() {
         let cases = [
             ("Camera preview has too few usable midtone quantiles; exposure unchanged", "The camera preview is too dark or too bright to match.", true),
-            ("Camera brightness requires exposure outside the supported ±3 EV range", "Matching would take more than ±3 EV.", false),
+            ("Camera brightness requires exposure outside the supported ±6 EV range", "Matching would take more than ±6 EV.", false),
             ("Selected film response is not reliably monotone for Auto exposure", "No reliable brightness match with these settings.", false),
         ];
         for (reason, message, photo) in cases {

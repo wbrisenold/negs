@@ -34,7 +34,7 @@ impl State {
         if let Some(matched) = self.brightness_match.as_mut()
             && matched
                 .ev
-                .is_some_and(|ev| !ev.is_finite() || !(-3.0..=3.0).contains(&ev))
+                .is_some_and(|ev| !ev.is_finite() || !(-6.0..=6.0).contains(&ev))
         {
             matched.ev = None;
             matched.inputs = None;
