@@ -56,7 +56,13 @@ impl Pipelines {
     /// (pinned entries always stay).
     fn evict(&mut self, keep: usize) {
         while self.entries.len() > keep {
-            let Some(index) = self.entries.iter().position(|(k, _)| !self.pinned.contains(k)) else { break };
+            let Some(index) = self
+                .entries
+                .iter()
+                .position(|(k, _)| !self.pinned.contains(k))
+            else {
+                break;
+            };
             self.entries.remove(index);
         }
     }
@@ -99,7 +105,9 @@ mod tests {
             cache.get_or_build(key, true, || Ok(stub())).unwrap();
         }
         for i in 0..CAPACITY * 2 {
-            cache.get_or_build(&format!("t{i}"), false, || Ok(stub())).unwrap();
+            cache
+                .get_or_build(&format!("t{i}"), false, || Ok(stub()))
+                .unwrap();
         }
         assert_eq!(cache.len(), CAPACITY);
         assert!(cache.peek("a").is_some() && cache.peek("b").is_some());
@@ -113,7 +121,9 @@ mod tests {
     fn only_the_last_main_keys_stay_pinned() {
         let mut cache = Pipelines::default();
         for i in 0..PINNED + 2 {
-            cache.get_or_build(&format!("m{i}"), true, || Ok(stub())).unwrap();
+            cache
+                .get_or_build(&format!("m{i}"), true, || Ok(stub()))
+                .unwrap();
         }
         cache.release_unpinned();
         assert_eq!(cache.len(), PINNED);

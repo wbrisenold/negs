@@ -91,10 +91,10 @@ final class EdgeSplitView: NSSplitView {
         panel = NSHostingController(rootView: InspectorPanel(model: model, built: false))
         panel.sizingOptions = []
         panel.safeAreaRegions = []
-        panel.view.frame.size = NSSize(width: 340, height: 860)
+        panel.view.frame.size = NSSize(width: 360, height: 860)
         panel.view.identifier = InkKeyLoop.inspectorIdentifier
         let canvasItem = NSSplitViewItem(viewController: canvas)
-        // With the inspector at its narrowest, the smallest window is 980 wide (§7).
+        // Keep the photo usable while allowing a narrower trailing inspector.
         canvasItem.minimumThickness = 640
         // A plain column, square and flush: an inspector item floats as a
         // rounded card on macOS 26 once there's no toolbar above it.
@@ -102,15 +102,17 @@ final class EdgeSplitView: NSSplitView {
         inspector.canCollapse = true
         // The canvas takes a window's resizing; the inspector keeps its width.
         inspector.holdingPriority = .init(260)
-        // The rows keep a usable slider track down to 340 (§2.3).
-        inspector.minimumThickness = Theme.Size.inspectorSmallest
-        inspector.maximumThickness = 440
+        // The adjustment rows stay readable while giving the photo more room.
+        inspector.minimumThickness = 340
+        inspector.maximumThickness = 380
         inspector.isCollapsed = !model.inspectorVisible
         let split = NSSplitViewController()
         split.splitView = EdgeSplitView()
         split.addSplitViewItem(canvasItem)
         split.addSplitViewItem(inspector)
-        split.splitView.autosaveName = "editor"
+        // Give the left-rail layout a fresh divider preference so an older
+        // narrow inspector width cannot clip its controls on first launch.
+        split.splitView.autosaveName = "editor-develop-compact-inspector"
         root = split.view
         canvasView = canvas.view
         canvasMinimum = canvasItem.minimumThickness
@@ -148,6 +150,8 @@ final class EdgeSplitView: NSSplitView {
                 return
             }
             Self.exportFromCurrentWorkspace(model)
+        }, onShowAdjustments: { [weak model] in
+            model?.showPane(.adjustments)
         })
         window.contentViewController = editorFrame
         window.setFrameAutosaveName("editor")
@@ -385,6 +389,7 @@ final class EdgeSplitView: NSSplitView {
         if window.title != title { window.title = title }
         editorFrame.band.title = title
         editorFrame.band.showingLibrary = model.workspace == .library
+        editorFrame.band.showsAdjustmentReopen = model.workspace == .editor && !model.inspectorShown
         let canExport = model.workspace == .library
             ? Self.hasLibraryExportSelection(model) && model.ready && !model.exporting && !model.saving && !model.batchRunning
             : model.canExport && !model.cropping

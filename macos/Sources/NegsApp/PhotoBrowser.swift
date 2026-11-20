@@ -339,6 +339,166 @@ struct PhotoBrowser: View {
     }
 }
 
+/// A vertical contact rail for the develop workspace. It uses the same
+/// bounded thumbnail cache, rating marks, click selection, and grid-flight
+/// places as the horizontal browser without rotating or stretching its cells.
+struct PhotoRail: View {
+    let model: EditorModel
+    @FocusState private var focused: Bool
+
+    static let width = Theme.Size.photoRail
+    static let imageHeight: CGFloat = 88
+
+    var body: some View {
+        let shown = PhotoBrowser.row(model).shown
+        let selected = model.selection.selected
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Button { model.showLibrary() } label: {
+                    Label("All Photos", systemImage: "square.grid.2x2")
+                }
+                .buttonStyle(OutlinedButtonStyle())
+                .help("Show the full photo library (G)")
+                .accessibilityLabel("Show all photographs")
+                Spacer(minLength: 0)
+                Text("\(shown.count)")
+                    .font(Theme.ui(10, weight: .semibold)).monospacedDigit().foregroundStyle(Theme.dim)
+                    .accessibilityLabel("\(shown.count) photographs")
+            }
+            .padding(.horizontal, 10).padding(.vertical, 7)
+            .background(Theme.panel)
+            Theme.line.frame(height: 1)
+
+            ScrollViewReader { reader in
+                ScrollView(.vertical) {
+                    LazyVStack(spacing: 7) {
+                        ForEach(shown, id: \.url) { file in
+                            PhotoRailFrame(file: file,
+                                           current: file.url == model.sourceItem,
+                                           selected: selected.contains(file.url),
+                                           summary: model.library.summary(for: file.url),
+                                           readOnly: model.library.readOnly,
+                                           edited: model.editedThumbnail(for: file.url),
+                                           shown: { model.thumbnailShown(file, $0) },
+                                           loaded: { model.aspects.note(file.url, image: $0) },
+                                           placed: { model.places.strip[file.url] = $0 }) {
+                                let modifiers = NSEvent.modifierFlags
+                                focused = true
+                                model.click(file.url, command: modifiers.contains(.command), shift: modifiers.contains(.shift))
+                            }
+                            .id(file.url)
+                            .contextMenu { LibraryContextMenu(model: model, item: file.url) }
+                        }
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 9)
+                }
+                .scrollIndicators(.never)
+                .onChange(of: model.sourceItem) { _, item in
+                    guard let item else { return }
+                    withAnimation(.easeInOut(duration: 0.18)) { reader.scrollTo(item, anchor: .center) }
+                }
+                .onAppear {
+                    if let item = model.sourceItem { reader.scrollTo(item, anchor: .center) }
+                }
+                .overlay {
+                    if model.library.loading || model.library.filtering {
+                        ProgressView().controlSize(.small)
+                    } else if model.library.failed {
+                        StripNote(text: "This folder couldn’t be read.")
+                    } else if shown.isEmpty {
+                        StripNote(text: "No photographs in this folder.")
+                    }
+                }
+            }
+            .focusable().focusEffectDisabled().focused($focused)
+            .onKeyPress(keys: [.leftArrow, .rightArrow], phases: [.down, .repeat]) { press in
+                guard press.modifiers.isDisjoint(with: [.command, .option, .control]) else { return .ignored }
+                model.move(by: press.key == .leftArrow ? -1 : 1, extending: press.modifiers.contains(.shift))
+                return .handled
+            }
+        }
+        .frame(width: Self.width)
+        .background(Theme.film)
+        .overlay(alignment: .trailing) { Theme.line.frame(width: 1) }
+        .accessibilityLabel("Photo film strip")
+    }
+}
+
+private struct PhotoRailFrame: View {
+    let file: PhotoFile
+    let current: Bool
+    let selected: Bool
+    let summary: LibrarySummary
+    let readOnly: Bool
+    let edited: EditedThumbnail?
+    let shown: (Bool) -> Void
+    let loaded: (CGImage) -> Void
+    let placed: (ThumbnailPlaces.Place?) -> Void
+    let open: () -> Void
+    @State private var image: CGImage?
+    @State private var visible = false
+
+    private struct Load: Hashable { let file: PhotoFile; let edited: EditedThumbnail? }
+
+    var body: some View {
+        Button(action: open) { card }
+        .buttonStyle(StripFrameStyle())
+        .help(PhotoMarks.help(file.name, summary: summary, readOnly: readOnly))
+        .accessibilityLabel(PhotoMarks.accessibilityLabel(file.name, summary: summary))
+        .accessibilityAddTraits(current || selected ? [.isSelected] : [])
+        .onAppear { visible = true; shown(true) }
+        .onDisappear { visible = false; image = nil; shown(false) }
+        .task(id: visible ? Load(file: file, edited: edited) : nil) { await loadThumbnail() }
+        .opacity(summary.flag == .reject ? PhotoMarks.rejectOpacity(inStrip: true, current: current || selected) : 1)
+    }
+
+    private var card: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            thumbnail
+            Text(file.name)
+                .font(Theme.ui(9.5, weight: current ? .semibold : .regular))
+                .lineLimit(1).truncationMode(.middle)
+                .foregroundStyle(current ? Theme.paper : Theme.label)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(6)
+        .background(current ? Theme.card : Theme.film, in: RoundedRectangle(cornerRadius: 7))
+        .overlay(RoundedRectangle(cornerRadius: 7).stroke(borderColor, lineWidth: borderWidth))
+        .contentShape(RoundedRectangle(cornerRadius: 7))
+    }
+
+    private var thumbnail: some View {
+        ZStack {
+            Theme.blank
+            if let image { Image(decorative: image, scale: 2).resizable().aspectRatio(contentMode: .fill) }
+            PhotoMarks(summary: summary, name: file.name)
+        }
+        .frame(width: Theme.Size.photoRailThumbnail, height: PhotoRail.imageHeight)
+        .clipped()
+        .modifier(PlaceReport(image: image, placed: placed))
+    }
+
+    private var borderColor: Color {
+        if current { return Theme.accent }
+        return selected ? Theme.label : Theme.line
+    }
+
+    private var borderWidth: CGFloat { current ? 2 : selected ? 1.5 : 1 }
+
+    private func loadThumbnail() async {
+        guard visible else { return }
+        let file = file, edited = edited
+        let request = Task.detached(priority: .utility) {
+            await PhotoThumbnails.shared.image(for: file, look: edited?.look, edited: edited?.store)
+        }
+        let result = await withTaskCancellationHandler {
+            await request.value
+        } onCancel: { request.cancel() }
+        guard !Task.isCancelled else { return }
+        if let result { image = result; loaded(result) }
+    }
+}
+
 /// Tells the strip when the window has stopped changing size: at the end
 /// of a live resize or of the full-screen animation, or a moment after the
 /// last change of the strip's width otherwise (zoom, tiling, the inspector

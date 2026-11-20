@@ -24,5 +24,8 @@ ab_glyph = "0.2.32"
 [build-dependencies]
 cc = "1"
 
+[package.metadata.cargo-machete]
+ignored = ["cc"]
+
 [dev-dependencies]
 serde_json.workspace = true

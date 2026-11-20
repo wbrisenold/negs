@@ -198,12 +198,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
-name = "bit_field"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e4b40c7323adcfc0a41c4b88143ed58346ff65a288fc144329c5c45e05d70c6"
-
-[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -569,21 +563,6 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "exr"
-version = "1.74.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4300e043a56aa2cb633c01af81ca8f699a321879a7854d3896a0ba89056363be"
-dependencies = [
- "bit_field",
- "half",
- "lebe",
- "miniz_oxide",
- "rayon-core",
- "smallvec",
- "zune-inflate",
 ]
 
 [[package]]
@@ -1222,12 +1201,6 @@ name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
-
-[[package]]
-name = "lebe"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "libc"
@@ -2166,17 +2139,14 @@ version = "0.15.0"
 dependencies = [
  "anyhow",
  "clap",
- "exr",
  "image",
  "rand_mt",
- "rayon",
  "serde_json",
  "spektrafilm-core",
  "spektrafilm-gpu",
  "spektrafilm-io",
  "spektrafilm-math",
  "tiff 0.10.3",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -2184,6 +2154,7 @@ dependencies = [
 name = "spektrafilm-core"
 version = "0.15.0"
 dependencies = [
+ "base64",
  "blas-src",
  "cblas",
  "image",
@@ -2218,7 +2189,6 @@ dependencies = [
  "rayon",
  "spektrafilm-math",
  "tempfile",
- "thiserror",
  "tracing",
  "tracing-subscriber",
  "web-time",
@@ -2253,7 +2223,6 @@ dependencies = [
  "rand_mt",
  "rayon",
  "rustfft",
- "thiserror",
 ]
 
 [[package]]
@@ -2266,8 +2235,6 @@ dependencies = [
  "rayon",
  "spektrafilm-gpu",
  "spektrafilm-math",
- "thiserror",
- "tracing",
  "web-time",
 ]
 
@@ -2277,7 +2244,6 @@ version = "0.15.0"
 dependencies = [
  "anyhow",
  "image",
- "rayon",
  "serde",
  "serde_json",
  "spektrafilm-core",
@@ -3324,15 +3290,6 @@ name = "zune-core"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb8a0807f7c01457d0379ba880ba6322660448ddebc890ce29bb64da71fb40f9"
-
-[[package]]
-name = "zune-inflate"
-version = "0.2.54"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73ab332fe2f6680068f3582b16a24f90ad7096d5d39b974d1c0aff0125116f02"
-dependencies = [
- "simd-adler32",
-]
 
 [[package]]
 name = "zune-jpeg"

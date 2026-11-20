@@ -196,6 +196,55 @@ final class ScratchSpace: @unchecked Sendable {
     }
 }
 
+/// Learns export throughput on this Mac from completed jobs. Estimates are
+/// normalized by source megapixels and kept separately for the CPU/GPU paths
+/// and RAW/raster inputs so the ETA is useful across different frame sizes.
+enum ExportTiming {
+    private static let defaults = UserDefaults.standard
+    private static let sampleLimit = 9
+    private static let fastCPUFallbackKey = "exportTiming.fast.cpuFallback"
+
+    private static func key(engine: ExportEngine, raw: Bool, cachedPreview: Bool) -> String {
+        "exportTiming.samples.\(engine.rawValue).\(raw ? "raw" : "raster").\(cachedPreview ? "cached" : "develop")"
+    }
+
+    static func estimate(engine: ExportEngine, raw: Bool, megapixels: Double, cachedPreview: Bool = false) -> TimeInterval? {
+        let measuredEngine: ExportEngine = engine == .fast && !cachedPreview && defaults.bool(forKey: fastCPUFallbackKey)
+            ? .reference : engine
+        guard megapixels > 0,
+              let samples = defaults.array(forKey: key(engine: measuredEngine, raw: raw, cachedPreview: cachedPreview)) as? [Double],
+              !samples.isEmpty else { return nil }
+        let sorted = samples.sorted()
+        let median = sorted[sorted.count / 2]
+        return max(1, median * megapixels)
+    }
+
+    static func record(engine: ExportEngine, raw: Bool, megapixels: Double, duration: TimeInterval, cachedPreview: Bool = false) {
+        guard megapixels > 0, duration.isFinite, duration > 0 else { return }
+        let sampleKey = key(engine: engine, raw: raw, cachedPreview: cachedPreview)
+        var samples = defaults.array(forKey: sampleKey) as? [Double] ?? []
+        samples.append(duration / megapixels)
+        defaults.set(Array(samples.suffix(sampleLimit)), forKey: sampleKey)
+    }
+
+    static func noteCPUFallback() { defaults.set(true, forKey: fastCPUFallbackKey) }
+
+    static func clock(_ seconds: TimeInterval) -> String {
+        let value = max(0, Int(seconds.rounded()))
+        let hours = value / 3600
+        let minutes = (value % 3600) / 60
+        let secs = value % 60
+        return hours > 0
+            ? String(format: "%d:%02d:%02d", hours, minutes, secs)
+            : String(format: "%d:%02d", minutes, secs)
+    }
+
+    static func eta(_ seconds: TimeInterval?) -> String {
+        guard let seconds else { return "estimating" }
+        return seconds <= 1 ? "finishing" : "~\(clock(seconds))"
+    }
+}
+
 /// What an export puts outside its scratch folder: the staging file beside the
 /// destination and the exporter process. Recorded so a crash can be cleaned up.
 struct ExportRecord: Codable {

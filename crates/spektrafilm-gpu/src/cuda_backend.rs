@@ -827,15 +827,17 @@ extern "C" __global__ void unsharp_combine_kernel(
     const float* __restrict__ blurred,
     unsigned int n_pixels,
     float amount,
+    float threshold,
     float* __restrict__ output
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_pixels) return;
     unsigned int base = idx * 3u;
-    float k1 = 1.0f + amount;
-    output[base] = k1 * original[base] - amount * blurred[base];
-    output[base + 1u] = k1 * original[base + 1u] - amount * blurred[base + 1u];
-    output[base + 2u] = k1 * original[base + 2u] - amount * blurred[base + 2u];
+    for (unsigned int c = 0; c < 3; ++c) {
+        float detail = original[base + c] - blurred[base + c];
+        float retained = copysignf(fmaxf(fabsf(detail) - threshold, 0.0f), detail);
+        output[base + c] = original[base + c] + amount * retained;
+    }
 }
 
 // One emulsion sub-layer of upstream experimental's multilayer grain; a port
@@ -2138,6 +2140,7 @@ impl CudaBackend {
                 .arg(&blurred)
                 .arg(&n_pixels)
                 .arg(&up.amount)
+                .arg(&up.threshold)
                 .arg(img);
             unsafe { launch.launch(LaunchConfig::for_num_elems(n_pixels)) }?;
         }

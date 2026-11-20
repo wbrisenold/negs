@@ -13,14 +13,15 @@
 //! The arithmetic is f32 even in the f64 build: the tables already limit
 //! accuracy to about 2e-7, far below a 16-bit output step, and the f64
 //! build's purpose, parity with the Python reference, doesn't cover Post.
+use base64::Engine as _;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use spektrafilm_math::colorspace::RgbColourspace;
+use spektrafilm_math::colorspace::{self, RgbColourspace};
 use spektrafilm_math::image::ImageBuf;
 use spektrafilm_math::precision::{from_f32, to_f32};
 
 /// Each control runs from -100 to 100; 0 leaves the photograph unchanged.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PostParams {
     /// Lifts or darkens the midtones, keeping black and white.
     #[serde(default)]
@@ -40,10 +41,85 @@ pub struct PostParams {
     /// Inferred color separation controls; the original DCTL source is opaque.
     #[serde(default)]
     pub color_separation: ColorSeparationParams,
+    /// ME deSatch cone-space density controls from SpektraFilm Studio.
+    #[serde(default)]
+    pub color_density: ColorDensityParams,
+    /// Controls for the optional HNCS finishing transform.
+    #[serde(default)]
+    pub hncs: HncsParams,
+    /// PNG-encoded grayscale background mask, base64 encoded for sidecar portability.
+    #[serde(default)]
+    pub background_mask_png_base64: String,
+    /// What Vision selected when it generated the saved mask.
+    #[serde(default = "default_background_mask_selection")]
+    pub background_mask_selection: String,
+    /// Independent AI selections, each with its own adjustments.
+    #[serde(default)]
+    pub background_masks: Vec<BackgroundMaskLayer>,
+    #[serde(default)]
+    pub background_exposure_ev: f32,
+    #[serde(default)]
+    pub background_temperature: f32,
+    #[serde(default)]
+    pub background_tint: f32,
+    #[serde(default)]
+    pub background_saturation: f32,
     #[serde(default)]
     pub film_compression: FilmCompressionParams,
     #[serde(default)]
     pub film_expand: FilmExpandParams,
+}
+
+fn default_background_mask_selection() -> String { "background".to_owned() }
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BackgroundMaskLayer {
+    #[serde(default)] pub id: String,
+    #[serde(default = "default_background_mask_selection")] pub selection: String,
+    #[serde(default)] pub mask_png_base64: String,
+    #[serde(default)] pub exposure_ev: f32,
+    #[serde(default)] pub temperature: f32,
+    #[serde(default)] pub tint: f32,
+    #[serde(default)] pub saturation: f32,
+    /// LaMa's repaired crop, kept as an editable patch in this mask layer.
+    #[serde(default)] pub inpaint_patch_png_base64: String,
+    /// Normalized top-left x, y, width, height in the source frame.
+    #[serde(default)] pub inpaint_bounds: [f32; 4],
+    /// Colour space used to develop the input given to LaMa.
+    #[serde(default)] pub inpaint_color_space: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HncsParams {
+    #[serde(default = "default_hncs_clahe_strength")]
+    pub clahe_strength: f32,
+    #[serde(default = "default_hncs_skin_protection")]
+    pub skin_protection: f32,
+}
+
+fn default_hncs_clahe_strength() -> f32 { 55.0 }
+fn default_hncs_skin_protection() -> f32 { 55.0 }
+
+impl Default for HncsParams {
+    fn default() -> Self { Self { clahe_strength: 55.0, skin_protection: 55.0 } }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ColorDensityParams {
+    #[serde(default)] pub master: f32,
+    #[serde(default)] pub red: f32,
+    #[serde(default)] pub yellow: f32,
+    #[serde(default)] pub green: f32,
+    #[serde(default)] pub cyan: f32,
+    #[serde(default)] pub blue: f32,
+    #[serde(default)] pub magenta: f32,
+}
+
+impl ColorDensityParams {
+    pub fn is_identity(self) -> bool {
+        self.master == 0.0 && self.red == 0.0 && self.yellow == 0.0
+            && self.green == 0.0 && self.cyan == 0.0 && self.blue == 0.0 && self.magenta == 0.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -100,6 +176,58 @@ fn default_target_hue() -> f32 { 35.0 }
 fn default_complementary_hue() -> f32 { 215.0 }
 fn default_target_saturation() -> f32 { 20.0 }
 
+fn density_control(value: f32) -> f32 { value.clamp(-1.0, 0.0) }
+
+/// GPL-3.0 adaptation of ME_Desatch.dctl's RGB→cone→RGB transfer. Keep its
+/// spherical radius, hue, and polar coordinate intact; only density radius
+/// changes. See docs/ME_Desatch_NOTICE.md.
+fn apply_color_density(rgb: [f32; 3], settings: ColorDensityParams) -> [f32; 3] {
+    const TAU: f32 = std::f32::consts::TAU;
+    const HUE_RADIUS: f32 = 0.1666;
+    let rtr = rgb[0] * 0.81649658 - rgb[1] * 0.40824829 - rgb[2] * 0.40824829;
+    let rtg = rgb[1] * 0.70710678 - rgb[2] * 0.70710678;
+    let rtb = (rgb[0] + rgb[1] + rgb[2]) * 0.57735027;
+    let theta = rtg.atan2(rtr).rem_euclid(TAU);
+    let phi = (rtr.hypot(rtg)).atan2(rtb);
+    let hue = theta / TAU;
+    let polar = phi * 1.0467733744265997;
+    let mut factor = 1.0 + density_control(settings.master) * polar;
+    for (center, raw) in [
+        (0.0, settings.red), (0.1666, settings.yellow),
+        (0.3330, settings.green), (0.4999, settings.cyan),
+        (0.6660, settings.blue), (0.8333, settings.magenta),
+    ] {
+        let direct = (hue - center).abs();
+        let distance = if center == 0.0 { direct.min(1.0 - direct) } else { direct };
+        if raw != 0.0 && distance <= HUE_RADIUS {
+            factor *= 1.0 + density_control(raw) * (1.0 - distance / HUE_RADIUS) * polar;
+        }
+    }
+    let sat_magnitude = |theta: f32, phi: f32| {
+        let base_phi = 0.61547971_f32;
+        let corner_phi = 0.78539816_f32;
+        let hue_coef1 = 1.0 / (2.0 - corner_phi / base_phi);
+        let sector = theta.rem_euclid(std::f32::consts::FRAC_PI_3);
+        let hue_coef2 = 2.0 * phi * ((2.0 * std::f32::consts::PI / 3.0) - sector).sin() / 1.7320508075688;
+        let hue_magnitude = ((3.0 * theta + std::f32::consts::PI).cos().acos()
+            / (std::f32::consts::PI * hue_coef1) + (corner_phi / base_phi - 1.0)) * hue_coef2;
+        (hue_magnitude + base_phi).sin()
+    };
+    let radius = rtr.hypot(rtg).hypot(rtb) * sat_magnitude(theta, phi) * factor;
+    let phi = polar / 1.0467733744265997;
+    let spherical_radius = radius / sat_magnitude(theta, phi).abs().max(1.0e-12)
+        * sat_magnitude(theta, phi).signum();
+    let sin_phi = phi.sin();
+    let x = spherical_radius * sin_phi * theta.cos();
+    let y = spherical_radius * sin_phi * theta.sin();
+    let z = spherical_radius * phi.cos();
+    [
+        x * 0.81649658 + z * 0.57735027,
+        x * -0.40824829 + y * 0.70710678 + z * 0.57735027,
+        x * -0.40824829 - y * 0.70710678 + z * 0.57735027,
+    ].map(|v| v.clamp(0.0, 1.0))
+}
+
 impl Default for ColorSeparationParams {
     fn default() -> Self {
         Self { strength: 0.0, target_hue: 35.0, complementary_hue: 215.0,
@@ -113,6 +241,13 @@ impl PostParams {
         self.brightness == 0.0 && self.contrast == 0.0 && self.whites == 0.0
             && self.blacks == 0.0 && self.saturation == 0.0
             && self.color_separation.strength == 0.0
+            && self.color_density.is_identity()
+            && (self.background_mask_png_base64.is_empty()
+                || (self.background_exposure_ev == 0.0 && self.background_temperature == 0.0
+                    && self.background_tint == 0.0 && self.background_saturation == 0.0))
+            && self.background_masks.iter().all(|mask| mask.exposure_ev == 0.0
+                && mask.temperature == 0.0 && mask.tint == 0.0 && mask.saturation == 0.0
+                && mask.inpaint_patch_png_base64.is_empty())
             && !self.film_compression.enabled && !self.film_expand.enabled
     }
 }
@@ -267,8 +402,59 @@ pub struct PostProcess {
     /// Linear luminance → adjusted linear luminance, sampled on √Y.
     tone: Vec<f32>,
     color_separation: ColorSeparationParams,
+    color_density: ColorDensityParams,
     film_compression: FilmCompressionParams,
     film_expand: FilmExpandParams,
+    background_masks: Vec<BackgroundMaskData>,
+}
+
+struct BackgroundMaskData {
+    mask: image::GrayImage,
+    adjustment: [f32; 4],
+    inpaint: Option<InpaintData>,
+}
+
+struct InpaintData {
+    patch: image::RgbImage,
+    bounds: [f32; 4],
+    source_space: &'static RgbColourspace,
+    target_space: &'static RgbColourspace,
+    to_target: Option<[[f64; 3]; 3]>,
+}
+
+/// Bilinearly sample a repaired crop at the output pixel's normalized source
+/// coordinate. The repair is stored in the mask layer so every render path
+/// applies it at the same stage and resolution.
+fn sample_inpaint(data: &InpaintData, x: usize, y: usize, width: usize, height: usize, encoded: bool) -> Option<[f32; 3]> {
+    let [bx, by, bw, bh] = data.bounds;
+    if ![bx, by, bw, bh].iter().all(|v| v.is_finite()) || bw <= 0.0 || bh <= 0.0 { return None; }
+    let u = (x as f32 + 0.5) / width.max(1) as f32;
+    let v = (y as f32 + 0.5) / height.max(1) as f32;
+    let lx = (u - bx) / bw;
+    let ly = (v - by) / bh;
+    if !(0.0..=1.0).contains(&lx) || !(0.0..=1.0).contains(&ly) { return None; }
+    let patch = &data.patch;
+    let gx = (lx * patch.width() as f32 - 0.5).clamp(0.0, (patch.width() - 1) as f32);
+    let gy = (ly * patch.height() as f32 - 0.5).clamp(0.0, (patch.height() - 1) as f32);
+    let x0 = gx.floor() as u32; let y0 = gy.floor() as u32;
+    let x1 = (x0 + 1).min(patch.width() - 1); let y1 = (y0 + 1).min(patch.height() - 1);
+    let fx = gx - x0 as f32; let fy = gy - y0 as f32;
+    let rgb: [f64; 3] = std::array::from_fn(|c| {
+        let p00 = patch.get_pixel(x0, y0)[c] as f32 / 255.0;
+        let p10 = patch.get_pixel(x1, y0)[c] as f32 / 255.0;
+        let p01 = patch.get_pixel(x0, y1)[c] as f32 / 255.0;
+        let p11 = patch.get_pixel(x1, y1)[c] as f32 / 255.0;
+        let top = p00 + (p10 - p00) * fx;
+        let bottom = p01 + (p11 - p01) * fx;
+        f64::from(top + (bottom - top) * fy)
+    });
+    let linear = rgb.map(|channel| data.source_space.cctf.decode(channel));
+    let converted = data.to_target.as_ref()
+        .map_or(linear, |matrix| colorspace::mat3_vec_f64(matrix, linear));
+    Some(converted.map(|channel| {
+        let value = if encoded { data.target_space.cctf.encode(channel) } else { channel };
+        value.clamp(0.0, 1.0) as f32
+    }))
 }
 
 impl PostProcess {
@@ -281,6 +467,54 @@ impl PostProcess {
                 .map(|i| f(i as f64 / (LUT_SIZE - 1) as f64) as f32)
                 .collect()
         };
+        let decode_mask = |encoded: &str| {
+            base64::engine::general_purpose::STANDARD.decode(encoded).ok()
+                .and_then(|png| image::load_from_memory_with_format(&png, image::ImageFormat::Png).ok())
+                .map(|mask| mask.to_luma8())
+                .filter(|mask| mask.width() > 0 && mask.height() > 0)
+                .map(|mask| {
+                    let longest = mask.width().max(mask.height());
+                    if longest > 4096 {
+                        let scale = 4096.0 / longest as f32;
+                        image::imageops::resize(&mask,
+                            ((mask.width() as f32 * scale).round() as u32).max(1),
+                            ((mask.height() as f32 * scale).round() as u32).max(1),
+                            image::imageops::FilterType::Triangle)
+                    } else { mask }
+                })
+        };
+        let target_space = RgbColourspace::output(color_space);
+        let decode_patch = |layer: &BackgroundMaskLayer| {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(&layer.inpaint_patch_png_base64).ok()?;
+            let patch = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).ok()?.to_rgb8();
+            if patch.width() == 0 || patch.height() == 0 { return None; }
+            let source_space = if layer.inpaint_color_space.is_empty() {
+                target_space
+            } else {
+                RgbColourspace::find(&layer.inpaint_color_space).unwrap_or(target_space)
+            };
+            let to_target = (source_space.name != target_space.name)
+                .then(|| colorspace::icc_rgb_to_rgb(source_space, target_space));
+            Some(InpaintData { patch, bounds: layer.inpaint_bounds, source_space, target_space, to_target })
+        };
+        let mut background_masks: Vec<_> = params.background_masks.iter().filter_map(|layer| {
+            decode_mask(&layer.mask_png_base64).map(|mask| BackgroundMaskData {
+                mask,
+                adjustment: [layer.exposure_ev, layer.temperature, layer.tint, layer.saturation],
+                inpaint: decode_patch(layer),
+            })
+        }).collect();
+        // Read pre-layer sidecars without changing their established behavior.
+        if background_masks.is_empty() {
+            if let Some(mask) = decode_mask(&params.background_mask_png_base64) {
+                background_masks.push(BackgroundMaskData {
+                    mask,
+                    adjustment: [params.background_exposure_ev,
+                        params.background_temperature, params.background_tint, params.background_saturation],
+                    inpaint: None,
+                });
+            }
+        }
         Self {
             saturation: params.saturation / 100.0,
             luma: luminance_weights(color_space),
@@ -289,8 +523,10 @@ impl PostProcess {
             encode: samples(&|s| space.encode(s * s)),
             tone: samples(&|s| srgb_decode(tone(params, srgb_encode(s * s)))),
             color_separation: params.color_separation,
+            color_density: params.color_density,
             film_compression: params.film_compression,
             film_expand: params.film_expand,
+            background_masks,
         }
     }
 
@@ -336,6 +572,7 @@ impl PostProcess {
         if (self.film_expand.enabled && self.film_expand.impact > 0.0)
             || (self.film_compression.enabled && self.film_compression.impact > 0.0)
             || self.color_separation.strength > 0.0
+            || !self.color_density.is_identity()
         {
         let mut display = c.map(|v| lookup(&self.encode, v.max(0.0).sqrt()));
         if self.film_expand.enabled && self.film_expand.impact > 0.0 {
@@ -369,6 +606,9 @@ impl PostProcess {
         if self.color_separation.strength > 0.0 {
             display = apply_color_separation(display, self.color_separation);
         }
+        if !self.color_density.is_identity() {
+            display = apply_color_density(display, self.color_density);
+        }
         c = display.map(|v| lookup(&self.decode, v));
         }
         if self.encoded {
@@ -376,6 +616,28 @@ impl PostProcess {
         } else {
             c
         }
+    }
+
+    /// Applies the preview/export pixel adjustments and samples every saved
+    /// selection at this source-image coordinate.
+    pub fn apply_rgb_at(&self, rgb: [f32; 3], x: usize, y: usize, width: usize, height: usize) -> [f32; 3] {
+        let mut out = self.apply_rgb(rgb);
+        for layer in &self.background_masks {
+            let mx = (x * layer.mask.width() as usize / width.max(1)).min(layer.mask.width() as usize - 1);
+            let my = (y * layer.mask.height() as usize / height.max(1)).min(layer.mask.height() as usize - 1);
+            let amount = layer.mask.get_pixel(mx as u32, my as u32)[0] as f32 / 255.0;
+            if let Some(inpaint) = &layer.inpaint {
+                if amount > 0.0 {
+                    if let Some(repaired) = sample_inpaint(inpaint, x, y, width, height, self.encoded) {
+                        out = std::array::from_fn(|c| out[c] * (1.0 - amount) + repaired[c] * amount);
+                    }
+                }
+            }
+            if layer.adjustment.iter().any(|value| *value != 0.0) {
+                out = self.apply_background(out, amount, layer.adjustment);
+            }
+        }
+        out
     }
 
     /// These adjustments for the GPU display pass, which applies them as
@@ -416,12 +678,34 @@ impl PostProcess {
     }
 
     pub fn apply(&self, image: &mut ImageBuf) {
-        image.data.par_chunks_exact_mut(3).for_each(|px| {
-            let out = self.apply_rgb([to_f32(px[0]), to_f32(px[1]), to_f32(px[2])]);
+        let width = image.width as usize;
+        let height = image.height as usize;
+        image.data.par_chunks_exact_mut(3).enumerate().for_each(|(index, px)| {
+            let out = self.apply_rgb_at(
+                [to_f32(px[0]), to_f32(px[1]), to_f32(px[2])],
+                index % width.max(1), index / width.max(1), width, height,
+            );
             px[0] = from_f32(out[0]);
             px[1] = from_f32(out[1]);
             px[2] = from_f32(out[2]);
         });
+    }
+
+    fn apply_background(&self, rgb: [f32; 3], mask: f32, adjustment: [f32; 4]) -> [f32; 3] {
+        if mask <= 0.0 { return rgb; }
+        let [exposure, temperature, tint, saturation] = adjustment;
+        let mut linear = if self.encoded { rgb.map(|v| lookup(&self.decode, v)) } else { rgb };
+        let warm = temperature.clamp(-100.0, 100.0) / 100.0 * 0.18 * mask;
+        let green = tint.clamp(-100.0, 100.0) / 100.0 * 0.12 * mask;
+        linear[0] *= 1.0 + warm;
+        linear[1] *= 1.0 + green;
+        linear[2] *= 1.0 - warm;
+        let y = (self.luma[0] * linear[0] + self.luma[1] * linear[1] + self.luma[2] * linear[2]).max(0.0);
+        let sat = 1.0 + saturation.clamp(-100.0, 100.0) / 100.0 * mask;
+        linear = linear.map(|channel| (y + (channel - y) * sat).max(0.0));
+        let exposure = 2.0f32.powf(exposure.clamp(-5.0, 5.0) * mask);
+        linear = linear.map(|channel| (channel * exposure).clamp(0.0, 1.0));
+        if self.encoded { linear.map(|v| lookup(&self.encode, v.sqrt())) } else { linear }
     }
 
     pub fn applied(&self, image: &ImageBuf) -> ImageBuf {
@@ -455,6 +739,35 @@ mod tests {
                 assert!((out[c] - rgb[c]).abs() < 2e-4, "{rgb:?} -> {out:?}");
             }
         }
+    }
+
+    #[test]
+    fn each_background_mask_slider_only_changes_its_own_selection() {
+        let encode_mask = |pixels: Vec<u8>| {
+            let mask = image::GrayImage::from_raw(2, 1, pixels).unwrap();
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageLuma8(mask)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+        };
+        let edit = params(|p| {
+            p.background_masks = vec![
+                BackgroundMaskLayer {
+                    id: "left".into(), selection: "subject".into(),
+                    mask_png_base64: encode_mask(vec![255, 0]), exposure_ev: 1.0, ..Default::default()
+                },
+                BackgroundMaskLayer {
+                    id: "right".into(), selection: "people".into(),
+                    mask_png_base64: encode_mask(vec![0, 255]), exposure_ev: 2.0, ..Default::default()
+                },
+            ];
+        });
+        let mut image = ImageBuf::from_data(2, 1, vec![0.1f32; 6].into_iter().map(from_f32).collect());
+        PostProcess::new(&edit, false, "sRGB").apply(&mut image);
+        let values: Vec<f32> = image.data.iter().copied().map(to_f32).collect();
+        assert!((values[0] - 0.2).abs() < 0.002, "left selection: {values:?}");
+        assert!((values[3] - 0.4).abs() < 0.002, "right selection: {values:?}");
     }
 
     #[test]

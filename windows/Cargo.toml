@@ -31,6 +31,10 @@ raw-window-handle = "0.6"
 pollster = "0.4"
 bytemuck = { version = "1.25", features = ["derive"] }
 
+# The `implement` macro emits references to windows-core in generated code.
+[package.metadata.cargo-machete]
+ignored = ["windows-core"]
+
 [build-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "ico"] }
 

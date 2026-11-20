@@ -390,7 +390,8 @@ pub fn scan(
     // Unsharp mask
     let [usm_sigma, usm_amount] = params.scanner.unsharp_mask;
     if usm_sigma > 0.0 && usm_amount > 0.0 {
-        rgb = spektrafilm_model::diffusion::apply_unsharp_mask(rgb, usm_sigma, usm_amount, backend);
+        rgb = spektrafilm_model::diffusion::apply_unsharp_mask(
+            rgb, usm_sigma, usm_amount, params.scanner.unsharp_threshold, backend);
     }
 
     if params.io.output_cctf_encoding {

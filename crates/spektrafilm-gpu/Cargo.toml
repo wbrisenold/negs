@@ -13,7 +13,6 @@ precision-f64 = ["spektrafilm-math/precision-f64"]
 [dependencies]
 spektrafilm-math.workspace = true
 rayon.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 web-time.workspace = true
 wgpu = { workspace = true, optional = true, features = ["wgsl", "metal"] }
@@ -41,6 +40,10 @@ openblas-src = "0.10"
 # Use the distro's portable, maintained BLAS instead of building a native-CPU
 # shared library under target/ that installed executables cannot locate.
 openblas-src = { version = "0.10", features = ["system"] }
+
+# These crates activate the selected BLAS linker backends without Rust imports.
+[package.metadata.cargo-machete]
+ignored = ["accelerate-src", "openblas-src"]
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

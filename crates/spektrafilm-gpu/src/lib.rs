@@ -592,6 +592,7 @@ pub struct GamutGpuParams<'a> {
 pub struct UnsharpGpuParams {
     pub sigma_px: f32,
     pub amount: f32,
+    pub threshold: f32,
 }
 
 /// Viewing glare parameters for the GPU-resident lognormal + blur + apply

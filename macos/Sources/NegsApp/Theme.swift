@@ -14,6 +14,9 @@ enum Theme {
         /// The sheet the photograph lies on (canvas, grid).
         static let bg: UInt32 = 0x1B1B1B
         static let panel: UInt32 = 0x262626
+        /// Warm raised surface for inspector cards, distinct from the rail.
+        static let card: UInt32 = 0x2B2B2B
+        static let cardLine: UInt32 = 0x3A3A3A
         static let film: UInt32 = 0x121212
         static let line: UInt32 = 0x3A3A3A
         static let track: UInt32 = 0x555555
@@ -28,6 +31,7 @@ enum Theme {
     }
 
     static let bg = color(Hex.bg), panel = color(Hex.panel), film = color(Hex.film)
+    static let card = color(Hex.card), cardLine = color(Hex.cardLine)
     static let line = color(Hex.line), track = color(Hex.track), dim = color(Hex.dim)
     static let label = color(Hex.label), paper = color(Hex.paper), accent = color(Hex.accent)
     static let warn = color(Hex.warn), onAccent = color(Hex.onAccent), blank = color(Hex.blank)
@@ -35,6 +39,7 @@ enum Theme {
     /// The same tokens for AppKit and Core Animation.
     enum NS {
         static let bg = nsColor(Hex.bg), panel = nsColor(Hex.panel), film = nsColor(Hex.film)
+        static let card = nsColor(Hex.card), cardLine = nsColor(Hex.cardLine)
         static let line = nsColor(Hex.line), track = nsColor(Hex.track), dim = nsColor(Hex.dim)
         static let label = nsColor(Hex.label), paper = nsColor(Hex.paper), accent = nsColor(Hex.accent)
         static let warn = nsColor(Hex.warn), onAccent = nsColor(Hex.onAccent), blank = nsColor(Hex.blank)
@@ -90,6 +95,9 @@ enum Theme {
         static let stripTopPadding: CGFloat = 6
         static let stripRebate: CGFloat = 12
         static let stripGap: CGFloat = 4
+        /// The develop workspace's thumbnail and stock rail.
+        static let photoRail: CGFloat = 196
+        static let photoRailThumbnail: CGFloat = 168
         static let statusLine: CGFloat = 28
         static let tray: CGFloat = strip + statusLine
         static let gridGap: CGFloat = 6

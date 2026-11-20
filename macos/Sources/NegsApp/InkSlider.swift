@@ -238,6 +238,8 @@ struct LabeledSlider: View {
     var trackValue: Binding<Double>? = nil
     var trackRange: ClosedRange<Double>? = nil
     var trackStep: Double? = nil
+    /// Multiplies track travel while leaving the displayed and typed value unchanged.
+    var trackScale: Double = 1
     var trackNeutral: Double? = nil
     var trackDefault: Double? = nil
 
@@ -322,7 +324,13 @@ struct LabeledSlider: View {
     }
 
     private var effectiveSliderValue: Binding<Double> {
-        let source = trackValue ?? value
+        let source: Binding<Double>
+        if let trackValue, trackScale != 1 {
+            source = Binding(get: { trackValue.wrappedValue * trackScale },
+                             set: { trackValue.wrappedValue = $0 / trackScale })
+        } else {
+            source = trackValue ?? value
+        }
         guard reversed else { return source }
         let sliderRange = effectiveSliderRange
         return Binding(

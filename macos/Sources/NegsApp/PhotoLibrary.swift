@@ -834,6 +834,38 @@ private struct LibraryProjectDocument: Codable, Sendable {
         await refresh()
     }
 
+    /// Bring the folder already open in Edit into the selected Library
+    /// project. Edit stores sidecars beside source files; Library stores
+    /// folder membership separately, so this keeps both views on the same set.
+    func syncEditedPhoto(_ photoURL: URL) async {
+        await load()
+        let folderURL = photoURL.deletingLastPathComponent().standardizedFileURL
+        let photoPath = photoURL.standardizedFileURL.path
+        if let folder = folders.first(where: {
+            URL(fileURLWithPath: $0.path).standardizedFileURL == folderURL
+        }), let owner = projects.first(where: { $0.folderIDs.contains(folder.id) }) {
+            selectedProjectID = owner.id
+            selectedFolderID = nil
+            selectedAlbumID = nil
+            selectedSmartCollectionID = nil
+            filter = .all
+            return
+        }
+        if let owner = projects.first(where: { $0.photoPaths.contains(photoPath) }) {
+            selectedProjectID = owner.id
+            selectedFolderID = nil
+            selectedAlbumID = nil
+            selectedSmartCollectionID = nil
+            filter = .all
+            return
+        }
+        if selectedProjectID == nil {
+            if projects.isEmpty { createProject(named: "Library") }
+            else { selectedProjectID = projects.first?.id }
+        }
+        await importFolders([folderURL])
+    }
+
     func removeFolder(_ id: UUID) {
         guard let projectIndex = projects.firstIndex(where: { $0.id == selectedProjectID }) else { return }
         projects[projectIndex].folderIDs.remove(id)

@@ -34,7 +34,7 @@ pub use metadata::{ImageMetadata, read_metadata};
 pub use save::save_image;
 pub use raw::LensCorrection;
 pub use rawler::imgop::develop::XTransDemosaic;
-pub use white_balance::{ItcwbEstimate, RawWhiteBalance, RawWhiteBalanceMethod, RawWhiteBalanceMode, estimate_itcwb, estimate_itcwb_with_method};
+pub use white_balance::{CanonR5WhiteBalancePreset, DarktableCameraWhiteBalance, DarktableCameraWhiteBalancePreset, DarktableCameraWhiteBalanceTuning, ItcwbEstimate, RawWhiteBalance, RawWhiteBalanceMethod, RawWhiteBalanceMode, darktable_camera_white_balance, estimate_itcwb, estimate_itcwb_with_method};
 
 /// Read the exact per-channel As Shot multipliers recorded in a RAW file.
 /// These are camera values, not a guessed Kelvin/tint conversion.

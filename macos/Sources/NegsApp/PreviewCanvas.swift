@@ -14,6 +14,8 @@ struct PreviewCanvas: NSViewRepresentable {
     let filmTexture: CGImage?
     let filmStrip: FilmStrip?
     var diagnosticOverlay: CGImage? = nil
+    var backgroundMaskOverlay: CGImage? = nil
+    var backgroundMaskOverlayOpacity: CGFloat = 0.55
     var comparisonImage: AnyObject? = nil
     var wipeFraction: CGFloat = 0.5
     let zoomCommand: UUID
@@ -27,8 +29,18 @@ struct PreviewCanvas: NSViewRepresentable {
     /// slider moves or before a discrete edit's export-size render: fitted,
     /// it's shown resampled to the screen's pixels (`FitDownscale`).
     var settled = true
+    /// Shares navigation between the two version panels in three-up compare.
+    var navigation: CanvasNavigation? = nil
+    var navigationSlot: Int? = nil
     /// A double-click on the photograph; true if it's zoomed from fitting.
     var doubleClick: ((_ zoomed: Bool) -> Void)?
+    var colorPickTapEnabled = false
+    var colorPicked: ((CGPoint) -> Void)?
+    var maskPaintingEnabled = false
+    var maskBrushSubtract = false
+    var maskStrokeBegan: ((CGPoint) -> Void)?
+    var maskStrokeChanged: ((CGPoint) -> Void)?
+    var maskStrokeEnded: (() -> Void)?
 
     func makeNSView(context: Context) -> ImageScrollView {
         let scroll = ImageScrollView()
@@ -45,9 +57,18 @@ struct PreviewCanvas: NSViewRepresentable {
 
     func updateNSView(_ scroll: ImageScrollView, context: Context) {
         scale?.view = scroll
+        scroll.navigation = navigation
+        if let navigationSlot { navigation?.register(scroll, slot: navigationSlot) }
         scroll.geometry = geometry
         scroll.doubleClick = doubleClick
         let photo = scroll.documentView as! PhotographView
+        photo.colorPickTapEnabled = colorPickTapEnabled
+        photo.colorPicked = colorPicked
+        photo.maskPaintingEnabled = maskPaintingEnabled
+        photo.maskBrushSubtract = maskBrushSubtract
+        photo.maskStrokeBegan = maskStrokeBegan
+        photo.maskStrokeChanged = maskStrokeChanged
+        photo.maskStrokeEnded = maskStrokeEnded
         let cropped = crop.size(of: size)
         let displaySize = rotation % 2 != 0 ? CGSize(width: cropped.height, height: cropped.width) : cropped
         let documentSize = border.map { border in
@@ -60,7 +81,9 @@ struct PreviewCanvas: NSViewRepresentable {
         let recropped = photo.crop != crop && oldSize.width != 0
         if recropped { scroll.fitting = true }
         photo.show(image, size: size, rotation: rotation, crop: crop, border: border, filmTexture: filmTexture, filmStrip: filmStrip,
-                   diagnosticOverlay: diagnosticOverlay, comparisonImage: comparisonImage, wipeFraction: wipeFraction)
+                   diagnosticOverlay: diagnosticOverlay, backgroundMaskOverlay: backgroundMaskOverlay,
+                   backgroundMaskOverlayOpacity: backgroundMaskOverlayOpacity,
+                   comparisonImage: comparisonImage, wipeFraction: wipeFraction)
         photo.settled = settled
         photo.turned = upsideDown
         if oldSize != documentSize {
@@ -94,6 +117,40 @@ struct PreviewCanvas: NSViewRepresentable {
     func zoom(by factor: CGFloat) { view?.zoom(by: factor) }
 }
 
+/// Keeps Version 1 and Version 2 on the same zoom and image location.
+@MainActor final class CanvasNavigation {
+    private final class WeakScroll {
+        weak var view: ImageScrollView?
+        init(_ view: ImageScrollView) { self.view = view }
+    }
+    private var views: [Int: WeakScroll] = [:]
+    private var isSynchronizing = false
+
+    func register(_ view: ImageScrollView, slot: Int) {
+        guard (1...2).contains(slot) else { return }
+        views[slot] = WeakScroll(view)
+        view.navigation = self
+    }
+
+    func synchronize(from source: ImageScrollView) {
+        guard !isSynchronizing, let document = source.documentView,
+              document.frame.width > 0, document.frame.height > 0 else { return }
+        let visible = source.documentVisibleRect
+        let x = min(max(visible.midX / document.frame.width, 0), 1)
+        let y = min(max(visible.midY / document.frame.height, 0), 1)
+        isSynchronizing = true
+        defer { isSynchronizing = false }
+        for weakView in views.values {
+            guard let view = weakView.view, view !== source,
+                  let targetDocument = view.documentView,
+                  targetDocument.frame.width > 0, targetDocument.frame.height > 0 else { continue }
+            view.matchNavigation(magnification: source.magnification,
+                                 center: CGPoint(x: x * targetDocument.frame.width,
+                                                 y: y * targetDocument.frame.height))
+        }
+    }
+}
+
 final class CenteringClipView: NSClipView {
     override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
         var bounds = super.constrainBoundsRect(proposedBounds)
@@ -125,6 +182,7 @@ final class CenteringClipView: NSClipView {
 final class ImageScrollView: NSScrollView {
     var lastCommand: UUID?
     var fitting = true { didSet { if fitting != oldValue { photograph?.refreshSharp() } } }
+    weak var navigation: CanvasNavigation?
     private var photograph: PhotographView? { documentView as? PhotographView }
     var doubleClick: ((_ zoomed: Bool) -> Void)?
     var geometry: CanvasGeometry? { didSet { if geometry !== oldValue { observeBounds(); reportGeometry() } } }
@@ -159,10 +217,23 @@ final class ImageScrollView: NSScrollView {
         reportGeometry()
         photograph?.refreshSharp()
     }
+    func matchNavigation(magnification amount: CGFloat, center: CGPoint) {
+        guard documentView != nil, contentSize.width > 0 else { return }
+        fitting = false
+        let amount = min(max(amount, minMagnification), maxMagnification)
+        setMagnification(amount, centeredAt: center)
+        let bounds = contentView.bounds
+        let origin = CGPoint(x: center.x - bounds.width / 2, y: center.y - bounds.height / 2)
+        contentView.scroll(to: origin)
+        reflectScrolledClipView(contentView)
+        reportGeometry()
+        photograph?.refreshSharp()
+    }
     /// Every scroll and zoom, gestures included, moves the clip view's bounds.
     override func reflectScrolledClipView(_ clipView: NSClipView) {
         super.reflectScrolledClipView(clipView)
         photograph?.refreshSharp()
+        navigation?.synchronize(from: self)
     }
 
     private var boundsObserver: NSObjectProtocol?
@@ -255,6 +326,7 @@ final class PhotographView: NSView {
     /// Fitted view resampled to physical screen pixels for a crisp settled frame.
     let sharp = CALayer()
     private let clipping = CALayer()
+    private let backgroundMask = CALayer()
     private var borderLayers: BorderLayers!
     private var image: AnyObject?
     private var comparisonImage: AnyObject?
@@ -266,7 +338,16 @@ final class PhotographView: NSView {
     private var filmTexture: CGImage?
     private var filmStrip: FilmStrip?
     private var diagnosticOverlay: CGImage?
+    private var backgroundMaskOverlay: CGImage?
     var turned = false { didSet { if turned != oldValue { placeTurn() } } }
+    var colorPickTapEnabled = false
+    var colorPicked: ((CGPoint) -> Void)?
+    var maskPaintingEnabled = false
+    var maskBrushSubtract = false
+    var maskStrokeBegan: ((CGPoint) -> Void)?
+    var maskStrokeChanged: ((CGPoint) -> Void)?
+    var maskStrokeEnded: (() -> Void)?
+    var maskOverlayOpacity: CGFloat = 0.55
     /// The photograph's size on the canvas, after cropping and rotation.
     var displaySize: CGSize {
         let cropped = crop.size(of: size)
@@ -299,6 +380,8 @@ final class PhotographView: NSView {
         clipping.contentsGravity = .resize
         clipping.actions = none
         clipping.opacity = 0.88
+        backgroundMask.contentsGravity = .resize
+        backgroundMask.actions = none
         clip.masksToBounds = true
         clip.addSublayer(photo)
         clip.addSublayer(sharp)
@@ -306,24 +389,31 @@ final class PhotographView: NSView {
         // frame and its sharper fitted resample.
         clip.addSublayer(comparisonPhoto)
         clip.addSublayer(clipping)
+        clip.addSublayer(backgroundMask)
         turn.addSublayer(clip)
         layer?.addSublayer(turn)
         borderLayers = BorderLayers(in: turn, around: clip)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    func show(_ image: AnyObject, size: CGSize, rotation: Int, crop: CropSettings = CropSettings(), border: BorderSettings? = nil, filmTexture: CGImage? = nil, filmStrip: FilmStrip? = nil, diagnosticOverlay: CGImage? = nil, comparisonImage: AnyObject? = nil, wipeFraction: CGFloat = 0.5) {
+    func show(_ image: AnyObject, size: CGSize, rotation: Int, crop: CropSettings = CropSettings(), border: BorderSettings? = nil, filmTexture: CGImage? = nil, filmStrip: FilmStrip? = nil, diagnosticOverlay: CGImage? = nil, backgroundMaskOverlay: CGImage? = nil, backgroundMaskOverlayOpacity: CGFloat = 0.55, comparisonImage: AnyObject? = nil, wipeFraction: CGFloat = 0.5) {
         guard image !== self.image || size != self.size || rotation != self.rotation || crop != self.crop
             || border != self.border || filmTexture !== self.filmTexture || filmStrip != self.filmStrip || diagnosticOverlay !== self.diagnosticOverlay
+            || backgroundMaskOverlay !== self.backgroundMaskOverlay || backgroundMaskOverlayOpacity != maskOverlayOpacity
             || comparisonImage !== self.comparisonImage || wipeFraction != self.wipeFraction else { return }
         self.image = image; self.size = size; self.rotation = rotation; self.crop = crop
         self.comparisonImage = comparisonImage; self.wipeFraction = min(max(wipeFraction, 0), 1)
         self.border = border; self.filmTexture = filmTexture; self.filmStrip = filmStrip; self.diagnosticOverlay = diagnosticOverlay
+        self.backgroundMaskOverlay = backgroundMaskOverlay
+        maskOverlayOpacity = min(max(backgroundMaskOverlayOpacity, 0), 1)
+        backgroundMask.opacity = Float(maskOverlayOpacity)
         photo.contents = image
         comparisonPhoto.contents = comparisonImage
         comparisonPhoto.isHidden = comparisonImage == nil
         clipping.contents = diagnosticOverlay
         clipping.isHidden = diagnosticOverlay == nil
+        backgroundMask.contents = backgroundMaskOverlay
+        backgroundMask.isHidden = backgroundMaskOverlay == nil
         needsLayout = true
         // A new picture never shows the last one's resample, not even for a frame.
         refreshSharp()
@@ -340,6 +430,7 @@ final class PhotographView: NSView {
         comparisonMask.position = .zero
         comparisonMask.bounds = CGRect(x: 0, y: 0, width: comparisonPhoto.bounds.width * wipeFraction, height: comparisonPhoto.bounds.height)
         Self.layout(clip: clip, photo: clipping, size: size, crop: crop, rotation: rotation, center: CGPoint(x: bounds.midX, y: bounds.midY))
+        Self.layout(clip: clip, photo: backgroundMask, size: size, crop: crop, rotation: rotation, center: CGPoint(x: bounds.midX, y: bounds.midY))
         borderLayers.layout(border, photo: displaySize, host: turn, texture: filmTexture, filmStrip: filmStrip)
         CATransaction.commit()
     }
@@ -526,18 +617,48 @@ final class PhotographView: NSView {
     }
 
     private var grabbing = false
+    private var paintingMask = false
     override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
     override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 2, let scroll = enclosingScrollView as? ImageScrollView {
+        if maskPaintingEnabled, let maskStrokeBegan, let point = normalizedPhotoPoint(event) {
+            paintingMask = true
+            maskStrokeBegan(point)
+        } else if colorPickTapEnabled, let colorPicked {
+            let point = convert(event.locationInWindow, from: nil)
+            let size = displaySize
+            let photoRect = CGRect(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2,
+                                   width: size.width, height: size.height)
+            guard photoRect.contains(point), size.width > 0, size.height > 0 else { return }
+            var normalized = CGPoint(x: (point.x - photoRect.minX) / photoRect.width,
+                                     y: 1 - (point.y - photoRect.minY) / photoRect.height)
+            if turned { normalized = CGPoint(x: 1 - normalized.x, y: 1 - normalized.y) }
+            colorPicked(normalized)
+        } else if event.clickCount == 2, let scroll = enclosingScrollView as? ImageScrollView {
             scroll.doubleClicked()
         } else if !grabbing { grabbing = true; NSCursor.closedHand.push() }
     }
     override func mouseDragged(with event: NSEvent) {
+        if paintingMask {
+            if let point = normalizedPhotoPoint(event) { maskStrokeChanged?(point) }
+            return
+        }
         guard let scroll = enclosingScrollView else { return }
         var point = scroll.contentView.bounds.origin
         point.x -= event.deltaX / scroll.magnification
         point.y += event.deltaY / scroll.magnification
         scroll.contentView.scroll(to: point); scroll.reflectScrolledClipView(scroll.contentView)
     }
-    override func mouseUp(with event: NSEvent) { if grabbing { grabbing = false; NSCursor.pop() } }
+    override func mouseUp(with event: NSEvent) {
+        if paintingMask { paintingMask = false; maskStrokeEnded?() }
+        if grabbing { grabbing = false; NSCursor.pop() }
+    }
+
+    private func normalizedPhotoPoint(_ event: NSEvent) -> CGPoint? {
+        guard let root = layer, photo.bounds.width > 0, photo.bounds.height > 0 else { return nil }
+        let point = convert(event.locationInWindow, from: nil)
+        let imagePoint = photo.convert(point, from: root)
+        guard photo.bounds.contains(imagePoint) else { return nil }
+        return CGPoint(x: min(max(imagePoint.x / photo.bounds.width, 0), 1),
+                       y: min(max(1 - imagePoint.y / photo.bounds.height, 0), 1))
+    }
 }

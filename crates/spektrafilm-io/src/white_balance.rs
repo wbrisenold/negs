@@ -1,11 +1,12 @@
 //! RAW import white balance. See docs/raw-white-balance.md for upstream
 //! provenance and the differences between LibRaw and rawler development.
 
-use anyhow::{Result, bail, ensure};
-use rawler::{RawImage, imgop::develop::Intermediate};
+use anyhow::{bail, ensure, Result};
+use rawler::{imgop::develop::Intermediate, RawImage};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use spektrafilm_math::image::ImageBuf;
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,6 +16,8 @@ pub enum RawWhiteBalanceMode {
     Daylight,
     Tungsten,
     Custom,
+    /// Camera-specific raw gains from Darktable's camera WB table.
+    CameraPreset,
 }
 
 impl RawWhiteBalanceMode {
@@ -27,6 +30,7 @@ impl RawWhiteBalanceMode {
             Self::Daylight => "daylight",
             Self::Tungsten => "tungsten",
             Self::Custom => "custom",
+            Self::CameraPreset => "camera_preset",
         }
     }
 
@@ -36,7 +40,47 @@ impl RawWhiteBalanceMode {
             Self::Daylight => "Daylight",
             Self::Tungsten => "Tungsten (2850 K)",
             Self::Custom => "Custom",
+            Self::CameraPreset => "Camera preset",
         }
+    }
+}
+
+/// Legacy preset enum retained so existing sidecars keep their original values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonR5WhiteBalancePreset {
+    #[default]
+    Daylight,
+    Shade,
+    Cloudy,
+    Tungsten,
+    CoolWhiteFluorescent,
+    Flash,
+}
+
+impl CanonR5WhiteBalancePreset {
+    pub const ALL: [Self; 6] = [
+        Self::Daylight,
+        Self::Shade,
+        Self::Cloudy,
+        Self::Tungsten,
+        Self::CoolWhiteFluorescent,
+        Self::Flash,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Daylight => "Daylight",
+            Self::Shade => "Shade",
+            Self::Cloudy => "Cloudy",
+            Self::Tungsten => "Tungsten",
+            Self::CoolWhiteFluorescent => "Cool White Fluorescent",
+            Self::Flash => "Flash",
+        }
+    }
+
+    fn darktable_name(self) -> &'static str {
+        self.label()
     }
 }
 
@@ -44,18 +88,21 @@ impl RawWhiteBalanceMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RawWhiteBalanceMethod {
-    /// CAT02 cone-response adaptation (the historical default).
+    /// CAT16 cone-response adaptation.
     #[default]
+    Cat16,
+    /// CAT02 cone-response adaptation (for older edits and comparison).
     Cat02,
     /// Direct diagonal scaling of linear CIE XYZ channels.
     XyzScaling,
 }
 
 impl RawWhiteBalanceMethod {
-    pub const ALL: [Self; 2] = [Self::Cat02, Self::XyzScaling];
+    pub const ALL: [Self; 3] = [Self::Cat16, Self::Cat02, Self::XyzScaling];
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Cat16 => "CAT16",
             Self::Cat02 => "CAT02",
             Self::XyzScaling => "XYZ Scaling",
         }
@@ -71,6 +118,14 @@ pub struct RawWhiteBalance {
     pub temperature: f64,
     pub tint: f64,
     pub method: RawWhiteBalanceMethod,
+    #[serde(default)]
+    pub camera_preset: CanonR5WhiteBalancePreset,
+    /// One-based index into this camera's Darktable presets; zero uses the
+    /// legacy EOS R5 enum value so old sidecars keep their exact behavior.
+    #[serde(default)]
+    pub camera_preset_index: u16,
+    #[serde(default)]
+    pub camera_tuning: f64,
 }
 
 impl Default for RawWhiteBalance {
@@ -80,6 +135,9 @@ impl Default for RawWhiteBalance {
             temperature: 5500.0,
             tint: 1.0,
             method: RawWhiteBalanceMethod::default(),
+            camera_preset: CanonR5WhiteBalancePreset::default(),
+            camera_preset_index: 0,
+            camera_tuning: 0.0,
         }
     }
 }
@@ -88,10 +146,16 @@ impl RawWhiteBalance {
     /// What the decoder uses: the temperature and tint only in Custom mode.
     /// Two settings with the same effective value decode identically.
     pub fn effective(self) -> Self {
-        if self.mode == RawWhiteBalanceMode::Custom {
+        if matches!(
+            self.mode,
+            RawWhiteBalanceMode::Custom | RawWhiteBalanceMode::CameraPreset
+        ) {
             self
         } else {
-            Self { mode: self.mode, ..Self::default() }
+            Self {
+                mode: self.mode,
+                ..Self::default()
+            }
         }
     }
 
@@ -106,6 +170,14 @@ impl RawWhiteBalance {
                 "RAW WB tint must be greater than 0 and at most 4"
             );
         }
+        if self.mode == RawWhiteBalanceMode::CameraPreset {
+            ensure!(
+                self.camera_tuning.is_finite()
+                    && (-9.0..=9.0).contains(&self.camera_tuning)
+                    && self.camera_tuning.fract() == 0.0,
+                "Camera WB fine tuning must be an integer between -9 and +9"
+            );
+        }
         Ok(())
     }
 
@@ -114,6 +186,7 @@ impl RawWhiteBalance {
             RawWhiteBalanceMode::AsShot | RawWhiteBalanceMode::Daylight => None,
             RawWhiteBalanceMode::Tungsten => Some((2850.0, 1.0)),
             RawWhiteBalanceMode::Custom => Some((self.temperature, self.tint)),
+            RawWhiteBalanceMode::CameraPreset => None,
         }
     }
 }
@@ -124,7 +197,24 @@ impl RawWhiteBalance {
 /// Daylight and Tungsten start with a camera-matrix-derived daylight develop.
 pub(crate) fn prepare(raw: &mut RawImage, settings: RawWhiteBalance) -> Result<()> {
     settings.validate()?;
-    if matches!(settings.mode, RawWhiteBalanceMode::AsShot | RawWhiteBalanceMode::Custom) || is_monochrome(raw) {
+    if settings.mode == RawWhiteBalanceMode::CameraPreset {
+        if is_monochrome(raw) {
+            return Ok(());
+        }
+        raw.wb_coeffs = darktable_camera_coefficients(
+            &raw.make,
+            &raw.model,
+            settings.camera_preset,
+            settings.camera_preset_index,
+            settings.camera_tuning as i8,
+        )?;
+        return Ok(());
+    }
+    if matches!(
+        settings.mode,
+        RawWhiteBalanceMode::AsShot | RawWhiteBalanceMode::Custom
+    ) || is_monochrome(raw)
+    {
         return Ok(());
     }
     use rawler::imgop::{chromatic_adaption::adapt_bradford, xyz::Illuminant};
@@ -156,6 +246,209 @@ pub(crate) fn prepare(raw: &mut RawImage, settings: RawWhiteBalance) -> Result<(
     }
     raw.wb_coeffs = daylight_coefficients(&matrix)?;
     Ok(())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DarktableCameraWhiteBalance {
+    pub maker: String,
+    pub model: String,
+    pub presets: Vec<DarktableCameraWhiteBalancePreset>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DarktableCameraWhiteBalancePreset {
+    pub index: u16,
+    pub name: String,
+    pub tunings: Vec<DarktableCameraWhiteBalanceTuning>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DarktableCameraWhiteBalanceTuning {
+    pub tuning: i8,
+    pub channels: [f32; 4],
+}
+
+#[derive(Deserialize)]
+struct DarktableWbDatabase {
+    wb_presets: Vec<DarktableWbMaker>,
+}
+#[derive(Deserialize)]
+struct DarktableWbMaker {
+    maker: String,
+    models: Vec<DarktableWbModel>,
+}
+#[derive(Deserialize)]
+struct DarktableWbModel {
+    model: String,
+    presets: Vec<DarktableCameraWhiteBalanceTuningRow>,
+}
+#[derive(Clone, Deserialize)]
+struct DarktableCameraWhiteBalanceTuningRow {
+    name: String,
+    #[serde(default)]
+    tuning: i8,
+    channels: [f32; 4],
+}
+
+fn darktable_wb_database() -> &'static DarktableWbDatabase {
+    static DATA: OnceLock<DarktableWbDatabase> = OnceLock::new();
+    let data = DATA.get_or_init(|| {
+        serde_json::from_str(include_str!("darktable_wb_presets.json"))
+            .expect("bundled Darktable camera WB data is valid")
+    });
+    data
+}
+
+/// Darktable camera WB entries matched from the RAW's TIFF make/model tags.
+/// EOS R5 C intentionally uses Darktable's EOS R5 entry, as requested.
+pub fn darktable_camera_white_balance(
+    make: &str,
+    model: &str,
+) -> Option<DarktableCameraWhiteBalance> {
+    let makers = darktable_wb_database();
+    let maker_key = compact(make);
+    let maker = makers.wb_presets.iter().find(|entry| {
+        let key = compact(&entry.maker);
+        maker_key.starts_with(&key) || key.starts_with(&maker_key)
+    })?;
+    let model_key = normalize_camera_model(make, model, &maker.maker);
+    let alias_key = if model_key == "eosr5c" || model_key == "r5c" {
+        "eosr5"
+    } else {
+        &model_key
+    };
+    let camera = maker
+        .models
+        .iter()
+        .find(|entry| compact(&entry.model) == alias_key)?;
+    let mut grouped: std::collections::BTreeMap<String, Vec<DarktableCameraWhiteBalanceTuning>> =
+        std::collections::BTreeMap::new();
+    for row in &camera.presets {
+        grouped
+            .entry(row.name.clone())
+            .or_default()
+            .push(DarktableCameraWhiteBalanceTuning {
+                tuning: row.tuning,
+                channels: [
+                    row.channels[0],
+                    row.channels[1],
+                    row.channels[2],
+                    if row.channels[3] > 0.0 {
+                        row.channels[3]
+                    } else {
+                        row.channels[1]
+                    },
+                ],
+            });
+    }
+    Some(DarktableCameraWhiteBalance {
+        maker: maker.maker.clone(),
+        model: camera.model.clone(),
+        presets: grouped
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, mut tunings))| {
+                tunings.sort_by_key(|entry| entry.tuning);
+                DarktableCameraWhiteBalancePreset {
+                    index: index as u16,
+                    name,
+                    tunings,
+                }
+            })
+            .collect(),
+    })
+}
+
+fn darktable_camera_coefficients(
+    make: &str,
+    model: &str,
+    legacy_preset: CanonR5WhiteBalancePreset,
+    preset_index: u16,
+    tuning: i8,
+) -> Result<[f32; 4]> {
+    ensure!(
+        (-9..=9).contains(&tuning),
+        "Camera WB fine tuning must be between -9 and +9"
+    );
+    let camera = darktable_camera_white_balance(make, model)
+        .ok_or_else(|| anyhow::anyhow!("Darktable has no WB presets for camera {make} {model}"))?;
+    let preset_name = if preset_index > 0 {
+        camera
+            .presets
+            .get(usize::from(preset_index - 1))
+            .map(|preset| preset.name.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Unknown Darktable WB preset index {preset_index}"))?
+    } else {
+        legacy_preset.darktable_name()
+    };
+    let key = compact(preset_name);
+    let preset = camera
+        .presets
+        .iter()
+        .find(|row| compact(&row.name) == key)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Darktable {} has no {preset_name} WB preset", camera.model)
+        })?;
+    let tuning_min = preset.tunings.iter().map(|row| row.tuning).min().unwrap_or(0);
+    let tuning_max = preset.tunings.iter().map(|row| row.tuning).max().unwrap_or(0);
+    // Some camera entries expose preset gains without any fine-tuning rows.
+    // Treat stale/non-supported tuning values as the nearest recorded value
+    // instead of failing RAW development.
+    let tuning = tuning.clamp(tuning_min, tuning_max);
+    let channels = if let Some(exact) = preset.tunings.iter().find(|row| row.tuning == tuning) {
+        exact.channels
+    } else {
+        let lower = preset
+            .tunings
+            .iter()
+            .filter(|row| row.tuning < tuning)
+            .max_by_key(|row| row.tuning);
+        let upper = preset
+            .tunings
+            .iter()
+            .filter(|row| row.tuning > tuning)
+            .min_by_key(|row| row.tuning);
+        match (lower, upper) {
+            (Some(a), Some(b)) => {
+                let t = f32::from(tuning - a.tuning) / f32::from(b.tuning - a.tuning);
+                std::array::from_fn(|i| a.channels[i] + (b.channels[i] - a.channels[i]) * t)
+            }
+            _ => anyhow::bail!(
+                "Darktable {} {preset_name} has no tuning value {tuning}",
+                camera.model
+            ),
+        }
+    };
+    // Darktable writes zero for Canon's unused fourth coefficient; rawler
+    // expects the second green CFA channel to carry G1's neutral gain.
+    Ok([
+        channels[0],
+        channels[1],
+        channels[2],
+        if channels[3] > 0.0 {
+            channels[3]
+        } else {
+            channels[1]
+        },
+    ])
+}
+
+fn compact(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn normalize_camera_model(make: &str, model: &str, table_maker: &str) -> String {
+    let mut key = compact(model);
+    for prefix in [compact(make), compact(table_maker)] {
+        if key.starts_with(&prefix) {
+            key.drain(..prefix.len());
+        }
+    }
+    key
 }
 
 pub(crate) fn is_monochrome(raw: &RawImage) -> bool {
@@ -267,6 +560,9 @@ fn adaptation(source: [f64; 3], target: [f64; 3], method: RawWhiteBalanceMethod)
         }
         return scale;
     }
+    if method == RawWhiteBalanceMethod::Cat16 {
+        return spektrafilm_math::colorspace::chromatic_adaptation_matrix_cat16_f64(source, target);
+    }
     let s = mv(CAT02, source);
     let t = mv(CAT02, target);
     let mut scale = IDENTITY;
@@ -281,9 +577,9 @@ fn adjustment_matrix(temperature: f64, tint: f64, method: RawWhiteBalanceMethod)
         return IDENTITY;
     }
     let temperature_adjust = adaptation(whitepoint(temperature), whitepoint(6504.0), method);
-    // Upstream operates in ACES2065-1 (D60). Move our linear sRGB (D65)
-    // into the same space, apply its XYZ adaptation and ACES green tint,
-    // then return to sRGB. colour.RGB_to_RGB defaults to CAT02 adaptation.
+    // Work in ACES2065-1 (D60). Move linear sRGB (D65) into the same space,
+    // apply the selected CAT and ACES green tint,
+    // then return to sRGB using the same selected adaptation method.
     let d65 = [0.3127 / 0.3290, 1.0, (1.0 - 0.3127 - 0.3290) / 0.3290];
     let d60 = [0.32168 / 0.33767, 1.0, (1.0 - 0.32168 - 0.33767) / 0.33767];
     let to_aces_xyz = adaptation(d65, d60, method);
@@ -316,13 +612,16 @@ const ITCWB_REFERENCES: &[u8] = include_bytes!("itcwb_reference_xy.bin");
 
 fn reference_xy() -> Vec<[f64; 2]> {
     let count = u32::from_le_bytes(ITCWB_REFERENCES[0..4].try_into().unwrap()) as usize;
-    (0..count).map(|i| {
-        let offset = 4 + i * 8;
-        [
-            f32::from_le_bytes(ITCWB_REFERENCES[offset..offset + 4].try_into().unwrap()) as f64,
-            f32::from_le_bytes(ITCWB_REFERENCES[offset + 4..offset + 8].try_into().unwrap()) as f64,
-        ]
-    }).collect()
+    (0..count)
+        .map(|i| {
+            let offset = 4 + i * 8;
+            [
+                f32::from_le_bytes(ITCWB_REFERENCES[offset..offset + 4].try_into().unwrap()) as f64,
+                f32::from_le_bytes(ITCWB_REFERENCES[offset + 4..offset + 8].try_into().unwrap())
+                    as f64,
+            ]
+        })
+        .collect()
 }
 
 /// Estimate a RAW white balance from the linear, camera-matrix-developed RGB
@@ -330,7 +629,7 @@ fn reference_xy() -> Vec<[f64; 2]> {
 /// it intentionally returns an error for low-information or near-monochrome
 /// frames instead of silently falling back to gray-world.
 pub fn estimate_itcwb(image: &ImageBuf) -> Result<ItcwbEstimate> {
-    estimate_itcwb_with_method(image, RawWhiteBalanceMethod::Cat02)
+    estimate_itcwb_with_method(image, RawWhiteBalanceMethod::Cat16)
 }
 
 /// Estimate RAW white balance using the same adaptation method that will be
@@ -339,22 +638,35 @@ pub fn estimate_itcwb_with_method(
     image: &ImageBuf,
     method: RawWhiteBalanceMethod,
 ) -> Result<ItcwbEstimate> {
-    ensure!(image.width > 0 && image.height > 0, "ITCWB needs a non-empty image");
+    ensure!(
+        image.width > 0 && image.height > 0,
+        "ITCWB needs a non-empty image"
+    );
     let stride = ((image.pixel_count() / 256).max(1)) * 3;
     let mut samples = Vec::with_capacity(256);
     for pixel in image.data.chunks_exact(3).step_by(stride / 3) {
         let rgb = [pixel[0] as f64, pixel[1] as f64, pixel[2] as f64];
         let y = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
-        if !y.is_finite() || !(0.015..0.95).contains(&y) { continue; }
+        if !y.is_finite() || !(0.015..0.95).contains(&y) {
+            continue;
+        }
         let max = rgb[0].max(rgb[1]).max(rgb[2]);
         let min = rgb[0].min(rgb[1]).min(rgb[2]);
-        if max - min < y * 0.035 { continue; }
+        if max - min < y * 0.035 {
+            continue;
+        }
         samples.push(rgb);
     }
-    ensure!(samples.len() >= 12, "ITCWB found too little usable color; try a frame with more varied, well-exposed colors");
+    ensure!(
+        samples.len() >= 12,
+        "ITCWB found too little usable color; try a frame with more varied, well-exposed colors"
+    );
 
     let references = reference_xy();
-    ensure!(references.len() == 429, "ITCWB spectral reference table is incomplete");
+    ensure!(
+        references.len() == 429,
+        "ITCWB spectral reference table is incomplete"
+    );
     let score = |temperature: f64, tint: f64| -> f64 {
         let matrix = adjustment_matrix(temperature, tint, method);
         let mut total_error = 0.0;
@@ -367,18 +679,32 @@ pub fn estimate_itcwb_with_method(
                 0.0193339 * corrected[0] + 0.1191920 * corrected[1] + 0.9503041 * corrected[2],
             ];
             let sum = xyz.iter().sum::<f64>();
-            if !sum.is_finite() || sum <= 1e-9 { continue; }
+            if !sum.is_finite() || sum <= 1e-9 {
+                continue;
+            }
             let xy = [xyz[0] / sum, xyz[1] / sum];
-            let saturation = ((max3(corrected) - min3(corrected)) / xyz[1].max(1e-6)).clamp(0.0, 2.0);
+            let saturation =
+                ((max3(corrected) - min3(corrected)) / xyz[1].max(1e-6)).clamp(0.0, 2.0);
             let weight = saturation.min(0.5) as f64;
-            if weight < 0.025 { continue; }
-            let nearest = references.iter().map(|r| {
-                let dx = xy[0] - r[0]; let dy = xy[1] - r[1]; dx * dx + dy * dy
-            }).fold(f64::INFINITY, f64::min);
+            if weight < 0.025 {
+                continue;
+            }
+            let nearest = references
+                .iter()
+                .map(|r| {
+                    let dx = xy[0] - r[0];
+                    let dy = xy[1] - r[1];
+                    dx * dx + dy * dy
+                })
+                .fold(f64::INFINITY, f64::min);
             total_error += nearest * weight;
             total_weight += weight;
         }
-        if total_weight == 0.0 { f64::INFINITY } else { (total_error / total_weight).sqrt() }
+        if total_weight == 0.0 {
+            f64::INFINITY
+        } else {
+            (total_error / total_weight).sqrt()
+        }
     };
 
     let mut best = (f64::INFINITY, 6504.0, 1.0);
@@ -386,7 +712,9 @@ pub fn estimate_itcwb_with_method(
         for tint_step in -6..=6 {
             let tint = 1.0 + tint_step as f64 * 0.05;
             let candidate = score(temperature as f64, tint);
-            if candidate < best.0 { best = (candidate, temperature as f64, tint); }
+            if candidate < best.0 {
+                best = (candidate, temperature as f64, tint);
+            }
         }
     }
     let coarse = best.0;
@@ -398,10 +726,15 @@ pub fn estimate_itcwb_with_method(
         for tint_step in 0..=20 {
             let tint = low_g + (high_g - low_g) * tint_step as f64 / 20.0;
             let candidate = score(temperature as f64, tint);
-            if candidate < best.0 { best = (candidate, temperature as f64, tint); }
+            if candidate < best.0 {
+                best = (candidate, temperature as f64, tint);
+            }
         }
     }
-    ensure!(best.0.is_finite(), "ITCWB could not find a reliable color match");
+    ensure!(
+        best.0.is_finite(),
+        "ITCWB could not find a reliable color match"
+    );
     Ok(ItcwbEstimate {
         temperature: best.1,
         tint: best.2,
@@ -409,8 +742,12 @@ pub fn estimate_itcwb_with_method(
     })
 }
 
-fn max3(v: [f64; 3]) -> f64 { v[0].max(v[1]).max(v[2]) }
-fn min3(v: [f64; 3]) -> f64 { v[0].min(v[1]).min(v[2]) }
+fn max3(v: [f64; 3]) -> f64 {
+    v[0].max(v[1]).max(v[2])
+}
+fn min3(v: [f64; 3]) -> f64 {
+    v[0].min(v[1]).min(v[2])
+}
 
 /// Apply the corrected upstream post-development WB before the loader's
 /// final negative clamp. A monochrome sensor has no chromatic balance.
@@ -477,7 +814,9 @@ mod tests {
         for channel in 0..3 {
             assert!((matrix[channel][channel] - target[channel] / source[channel]).abs() < 1e-12);
             for other in 0..3 {
-                if other != channel { assert_eq!(matrix[channel][other], 0.0); }
+                if other != channel {
+                    assert_eq!(matrix[channel][other], 0.0);
+                }
             }
         }
         let mapped_white = mv(matrix, source);
@@ -558,8 +897,14 @@ mod tests {
                 assert!((a - b).abs() < 3e-5, "{a} != {b}");
             }
         }
-        assert_eq!(adjustment_matrix(6504.0, 1.0, RawWhiteBalanceMethod::Cat02), IDENTITY);
-        let warm = mv(adjustment_matrix(2850.0, 1.0, RawWhiteBalanceMethod::Cat02), [0.2; 3]);
+        assert_eq!(
+            adjustment_matrix(6504.0, 1.0, RawWhiteBalanceMethod::Cat02),
+            IDENTITY
+        );
+        let warm = mv(
+            adjustment_matrix(2850.0, 1.0, RawWhiteBalanceMethod::Cat02),
+            [0.2; 3],
+        );
         assert!(warm[2] > warm[0]); // tungsten WB cools a daylight image
     }
 }

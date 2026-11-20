@@ -4,6 +4,8 @@
 Run with builds stopped. Defaults to a dry run; --apply deletes the listed paths.
 Other worktrees, release packages, RAW inputs, source, logs and measurements
 are left alone. --debug also removes the complete Cargo development build.
+--build-caches removes the local packaged-app cache, Intel Cargo test cache,
+and Cargo development build while preserving target/release and dist/.
 --sweep [DAYS] also runs cargo-sweep on target/, deleting Cargo artifacts that no
 build has used for DAYS days (default 1). Cargo keeps every stale copy otherwise.
 """
@@ -30,10 +32,13 @@ def safe_path(root, path):
     return True
 
 
-def candidates(root, debug=False):
+def candidates(root, debug=False, build_caches=False):
     target = root / "target"
     if not safe_path(root, target):
         return []
+    if build_caches:
+        paths = [target / "macos-app", target / "x86_64-apple-darwin", target / "debug"]
+        return sorted(p for p in paths if safe_path(root, p) and p.exists())
     paths = [target / "debug" if debug else target / "debug/incremental"]
     package = target / "macos-app"
     if safe_path(root, package):
@@ -95,6 +100,8 @@ def main(argv=None):
     parser.add_argument("--apply", action="store_true", help="delete the listed disposable outputs")
     parser.add_argument("--debug", action="store_true",
                         help="remove all target/debug outputs instead of just incremental caches")
+    parser.add_argument("--build-caches", action="store_true",
+                        help="remove local app, Intel test, and debug caches; preserve target/release and dist/")
     parser.add_argument("--sweep", type=int, nargs="?", const=1, metavar="DAYS",
                         help="also remove Cargo artifacts unused for DAYS days (default 1)")
     args = parser.parse_args(argv)
@@ -104,7 +111,7 @@ def main(argv=None):
 
 
 def clean_paths(args):
-    paths = candidates(ROOT, args.debug)
+    paths = candidates(ROOT, args.debug, args.build_caches)
     total = 0
     for path in paths:
         amount = allocated_bytes(path)

@@ -8,7 +8,7 @@
 struct Params {
     n_pixels: u32,
     amount: f32,
-    _pad0: u32,
+    threshold: f32,
     _pad1: u32,
 }
 
@@ -30,9 +30,10 @@ fn main(
     let idx = gid.y * groups.x * WORKGROUP_SIZE + gid.x;
     if idx >= params.n_pixels { return; }
     let base = idx * 3u;
-    let k1 = 1.0 + params.amount;
     let k2 = params.amount;
-    out_buf[base] = k1 * a_buf[base] - k2 * b_buf[base];
-    out_buf[base + 1u] = k1 * a_buf[base + 1u] - k2 * b_buf[base + 1u];
-    out_buf[base + 2u] = k1 * a_buf[base + 2u] - k2 * b_buf[base + 2u];
+    for (var c = 0u; c < 3u; c++) {
+        let detail = a_buf[base + c] - b_buf[base + c];
+        let retained = sign(detail) * max(abs(detail) - params.threshold, 0.0);
+        out_buf[base + c] = a_buf[base + c] + k2 * retained;
+    }
 }

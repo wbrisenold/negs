@@ -35,3 +35,7 @@ rayon = { workspace = true, optional = true }
 # Rayon on Web Workers. Needs a build with atomics (see web/build.sh) and a
 # cross-origin isolated page that runs the engine in a worker.
 threads = ["dep:wasm-bindgen-rayon", "dep:rayon"]
+
+# Enable getrandom's browser implementation and UUID generation inside rawler.
+[package.metadata.cargo-machete]
+ignored = ["getrandom", "uuid"]

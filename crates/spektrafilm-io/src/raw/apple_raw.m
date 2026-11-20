@@ -155,7 +155,7 @@ int sf_apple_raw_decode(const char *path, int decoder_major, int orient, int as_
                                 isEqual:(__bridge NSString *)kCGImagePropertyColorModelGray]
                 || (properties[(__bridge NSString *)kCGImagePropertyDNGDictionary] != nil
                     && [tiff[(__bridge NSString *)kCGImagePropertyTIFFPhotometricInterpretation] intValue] == 1);
-            // Other modes develop at D65, then use the same CAT02/ACES tint
+            // Other modes develop at D65, then use the same CAT/ACES tint
             // operation as rawler. Apple's unrelated -150..150 tint is unused.
             if (!as_shot && !out->monochrome) raw.neutralChromaticity = CGPointMake(0.3127, 0.3290);
             snprintf(out->version, sizeof(out->version), "%s", raw.decoderVersion.UTF8String);

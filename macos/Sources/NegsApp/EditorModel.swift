@@ -15,7 +15,8 @@ enum EditorWorkspace {
 
 /// Adjustment families that can come from the global reset preset.
 enum ResetKeepGroup: String, CaseIterable, Identifiable, Codable {
-    case exposure = "Exposure & Tone"
+    case exposure = "Exposure"
+    case tone = "Tone"
     case whiteBalance = "White Balance"
     case color = "Color"
     case camera = "Camera"
@@ -25,12 +26,38 @@ enum ResetKeepGroup: String, CaseIterable, Identifiable, Codable {
     case lookTransform = "Look Transform"
     case input = "Input Transform"
     case output = "Output"
+    /// Kept only to read older saved reset baselines and preferences.
+    case legacyExposureAndTone = "Exposure & Tone"
+
+    static let allCases: [ResetKeepGroup] = [
+        .exposure, .tone, .whiteBalance, .color, .camera, .filmPrint,
+        .filmStock, .paperStock, .lookTransform, .input, .output
+    ]
+
+    static func selected(from stored: String) -> Set<ResetKeepGroup> {
+        var groups = Set<ResetKeepGroup>()
+        for value in stored.split(separator: "|").map(String.init) {
+            if value == legacyExposureAndTone.rawValue {
+                groups.formUnion([.exposure, .tone])
+            } else if let group = ResetKeepGroup(rawValue: value) {
+                groups.insert(group)
+            }
+        }
+        return groups
+    }
 
     var id: String { rawValue }
 
     func keeps(_ path: String) -> Bool {
         switch self {
         case .exposure:
+            return ["prep.exposure_ev", "camera.auto_exposure", "camera.auto_exposure_method"].contains(path)
+        case .tone:
+            return ["prep.highlights", "prep.shadows", "prep.contrast", "prep.lift", "prep.gain",
+                    "prep.global_tone", "prep.black_point", "prep.white_point", "prep.expand",
+                    ].contains(path)
+                || path.hasPrefix("post.film_expand.")
+        case .legacyExposureAndTone:
             return ["prep.exposure_ev", "prep.highlights", "prep.shadows", "prep.contrast", "prep.lift", "prep.gain",
                     "prep.global_tone", "prep.black_point", "prep.white_point", "prep.expand",
                     "camera.auto_exposure", "camera.auto_exposure_method"].contains(path)
@@ -66,15 +93,18 @@ private struct GlobalResetBaseline: Codable {
     static func load() -> GlobalResetBaseline? {
         let defaults = UserDefaults.standard
         if let data = defaults.data(forKey: key),
-           let baseline = try? JSONDecoder().decode(Self.self, from: data) {
+           var baseline = try? JSONDecoder().decode(Self.self, from: data) {
+            if baseline.groups.remove(.legacyExposureAndTone) != nil {
+                baseline.groups.formUnion([.exposure, .tone])
+                baseline.persist()
+            }
             return baseline
         }
         // Migrate the earlier split keys once; the versioned blob becomes the
         // only active source of truth after this read.
         guard let paramData = defaults.data(forKey: "negs.reset.savedParams"),
               let params = try? JSONDecoder().decode(JSONValue.self, from: paramData) else { return nil }
-        let groups = Set((defaults.string(forKey: "negs.reset.keepGroups") ?? "")
-            .split(separator: "|").compactMap { ResetKeepGroup(rawValue: String($0)) })
+        let groups = ResetKeepGroup.selected(from: defaults.string(forKey: "negs.reset.keepGroups") ?? "")
         guard !groups.isEmpty else { return nil }
         let decoder = JSONDecoder()
         let baseline = GlobalResetBaseline(
@@ -106,10 +136,10 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .off: "Edit preview"
-        case .wipe: "Before / Current wipe"
-        case .versionWipe: "Version 1 / Version 2 wipe"
-        case .threeUp: "Before / Version 1 / Version 2"
+        case .off: "Edit Preview"
+        case .wipe: "Before vs Current"
+        case .versionWipe: "Version 1 vs Version 2"
+        case .threeUp: "Before + Versions 1 and 2"
         }
     }
 }
@@ -124,12 +154,16 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         didSet { publish() }
     }
     private(set) var savedVersions: [SavedEditVersion] = []
+    private(set) var previewVersionSlot: Int?
+    private(set) var editingVersionSlot: Int?
     private(set) var comparisonOriginal: IOSurface?
     private(set) var versionImages: [Int: IOSurface] = [:]
+    @ObservationIgnored let versionNavigation = CanvasNavigation()
     var comparisonMode: PreviewCompareMode = .off {
         didSet {
             guard comparisonMode != oldValue else { return }
             versionPreviewTask?.cancel(); versionPreviewTask = nil
+            if comparisonMode != .versionWipe && comparisonMode != .threeUp { editingVersionSlot = nil }
             if comparisonMode != .off { prepareComparison() }
             else {
                 comparisonOriginal = nil; versionImages.removeAll()
@@ -170,6 +204,8 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     private(set) var asShotWhiteBalance: [Double?]?
     /// The camera's facts for the caption over the photograph, read off the main actor.
     private(set) var photoFacts: PhotoFacts?
+    /// Darktable's exact preset gains returned for the open RAW's camera.
+    private(set) var cameraWhiteBalance: JSONValue = .null
     /// The duplicate of `source` open (its sidecar variant); nil for the
     /// photograph itself.
     private(set) var sourceVariant: String?
@@ -204,6 +240,10 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     private(set) var waveform: Waveform?
     private(set) var vectorscope: Vectorscope?
     private(set) var skinAnalysis: SkinAnalysis?
+    private(set) var chromaticity = ChromaticityScope()
+    private(set) var saturation = SaturationScope()
+    private(set) var colorSample: ColorSample?
+    var scopeMode: ScopeMode { requestedScopeMode }
     private(set) var scopesUpdating = false
     var clippingOverlayEnabled = UserDefaults.standard.bool(forKey: "clippingOverlayEnabled") {
         didSet {
@@ -226,6 +266,36 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         }
     }
     private(set) var diagnosticOverlay: CGImage?
+    var backgroundMaskEnabled = false {
+        didSet { if backgroundMaskEnabled != oldValue { updateBackgroundMask() } }
+    }
+    var backgroundMaskSelection: BackgroundMask.Selection = .background
+    var selectedBackgroundMaskIndex = 0
+    var backgroundMaskBrushActive = false
+    var backgroundMaskBrushSubtract = false
+    var backgroundMaskBrushSize = 42.0
+    var backgroundMaskRemovalProvider = BackgroundMaskRemovalProvider(
+        rawValue: UserDefaults.standard.string(forKey: "backgroundMaskRemovalProvider") ?? "") ?? .openAI {
+        didSet { UserDefaults.standard.set(backgroundMaskRemovalProvider.rawValue, forKey: "backgroundMaskRemovalProvider") }
+    }
+    /// Showing the selection preview is independent of enabling/editing the mask.
+    var backgroundMaskOverlayVisible = UserDefaults.standard.object(forKey: "backgroundMaskOverlayVisible") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(backgroundMaskOverlayVisible, forKey: "backgroundMaskOverlayVisible") }
+    }
+    var backgroundMaskOverlayOpacity = UserDefaults.standard.object(forKey: "backgroundMaskOverlayOpacity") as? Double ?? 0.55 {
+        didSet { UserDefaults.standard.set(backgroundMaskOverlayOpacity, forKey: "backgroundMaskOverlayOpacity") }
+    }
+    private(set) var backgroundMaskOverlay: CGImage?
+    var visibleBackgroundMaskOverlay: CGImage? { backgroundMaskOverlayVisible ? backgroundMaskOverlay : nil }
+    private(set) var backgroundMaskGenerating = false
+    private(set) var backgroundMaskStatus = ""
+    private var backgroundMaskLayers: [JSONValue] { value("post.background_masks").array }
+    var hasBackgroundMask: Bool {
+        !backgroundMaskLayers.isEmpty || !value("post.background_mask_png_base64").string.isEmpty
+    }
+    private var backgroundMaskRequest = 0
+    @ObservationIgnored private var backgroundMaskTask: Task<Void, Never>?
+    @ObservationIgnored private var backgroundMaskPainter: MaskPainter?
     /// The developed preview's frame, uncropped, which the canvas lays out:
     /// the working frame, or less with the 12 MP limit.
     private(set) var imageSize = CGSize.zero
@@ -263,6 +333,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     private(set) var exporting = false
     private(set) var exportCancellable = false
     private(set) var exportStarted = Date()
+    private(set) var exportExpectedDuration: TimeInterval?
     /// A brightness solve is with the helper.
     private(set) var matchingBrightness = false
     /// A failed solve that trying again can't change: for the photograph
@@ -273,6 +344,21 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     var autoPlaceNewImages = UserDefaults.standard.object(forKey: "autoPlaceNewImages") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(autoPlaceNewImages, forKey: "autoPlaceNewImages")
+            refreshUneditedLook()
+        }
+    }
+    static let newPhotoSpectralMethodKey = "newPhotoSpectralMethod"
+    static let spectralUpsamplingMethods = ["arctic2026beta04", "hanatos2025", "mallett2019"]
+    /// Settings › New photographs: Arctic is the default for new and unedited photos.
+    var newPhotoSpectralMethod: String = {
+        let saved = UserDefaults.standard.string(forKey: newPhotoSpectralMethodKey)
+        return saved.flatMap { spectralUpsamplingMethods.contains($0) ? $0 : nil } ?? "arctic2026beta04"
+    }() {
+        didSet {
+            guard Self.spectralUpsamplingMethods.contains(newPhotoSpectralMethod) else { return }
+            UserDefaults.standard.set(newPhotoSpectralMethod, forKey: Self.newPhotoSpectralMethodKey)
+            defaults["settings.rgb_to_raw_method"] = .string(newPhotoSpectralMethod)
+            followNewPhotoSpectralMethod()
             refreshUneditedLook()
         }
     }
@@ -501,7 +587,10 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     @ObservationIgnored private var requestedScopeMode = ScopeMode(rawValue: UserDefaults.standard.string(forKey: "scopeMode") ?? ScopeMode.histogram.rawValue) ?? .histogram
     @ObservationIgnored private var diagnosticOverlayRequest = 0
     @ObservationIgnored private var diagnosticOverlayTask: Task<Void, Never>?
+    @ObservationIgnored private var clippingMask: Data?
     @ObservationIgnored private var versionPreviewTask: Task<Void, Never>?
+    @ObservationIgnored private var versionPreviewRefreshPending = false
+    @ObservationIgnored private var comparisonEngine: EngineClient?
     @ObservationIgnored private var toneGraphsShown = 0
     @ObservationIgnored private var toneCurveTask: Task<Void, Never>?
     @ObservationIgnored private var toneCurveStale = false
@@ -683,6 +772,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         photoSidecar = nil; sidecarWrite?.cancel(); sidecarWrite = nil
         sourceGeneration += 1
         photoFacts = nil
+        cameraWhiteBalance = .null
         source = nil; sourceVariant = nil; image = nil; placeholder = nil; standIn = nil; previewCurrent = false; developFailure = nil
         asShotWhiteBalance = nil
         imageSize = .zero; placeholderSize = .zero; sourceSize = .zero; workingSize = .zero; previewScale = 1
@@ -753,6 +843,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         self.catalog = catalog
         stocks = catalog["profiles"].array.map(Stock.init)
         defaults = catalog["defaults"]
+        defaults["settings.rgb_to_raw_method"] = .string(newPhotoSpectralMethod)
         // The engine leaves lens correction off for params from before it, so
         // their crops keep their place; the app corrects every new edit.
         defaults[Self.lensCorrectionPath] = .bool(true)
@@ -843,7 +934,13 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     }
     var globalResetSavedAt: Date? { resetBaseline?.savedAt }
     func defaultValue(_ path: String) -> JSONValue {
-        resetBaseline?.value(for: path, fallback: defaults[path]) ?? defaults[path]
+        let components = path.split(separator: ".")
+        if components.count == 4, components[0] == "post", components[1] == "background_masks",
+           Int(components[2]) != nil,
+           ["exposure_ev", "temperature", "tint", "saturation"].contains(String(components[3])) {
+            return .number(0)
+        }
+        return resetBaseline?.value(for: path, fallback: defaults[path]) ?? defaults[path]
     }
     func isModified(_ path: String) -> Bool {
         let (current, original) = (value(path), defaultValue(path))
@@ -871,14 +968,34 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         apply(next, action: "Change White Balance")
     }
     func setWhiteBalancePreset(_ temperature: Double) {
+        let temperaturePath = "io.raw_white_balance.temperature"
+        let tintPath = "io.raw_white_balance.tint"
+        let oldTemperature = value(temperaturePath).double
+        let oldTint = min(max(value(tintPath).double, 0.01), 4)
+        let newTemperature = Self.snap(temperature, to: 1667...25000, step: 1)
+        let newTint = linkedWhiteBalanceTint(oldTint, temperatureDelta: newTemperature - oldTemperature)
         var next = state
         next.params["io.raw_white_balance.mode"] = .string("custom")
-        next.params["io.raw_white_balance.temperature"] = .number(Self.snap(temperature, to: 1667...25000, step: 1))
-        // A named illuminant lies on the daylight/Planckian locus. Start with
-        // neutral tint so the selected target maps through the chosen CAT
-        // (CAT02 by default), instead of carrying a prior custom green/magenta cast.
-        next.params["io.raw_white_balance.tint"] = .number(1)
+        next.params[temperaturePath] = .number(newTemperature)
+        // Use the same temperature-to-tint coupling as the linked slider, so
+        // choosing a Kelvin preset updates both RAW WB controls together.
+        next.params[tintPath] = .number(Self.snap(newTint, to: 0.01...4, step: 0.001))
         apply(next, action: "Set RAW White Balance Preset")
+    }
+    func setCameraWhiteBalancePreset(index: Int) {
+        var next = state
+        next.params["io.raw_white_balance.mode"] = .string("camera_preset")
+        // Keep the legacy enum field valid for older readers; the one-based
+        // index selects any camera-specific entry in the bundled Darktable table.
+        next.params["io.raw_white_balance.camera_preset"] = .string("daylight")
+        next.params["io.raw_white_balance.camera_preset_index"] = .number(Double(index + 1))
+        apply(next, action: "Set Camera White Balance Preset")
+    }
+    private func linkedWhiteBalanceTint(_ tint: Double, temperatureDelta: Double) -> Double {
+        let tint = min(max(tint, 0.01), 4)
+        let amount = tint < 1 ? log(tint) / log(0.01) * -100 : log(tint) / log(4) * 100
+        let linkedAmount = min(max(amount + temperatureDelta * 0.0125, -100), 100)
+        return linkedAmount < 0 ? pow(0.01, -linkedAmount / 100) : pow(4, linkedAmount / 100)
     }
     func resetValue(_ path: String) { set(path, defaultValue(path)) }
     func number(_ path: String, range: ClosedRange<Double>, step: Double) -> Binding<Double> {
@@ -987,12 +1104,9 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     /// unchanged, so existing edits, presets and exports retain their meaning.
     func whiteBalanceTintAmount() -> Binding<Double> {
         Binding(get: {
-            let tint = min(max(self.value("io.raw_white_balance.tint").double, 0.01), 4)
-            if tint < 1 { return log(tint) / log(0.01) * -100 }
-            return log(tint) / log(4) * 100
+            self.whiteBalanceTintAmount(for: self.value("io.raw_white_balance.tint").double)
         }, set: { amount in
-            let amount = min(max(amount, -100), 100)
-            let tint = amount < 0 ? pow(0.01, -amount / 100) : pow(4, amount / 100)
+            let tint = self.whiteBalanceTintValue(for: amount)
             self.set("io.raw_white_balance.tint", .number(Self.snap(tint, to: 0.01...4, step: 0.001)))
         })
     }
@@ -1020,10 +1134,8 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
             // In linked mode, warming moves tint toward green and cooling
             // moves it toward magenta. Work in the centered UI scale so a
             // Kelvin change has a visible, consistent effect around neutral.
-            let stored = min(max(self.value(tintPath).double, 0.01), 4)
-            let amount = stored < 1 ? log(stored) / log(0.01) * -100 : log(stored) / log(4) * 100
-            let linkedAmount = min(max(amount + (temperature - previousTemperature) * 0.0125, -100), 100)
-            let tint = linkedAmount < 0 ? pow(0.01, -linkedAmount / 100) : pow(4, linkedAmount / 100)
+            let tint = linkedWhiteBalanceTint(self.value(tintPath).double,
+                                              temperatureDelta: temperature - previousTemperature)
             next.params[tintPath] = .number(Self.snap(tint, to: 0.01...4, step: 0.001))
         }
         apply(next, action: "Change White Balance")
@@ -1328,8 +1440,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     /// Captures the selected adjustment families as a global baseline used by
     /// Reset on every photograph. Values are a small JSON parameter snapshot.
     func saveGlobalResetDefaults() {
-        let groups = Set((UserDefaults.standard.string(forKey: "negs.reset.keepGroups") ?? "")
-            .split(separator: "|").compactMap { ResetKeepGroup(rawValue: String($0)) })
+        let groups = ResetKeepGroup.selected(from: UserDefaults.standard.string(forKey: "negs.reset.keepGroups") ?? "")
         guard !groups.isEmpty else { return }
         let baseline = GlobalResetBaseline(groups: groups, params: state.params, film: state.film, paper: state.paper,
                                            previewSpace: previewSpace,
@@ -1343,6 +1454,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         guard !cropping, !targets.isEmpty else { return }
         var next = state
         var lanes: [String: [Int]] = [:]
+        var masksToRemove = Set<Int>()
         var spaceToRestore: String?
         // Exposure first: turning matching on after it sets Exposure to 0.
         if targets.contains(.exposure) { next.params["prep.exposure_ev"] = .number(matchedEV) }
@@ -1361,6 +1473,8 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
             case .scanFilm:
                 let stock = resetBaseline.flatMap { $0.groups.contains(.filmStock) ? $0.film : nil } ?? next.film
                 next.params["io.scan_film"] = .bool(films.first(where: { $0.id == stock })?.positive ?? false)
+            case .removeBackgroundMask(let index):
+                masksToRemove.insert(index)
             case .previewSpace:
                 spaceToRestore = resetBaseline?.groups.contains(.output) == true
                     ? resetBaseline?.previewSpace : SaveSettings.colorSpaces[0]
@@ -1381,6 +1495,14 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
             let preset = stockDefaults(path)
             let atPreset = values.count == preset.count && zip(values, preset).allSatisfy { abs($0 - $1) <= 1e-6 * max(1, abs($1)) }
             next.params[path] = atPreset ? .null : .array(values.map(JSONValue.number))
+        }
+        if masksToRemove.contains(-1) {
+            next.params["post.background_mask_png_base64"] = .string("")
+            next.params["post.background_mask_selection"] = .string("background")
+        }
+        if !masksToRemove.isEmpty {
+            next.params["post.background_masks"] = .array(next.params["post.background_masks"].array.enumerated()
+                .filter { !masksToRemove.contains($0.offset) }.map(\.element))
         }
         apply(next, action: action)
         if let spaceToRestore { choosePreviewSpace(spaceToRestore) }
@@ -1406,11 +1528,25 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     /// else re-renders.
     private func replaceState(_ next: EditState) {
         guard !closing else { return }
+        previewVersionSlot = nil
         let next = withPreferences(next)
         let render = next.rendered != state.rendered
         // The enlarged tile was of the edit before.
         if render { trialImage = nil }
         state = next
+        if let slot = editingVersionSlot,
+           let index = savedVersions.firstIndex(where: { $0.slot == slot }) {
+            let updated = SavedEditVersion(slot: slot, state: Self.userEdits(next))
+            if savedVersions[index] != updated {
+                savedVersions[index] = updated
+                versionImages[slot] = nil
+                persistVersions()
+                if comparisonMode == .versionWipe || comparisonMode == .threeUp {
+                    if versionPreviewTask == nil { renderVersionPreviews() }
+                    else { versionPreviewRefreshPending = true }
+                }
+            }
+        }
         // A crop doesn't re-render the preview, but it changes the thumbnails.
         if render { changed() } else { pumpPreviews() }
         reconcileBrightnessMatch()
@@ -1633,6 +1769,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         let generation = sourceGeneration
         customFilmFormat = false
         photoFacts = nil
+        cameraWhiteBalance = .null
         Task.detached(priority: .utility) { [weak self] in
             let facts = PhotoFacts.read(url)
             await self?.adopt(facts, generation: generation)
@@ -1711,6 +1848,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         guard renderState.rendered == rendered else { return false }
         let frame = cached.frame
         image = frame.surface; imageSize = frame.photoSize; isRaw = frame.raw
+        clippingMask = nil // Cached display frames do not retain scan clipping provenance.
         sourceSize = frame.sourceSize; workingSize = frame.workingSize
         previewScale = frame.workingSize.width > 0 ? Double(frame.surface.width) / frame.workingSize.width : 1
         showingCachedPreview = true; placeholder = nil; standIn = nil; hideActivity()
@@ -1719,6 +1857,8 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
             histogramTask?.cancel(); histogramTask = nil
             histogramRequest += 1; histogram = cached.scopes.histogram; waveform = cached.scopes.waveform
             vectorscope = cached.scopes.vectorscope; skinAnalysis = cached.scopes.skinAnalysis; scopesUpdating = false
+            chromaticity = cached.scopes.chromaticity
+            saturation = cached.scopes.saturation
             updateDiagnosticOverlay()
         } else { updateHistogram() }
         updateFilmStrip()
@@ -1754,7 +1894,23 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     }
 
     private func adopt(_ facts: PhotoFacts?, generation: Int) {
-        if generation == sourceGeneration { photoFacts = facts }
+        guard generation == sourceGeneration else { return }
+        photoFacts = facts
+        cameraWhiteBalance = .null
+        guard let source, Self.rawExtensions.contains(source.pathExtension.lowercased()), let engine else { return }
+        Task { [weak self] in
+            do {
+                let (_, result) = try await engine.request([
+                    "command": .string("camera_white_balance"), "input": .string(source.path)
+                ])
+                await self?.adoptCameraWhiteBalance(result["camera_white_balance"], generation: generation)
+            } catch { /* Unsupported metadata or an older helper keeps the standard WB controls. */ }
+        }
+    }
+
+    private func adoptCameraWhiteBalance(_ profile: JSONValue, generation: Int) {
+        guard generation == sourceGeneration else { return }
+        cameraWhiteBalance = profile
     }
 
     private func showStandIn(_ thumbnail: CGImage, generation: Int) {
@@ -1790,6 +1946,14 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
             size = turned ? CGSize(width: height, height: width) : CGSize(width: width, height: height)
         }
         return (image, size)
+    }
+
+    nonisolated static func imagePixelSize(of url: URL) -> CGSize? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber else { return nil }
+        return CGSize(width: width.doubleValue, height: height.doubleValue)
     }
 
     // MARK: Edits per photograph
@@ -1842,6 +2006,19 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         photoSidecar = context
     }
 
+    /// An unedited open photograph follows the default used when opening
+    /// the next photograph, just like its chosen film and paper do.
+    private func followNewPhotoSpectralMethod() {
+        guard source != nil, !closing, !cropping, !interacting, var context = photoSidecar, context.photo == source,
+              !context.editedAtOpen, context.blocked == nil, Self.userEdits(state) == context.opened else { return }
+        var next = state
+        next.params["settings.rgb_to_raw_method"] = .string(newPhotoSpectralMethod)
+        guard next != state else { return }
+        replaceState(next)
+        context.opened = Self.userEdits(state)
+        photoSidecar = context
+    }
+
     /// The state a photograph without saved edits opens with: the defaults,
     /// with the film and paper of Settings › New photographs. Image Size and
     /// the output colour follow the previous photograph, as a workflow's
@@ -1853,6 +2030,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         let retained = retainedPaths.map { ($0, previous.params[$0]) }
         next.film = newPhotoFilm; next.paper = newPhotoPaper
         next.params = defaults
+        next.params["settings.rgb_to_raw_method"] = .string(newPhotoSpectralMethod)
         for (path, value) in retained where value != .null { next.params[path] = value }
         next.params["io.scan_film"] = .bool(films.first(where: { $0.id == next.film })?.positive ?? false)
         next.border = BorderSettings()
@@ -2004,6 +2182,24 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     func applyVersion(_ slot: Int) {
         guard let version = savedVersions.first(where: { $0.slot == slot }) else { return }
         apply(restoredState(version.state, legacy: false), action: "Apply \(version.name)")
+        previewVersionSlot = slot
+    }
+
+    func selectVersionForEditing(_ slot: Int) {
+        guard comparisonMode == .versionWipe || comparisonMode == .threeUp,
+              let version = savedVersions.first(where: { $0.slot == slot }) else { return }
+        endInteraction()
+        editingVersionSlot = slot
+        apply(restoredState(version.state, legacy: false), action: "Edit \(version.name)")
+        previewVersionSlot = slot
+    }
+
+    func exportVersion(_ slot: Int) {
+        guard let version = savedVersions.first(where: { $0.slot == slot }) else { return }
+        editingVersionSlot = nil
+        apply(restoredState(version.state, legacy: false), action: "Export \(version.name)")
+        previewVersionSlot = slot
+        exportPanel()
     }
 
     func prepareComparison() {
@@ -2022,29 +2218,76 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
               versionPreviewTask == nil, let source, let engine else { return }
         let missing = savedVersions.filter { versionImages[$0.slot] == nil }
         guard !missing.isEmpty else { return }
+        let renderer: EngineClient
+        do {
+            if let comparisonEngine { renderer = comparisonEngine }
+            else {
+                renderer = try EngineClient(paths: engine.paths, quality: .userInitiated)
+                comparisonEngine = renderer
+            }
+        } catch {
+            status = "Couldn’t start the comparison renderer: \(error.localizedDescription)"
+            return
+        }
         let generation = sourceGeneration, space = previewSpace
+        let limitPreview = state.limitPreview
+        let scale = max(0.01, min(previewScale, 1))
         versionPreviewTask = Task { [weak self] in
             guard let self else { return }
-            defer { if !Task.isCancelled { self.versionPreviewTask = nil } }
+            defer {
+                if !Task.isCancelled {
+                    self.versionPreviewTask = nil
+                    if self.versionPreviewRefreshPending {
+                        self.versionPreviewRefreshPending = false
+                        self.renderVersionPreviews()
+                    }
+                }
+            }
             for version in missing {
                 guard !Task.isCancelled, !self.closing, generation == self.sourceGeneration,
                       (self.comparisonMode == .threeUp || self.comparisonMode == .versionWipe),
                       space == self.previewSpace else { return }
-                let buffer = engine.directory.appendingPathComponent("compare-\(UUID().uuidString).rgba")
+                let buffer = renderer.directory.appendingPathComponent("compare-\(UUID().uuidString).rgba")
                 defer { try? FileManager.default.removeItem(at: buffer) }
                 var state = version.state
+                state.limitPreview = limitPreview
                 state.params["io.output_color_space"] = .string(space)
-                // Thumbnail is independent of the main render retained for
-                // Save Preview. Bound comparison memory by its long edge.
-                let command: [String: JSONValue] = [
-                    "command": .string("thumbnail"), "input": .string(source.path),
-                    "source_generation": .number(Double(generation)), "film": .string(state.film),
-                    "paper": .string(state.paper), "params": state.params,
-                    "long_side": .number(1600),
-                    "preview_path": .string(buffer.path)
-                ]
                 do {
-                    let (_, result, _) = try await engine.requestOnLaunch(command)
+                    if let match = state.brightnessMatch, match.ev == nil || match.inputs != self.matchInputs(state) {
+                        let inputs = self.matchInputs(state)
+                        let request = self.matchSolveState(state)
+                        let key = self.matchCacheKey(source, request: request, paths: renderer.paths)
+                        let solved: (ev: Double, limited: Bool)
+                        if let key, let cached = self.matchCache.solved(key) {
+                            solved = cached
+                        } else {
+                            let (_, decoded, _) = try await renderer.requestOnLaunch(
+                                self.decodeOnlyCommand(source: source, generation: generation, state: request, engine: renderer))
+                            let size = CGSize(width: decoded["source_width"].double, height: decoded["source_height"].double)
+                            let raw = decoded["raw"].bool
+                            let prepared = raw ? Task.detached(priority: .utility) { CameraBrightnessReference.Prepared(from: source) } : nil
+                            let reference = renderer.directory.appendingPathComponent("compare-brightness-\(version.slot)-\(UUID().uuidString).png")
+                            defer { try? FileManager.default.removeItem(at: reference) }
+                            let outcome = try await Self.solveBrightnessMatch(
+                                engine: renderer, source: source, generation: generation, size: size, raw: raw,
+                                request: request, reference: reference,
+                                prepared: prepared)
+                            solved = (ev: outcome.exposure, limited: outcome.limited)
+                            if let key { self.matchCache.store(key, ev: solved.ev, limited: solved.limited) }
+                        }
+                        state = Self.matching(state, ev: solved.ev, limited: solved.limited, inputs: inputs) ?? state
+                    }
+                    var command: [String: JSONValue] = [
+                        "command": .string("render"), "input": .string(source.path),
+                        "source_generation": .number(Double(generation)), "film": .string(state.film),
+                        "paper": .string(state.paper), "params": state.params,
+                        "limit_preview": .bool(limitPreview), "interactive_scale": .number(scale),
+                        "preview_path": .string(buffer.path)
+                    ]
+                    if ImageSize.mode(of: state.params) == .longestSide, let crop = Self.cropJSON(state.crop) {
+                        command["crop"] = crop
+                    }
+                    let (_, result, _) = try await renderer.requestOnLaunch(command)
                     guard !Task.isCancelled else { return }
                     let preview = try await Task.detached(priority: .userInitiated) {
                         try Self.readPreview(buffer, width: Int(result["width"].double), height: Int(result["height"].double),
@@ -2509,6 +2752,9 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     func showLibrary() {
         guard !cropping else { return }
         prepareToBrowse()
+        if let source {
+            Task { await photoLibrary.syncEditedPhoto(source) }
+        }
         workspace = .library
     }
 
@@ -3671,7 +3917,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     nonisolated static let quickFrameMaximumPixelFraction = 0.5
     /// Fallback for RAW sources whose dimensions have not been decoded yet.
     nonisolated static let initialRawPreviewScale: CGFloat = 0.27
-    nonisolated static let rawPreviewShortEdge: CGFloat = 1080
+    nonisolated static let rawPreviewShortEdge: CGFloat = 2048
     nonisolated static let maximumRawPreviewScale: CGFloat = 0.38
 
     nonisolated static func rawPreviewScale(requested: CGFloat?, photoSize: CGSize? = nil) -> CGFloat {
@@ -3834,8 +4080,10 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
             guard showable() else { return }
             let width = Int(result["width"].double), height = Int(result["height"].double)
             let display = result["display_color_space"].string
+            let clippingBuffer = buffer.deletingPathExtension().appendingPathExtension("clip")
             let developed = try await Task.detached(priority: .userInitiated) {
-                try Self.readPreview(buffer, width: width, height: height, displaySpace: display)
+                let surface = try Self.readPreview(buffer, width: width, height: height, displaySpace: display)
+                return (surface, try? Data(contentsOf: clippingBuffer))
             }.value
             let cacheKey = await cacheKeyTask?.value ?? nil
             guard showable() else { return }
@@ -3846,12 +4094,10 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
                 guard let self else { return }
                 imageSize = CGSize(width: result["photo_width"].double, height: result["photo_height"].double)
                 workingSize = CGSize(width: result["working_width"].double, height: result["working_height"].double)
-                if interactiveScale == nil {
-                    previewScale = workingSize.width > 0 ? min(Double(width) / workingSize.width, 1) : 1
-                }
+                previewScale = workingSize.width > 0 ? min(Double(width) / workingSize.width, 1) : 1
                 showingInteractiveFrame = interactiveScale != nil
                 quickFrame = quick ? frame : nil
-                image = developed; placeholder = nil; standIn = nil
+                image = developed.0; clippingMask = developed.1; placeholder = nil; standIn = nil
                 if comparisonMode != .off { prepareComparison() }
                 if revision == currentRevision { trialImage = nil }
                 updateHistogram()
@@ -3872,7 +4118,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
                     showingCachedPreview = false
                     renderAtExportSize = result["export_resolution"].bool
                     renderOnGPU = ExportEngine.ranOnGPU(backend: result["backend"].string)
-                    if let cacheKey { previewCache.save(developed, photoSize: imageSize, sourceSize: sourceSize, workingSize: workingSize, raw: isRaw, key: cacheKey) }
+                    if let cacheKey { previewCache.save(developed.0, photoSize: imageSize, sourceSize: sourceSize, workingSize: workingSize, raw: isRaw, key: cacheKey) }
                 } else if revision == currentRevision, interactiveScale != nil {
                     // Keep a responsive proxy as the current editor frame. A
                     // full decode immediately after this would make the UI
@@ -3937,7 +4183,12 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         histogramTask?.cancel()
         guard let image else {
             histogramTask = nil; scopesUpdating = false
+            clippingMask = nil
             histogram = nil; waveform = nil; vectorscope = nil; skinAnalysis = nil; diagnosticOverlay = nil
+            chromaticity = ChromaticityScope(); saturation = SaturationScope(); colorSample = nil
+            backgroundMaskRequest += 1
+            backgroundMaskTask?.cancel(); backgroundMaskTask = nil
+            backgroundMaskOverlay = nil; backgroundMaskGenerating = false
             diagnosticOverlayRequest += 1
             diagnosticOverlayTask?.cancel(); diagnosticOverlayTask = nil
             return
@@ -3956,6 +4207,10 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         requestedScopeMode = mode
         updateHistogram()
     }
+    func pickColor(at displayedPoint: CGPoint) {
+        guard let image else { return }
+        colorSample = ImageScopes.sample(image, displayedPoint: displayedPoint, crop: crop, rotation: imageRotation)
+    }
     private func updateDiagnosticOverlay() {
         diagnosticOverlayRequest += 1
         diagnosticOverlayTask?.cancel(); diagnosticOverlayTask = nil
@@ -3963,11 +4218,295 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         guard !closing, (clippingOverlayEnabled || falseColorEnabled), let image else { diagnosticOverlay = nil; return }
         let falseColor = falseColorEnabled
         let lowThreshold = clippingLowThreshold, highThreshold = clippingHighThreshold
+        let clippedHighlights = clippingMask
         diagnosticOverlayTask = Task.detached(priority: .utility) { [weak self] in
-            let overlay = falseColor ? ImageScopes.falseColorOverlay(image) : ImageScopes.clippingOverlay(image, low: lowThreshold, high: highThreshold)
+            let overlay = falseColor ? ImageScopes.falseColorOverlay(image) : ImageScopes.clippingOverlay(
+                image, low: lowThreshold, high: highThreshold, clippedHighlights: clippedHighlights)
             guard !Task.isCancelled else { return }
             await self?.showDiagnosticOverlay(overlay, request: request)
         }
+    }
+    private func updateBackgroundMask() {
+        backgroundMaskRequest += 1
+        backgroundMaskTask?.cancel(); backgroundMaskTask = nil
+        guard !closing, backgroundMaskEnabled else {
+            backgroundMaskOverlay = nil; backgroundMaskGenerating = false
+            return
+        }
+        if !hasBackgroundMask {
+            addBackgroundMask()
+            return
+        }
+        backgroundMaskOverlay = activeBackgroundMaskOverlay()
+    }
+    private func activeBackgroundMaskOverlay() -> CGImage? {
+        let layers = backgroundMaskLayers
+        if layers.indices.contains(selectedBackgroundMaskIndex) {
+            return BackgroundMask.overlay(fromPNGBase64: layers[selectedBackgroundMaskIndex]["mask_png_base64"].string)
+        }
+        return BackgroundMask.overlay(fromPNGBase64: value("post.background_mask_png_base64").string)
+    }
+    var backgroundMaskLabels: [String] {
+        backgroundMaskLayers.enumerated().map { index, layer in
+            let title = BackgroundMask.Selection(rawValue: layer["selection"].string)?.title ?? "Mask"
+            return "\(index + 1) · \(title)"
+        }
+    }
+    func selectBackgroundMask(at index: Int) {
+        guard backgroundMaskLayers.indices.contains(index) else { return }
+        selectedBackgroundMaskIndex = index
+        if backgroundMaskEnabled { backgroundMaskOverlay = activeBackgroundMaskOverlay() }
+    }
+    func createBrushBackgroundMask() {
+        guard !backgroundMaskGenerating, let image,
+              let painter = MaskPainter(width: image.width, height: image.height),
+              let result = painter.makeResult() else { return }
+        var layers = backgroundMaskLayers
+        layers.append(.object([
+            "id": .string(UUID().uuidString), "selection": .string(BackgroundMask.Selection.custom.rawValue),
+            "mask_png_base64": .string(result.pngBase64), "exposure_ev": .number(0),
+            "temperature": .number(0), "tint": .number(0), "saturation": .number(0)
+        ]))
+        set("post.background_masks", .array(layers))
+        selectedBackgroundMaskIndex = layers.count - 1
+        backgroundMaskSelection = .custom
+        backgroundMaskEnabled = true
+        backgroundMaskOverlay = result.overlay
+        backgroundMaskBrushSubtract = false
+        backgroundMaskBrushActive = true
+    }
+    func beginBackgroundMaskStroke(at point: CGPoint) {
+        guard backgroundMaskBrushActive, !backgroundMaskGenerating,
+              backgroundMaskLayers.indices.contains(selectedBackgroundMaskIndex) else { return }
+        let layer = backgroundMaskLayers[selectedBackgroundMaskIndex]
+        let encoded = layer["mask_png_base64"].string
+        guard !encoded.isEmpty,
+              let data = Data(base64Encoded: encoded),
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let mask = CGImageSourceCreateImageAtIndex(source, 0, nil),
+              let painter = MaskPainter(width: mask.width, height: mask.height, pngBase64: encoded) else { return }
+        backgroundMaskPainter = painter
+        painter.stroke(to: point, diameter: backgroundMaskBrushSize, subtract: backgroundMaskBrushSubtract)
+        backgroundMaskOverlay = painter.overlayImage()
+    }
+    func continueBackgroundMaskStroke(at point: CGPoint) {
+        guard let painter = backgroundMaskPainter else { return }
+        painter.stroke(to: point, diameter: backgroundMaskBrushSize, subtract: backgroundMaskBrushSubtract)
+        backgroundMaskOverlay = painter.overlayImage()
+    }
+    func endBackgroundMaskStroke() {
+        guard let painter = backgroundMaskPainter else { return }
+        painter.endStroke()
+        backgroundMaskPainter = nil
+        guard let result = painter.makeResult() else { return }
+        var layers = backgroundMaskLayers
+        guard layers.indices.contains(selectedBackgroundMaskIndex), var layer = layers[selectedBackgroundMaskIndex].object else { return }
+        layer["mask_png_base64"] = .string(result.pngBase64)
+        // An edited selection no longer matches a previously generated fill.
+        layer.removeValue(forKey: "inpaint_patch_png_base64")
+        layer.removeValue(forKey: "inpaint_bounds")
+        layer.removeValue(forKey: "inpaint_color_space")
+        layers[selectedBackgroundMaskIndex] = .object(layer)
+        var next = state
+        next.params["post.background_masks"] = .array(layers)
+        backgroundMaskOverlay = result.overlay
+        apply(next, action: "Refine Mask")
+    }
+    func invertSelectedBackgroundMask() {
+        guard !backgroundMaskGenerating, backgroundMaskLayers.indices.contains(selectedBackgroundMaskIndex),
+              !backgroundMaskLayers[selectedBackgroundMaskIndex]["mask_png_base64"].string.isEmpty else { return }
+        let encoded = backgroundMaskLayers[selectedBackgroundMaskIndex]["mask_png_base64"].string
+        guard
+              let data = Data(base64Encoded: encoded),
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let mask = CGImageSourceCreateImageAtIndex(source, 0, nil),
+              let painter = MaskPainter(width: mask.width, height: mask.height, pngBase64: encoded) else { return }
+        painter.invert()
+        guard let result = painter.makeResult() else { return }
+        var layers = backgroundMaskLayers
+        guard var layer = layers[selectedBackgroundMaskIndex].object else { return }
+        layer["mask_png_base64"] = .string(result.pngBase64)
+        layer.removeValue(forKey: "inpaint_patch_png_base64")
+        layer.removeValue(forKey: "inpaint_bounds")
+        layer.removeValue(forKey: "inpaint_color_space")
+        layers[selectedBackgroundMaskIndex] = .object(layer)
+        var next = state
+        next.params["post.background_masks"] = .array(layers)
+        backgroundMaskOverlay = result.overlay
+        apply(next, action: "Invert Mask")
+    }
+    func backgroundMaskNumber(_ field: String, range: ClosedRange<Double>, step: Double) -> Binding<Double> {
+        number(backgroundMaskPath(field), range: range, step: step)
+    }
+    func backgroundMaskPath(_ field: String) -> String {
+        backgroundMaskLayers.indices.contains(selectedBackgroundMaskIndex)
+            ? "post.background_masks.\(selectedBackgroundMaskIndex).\(field)"
+            : "post.background_\(field)"
+    }
+    func addBackgroundMask(selection requestedSelection: BackgroundMask.Selection? = nil) {
+        guard !backgroundMaskGenerating else { return }
+        if requestedSelection == .custom { createBrushBackgroundMask(); return }
+        guard let image else { backgroundMaskEnabled = false; return }
+        backgroundMaskRequest += 1
+        let request = backgroundMaskRequest
+        let selection = requestedSelection ?? backgroundMaskSelection
+        backgroundMaskSelection = selection
+        backgroundMaskBrushActive = false
+        backgroundMaskGenerating = true
+        backgroundMaskTask?.cancel()
+        backgroundMaskTask = Task.detached(priority: .utility) { [weak self] in
+            let result = BackgroundMask.result(for: image, selection: selection)
+            guard !Task.isCancelled else { return }
+            await self?.appendBackgroundMask(result, selection: selection, request: request)
+        }
+    }
+    private func appendBackgroundMask(_ result: BackgroundMask.Result?, selection: BackgroundMask.Selection, request: Int) {
+        guard !closing, request == backgroundMaskRequest else { return }
+        backgroundMaskTask = nil
+        backgroundMaskGenerating = false
+        guard let result else {
+            error = "Vision could not create a mask for this selection."
+            return
+        }
+        var layers = backgroundMaskLayers
+        // Upgrade a pre-layer edit the first time the user adds another mask.
+        if layers.isEmpty, !value("post.background_mask_png_base64").string.isEmpty {
+            layers.append(.object([
+                "id": .string(UUID().uuidString),
+                "selection": .string(value("post.background_mask_selection").string.isEmpty ? "background" : value("post.background_mask_selection").string),
+                "mask_png_base64": value("post.background_mask_png_base64"),
+                "exposure_ev": value("post.background_exposure_ev"),
+                "temperature": value("post.background_temperature"),
+                "tint": value("post.background_tint"),
+                "saturation": value("post.background_saturation")
+            ]))
+            set("post.background_mask_png_base64", .string(""))
+        }
+        layers.append(.object([
+            "id": .string(UUID().uuidString), "selection": .string(selection.rawValue),
+            "mask_png_base64": .string(result.pngBase64), "exposure_ev": .number(0),
+            "temperature": .number(0), "tint": .number(0), "saturation": .number(0)
+        ]))
+        set("post.background_masks", .array(layers))
+        selectedBackgroundMaskIndex = layers.count - 1
+        backgroundMaskEnabled = true
+        backgroundMaskOverlay = result.overlay
+    }
+
+    /// Removes the selected layer's masked object with the chosen inpainting
+    /// provider. The repaired crop is stored in that layer and composited
+    /// through the original mask in preview and export.
+    func removeSelectedBackgroundObject() {
+        guard !backgroundMaskGenerating,
+              backgroundMaskLayers.indices.contains(selectedBackgroundMaskIndex),
+              previewCurrent, !rendering, !saving else { return }
+        let index = selectedBackgroundMaskIndex
+        let generation = sourceGeneration
+        let request = backgroundMaskRequest
+        backgroundMaskGenerating = true
+        backgroundMaskStatus = "Preparing the full-resolution frame…"
+        error = nil
+        backgroundMaskTask?.cancel()
+        backgroundMaskTask = Task { [weak self] in
+            guard let self else { return }
+            let temporary = FileManager.default.temporaryDirectory
+                .appendingPathComponent("negs-lama-\(UUID().uuidString).png")
+            defer {
+                try? FileManager.default.removeItem(at: temporary)
+                if generation == self.sourceGeneration {
+                    self.backgroundMaskGenerating = false
+                    self.backgroundMaskTask = nil
+                    if self.backgroundMaskStatus == "Running LaMa on this Mac…"
+                        || self.backgroundMaskStatus == "Removing selected area with GPT Image…" {
+                        self.backgroundMaskStatus = ""
+                    }
+                }
+            }
+            do {
+                let currentLayers = self.backgroundMaskLayers
+                guard currentLayers.indices.contains(index), var layer = currentLayers[index].object,
+                      let encodedMask = layer["mask_png_base64"]?.string,
+                      let engine = self.engine, let source = self.source else { throw LaMaInpainting.Failure.emptyMask }
+
+                var removalState = self.state
+                let postPaths = removalState.params.object.map { Array($0.keys) } ?? []
+                for path in postPaths where path.hasPrefix("post.") {
+                    removalState.params[path] = self.defaultValue(path)
+                }
+                var settings = SaveSettings()
+                settings.colorSpace = SaveSettings.colorSpaces.firstIndex(of: self.previewSpace) ?? 0
+                settings.bitDepth = 8
+                let job = ExportJob()
+                _ = try await job.run(paths: engine.paths, scratch: engine.scratch,
+                                      source: source, destination: temporary, state: removalState,
+                                      crop: nil, border: nil, size: .full, save: settings,
+                                      engine: .fast, rating: nil)
+                guard generation == self.sourceGeneration, request == self.backgroundMaskRequest,
+                      index < self.backgroundMaskLayers.count,
+                      let imageSource = CGImageSourceCreateWithURL(temporary as CFURL, nil),
+                      let fullImage = CGImageSourceCreateImageAtIndex(imageSource, 0, nil),
+                      let fullMask = BackgroundMask.mask(fromPNGBase64: encodedMask,
+                                                         width: fullImage.width, height: fullImage.height) else {
+                    throw LaMaInpainting.Failure.invalidImage
+                }
+                let patch: (image: CGImage, x: Double, y: Double, width: Double, height: Double)
+                switch self.backgroundMaskRemovalProvider {
+                case .localLaMa:
+                    self.backgroundMaskStatus = "Running LaMa on this Mac…"
+                    let result = try await LaMaInpainting.inpaint(image: fullImage, mask: fullMask)
+                    patch = (result.image, result.x, result.y, result.width, result.height)
+                case .openAI:
+                    guard let apiKey = try OpenAIImageInpainting.apiKey() else {
+                        throw OpenAIImageInpainting.Failure.missingAPIKey
+                    }
+                    self.backgroundMaskStatus = "Removing selected area with GPT Image…"
+                    let result = try await OpenAIImageInpainting.inpaint(image: fullImage, mask: fullMask, apiKey: apiKey)
+                    patch = (result.image, result.x, result.y, result.width, result.height)
+                }
+                guard generation == self.sourceGeneration, request == self.backgroundMaskRequest,
+                      index < self.backgroundMaskLayers.count else { return }
+                layer["inpaint_patch_png_base64"] = .string(try LaMaInpainting.pngBase64(patch.image))
+                layer["inpaint_bounds"] = .array([patch.x, patch.y, patch.width, patch.height].map { .number($0) })
+                layer["inpaint_color_space"] = .string(settings.spaceName)
+                var layers = self.backgroundMaskLayers
+                layers[index] = .object(layer)
+                var next = self.state
+                next.params["post.background_masks"] = .array(layers)
+                let providerName = self.backgroundMaskRemovalProvider.title
+                self.apply(next, action: "Remove Object with \(providerName)")
+                self.backgroundMaskStatus = "Object removed · \(providerName)"
+            } catch {
+                if generation == self.sourceGeneration, request == self.backgroundMaskRequest {
+                    self.backgroundMaskStatus = ""
+                    self.error = error.localizedDescription
+                }
+            }
+        }
+    }
+    func removeSelectedBackgroundMask() {
+        var layers = backgroundMaskLayers
+        guard layers.indices.contains(selectedBackgroundMaskIndex) else {
+            set("post.background_mask_png_base64", .string(""))
+            backgroundMaskOverlay = nil
+            return
+        }
+        layers.remove(at: selectedBackgroundMaskIndex)
+        set("post.background_masks", .array(layers))
+        selectedBackgroundMaskIndex = max(0, min(selectedBackgroundMaskIndex, layers.count - 1))
+        backgroundMaskOverlay = backgroundMaskEnabled ? activeBackgroundMaskOverlay() : nil
+    }
+    func clearBackgroundMask() {
+        var next = state
+        next.params["post.background_masks"] = .array([])
+        next.params["post.background_mask_png_base64"] = .string("")
+        next.params["post.background_mask_selection"] = .string("background")
+        apply(next, action: "Remove AI Masks")
+        backgroundMaskRequest += 1
+        backgroundMaskTask?.cancel(); backgroundMaskTask = nil
+        backgroundMaskEnabled = false
+        backgroundMaskGenerating = false
+        backgroundMaskOverlay = nil
+        selectedBackgroundMaskIndex = 0
     }
     private func showDiagnosticOverlay(_ overlay: CGImage?, request: Int) {
         guard !closing, request == diagnosticOverlayRequest else { return }
@@ -3981,6 +4520,8 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         waveform = counted.waveform
         vectorscope = counted.vectorscope
         skinAnalysis = counted.skinAnalysis
+        chromaticity = counted.chromaticity
+        saturation = counted.saturation
     }
 
     // MARK: Tone graph
@@ -4262,7 +4803,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     func autoWhiteBalance() {
         guard isRaw, let source, let engine else { return }
         let selectedMethod = value("io.raw_white_balance.method").string
-        let adaptationMethod = selectedMethod.isEmpty ? "cat02" : selectedMethod
+        let adaptationMethod = selectedMethod.isEmpty ? "cat16" : selectedMethod
         Task { [weak self] in
             guard let self else { return }
             do {
@@ -4780,20 +5321,46 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         exporting = true
         exportCancellable = false
         exportStarted = Date()
-        defer { exporting = false; exportCancellable = false; exportJob = nil }
+        let megapixels = max(0.1, Double(max(sourceSize.width * sourceSize.height,
+                                             imageSize.width * imageSize.height)) / 1_000_000)
+        let rawInput = isRaw
+        exportExpectedDuration = nil
+        defer {
+            exporting = false; exportCancellable = false; exportJob = nil
+            exportExpectedDuration = nil
+        }
         await settleBrightnessMatch()
         guard !closing, !saving, sourceGeneration == generation else { return }
+        exportStarted = Date()
+        let cachedPreview = exportEngine == .fast && renderAtExportSize
+        let cachedPreviewMegapixels = image.map { max(0.1, Double($0.width * $0.height) / 1_000_000) } ?? megapixels
+        let timingMegapixels = cachedPreview ? cachedPreviewMegapixels : megapixels
+        exportExpectedDuration = ExportTiming.estimate(engine: exportEngine, raw: rawInput,
+                                                       megapixels: timingMegapixels, cachedPreview: cachedPreview)
         var exportState = state
         exportState.params["settings.serial_grain"] = .bool(lowMemoryExport)
         let exportBorder = state.border.exported(for: photoSize)
         let rating = currentSummary.flatMap(ExportRating.value)
         // An edit made meanwhile makes the save fail; develop the photograph then.
-        if exportEngine == .fast, await exportPreview(to: url, size: size, save: save) { return }
+        if exportEngine == .fast, await exportPreview(to: url, size: size, save: save) {
+            let elapsed = Date().timeIntervalSince(exportStarted)
+            ExportTiming.record(engine: .fast, raw: rawInput, megapixels: timingMegapixels,
+                                duration: elapsed, cachedPreview: true)
+            return
+        }
+        if cachedPreview {
+            exportStarted = Date()
+            exportExpectedDuration = ExportTiming.estimate(engine: exportEngine, raw: rawInput, megapixels: megapixels)
+        }
         let job = ExportJob(); exportJob = job; exportCancellable = true
         do {
             let outcome = try await job.run(paths: engine.paths, scratch: engine.scratch, source: source, destination: url, state: exportState,
                                             crop: exportState.crop.cropped ? exportState.crop : nil, border: exportBorder, size: size, save: save,
                                             engine: exportEngine, rating: rating)
+            let elapsed = Date().timeIntervalSince(exportStarted)
+            let actualEngine: ExportEngine = outcome.fellBackToCPU ? .reference : exportEngine
+            if outcome.fellBackToCPU { ExportTiming.noteCPUFallback() }
+            ExportTiming.record(engine: actualEngine, raw: rawInput, megapixels: megapixels, duration: elapsed)
             status = outcome.fellBackToCPU
                 ? "Exported \(url.lastPathComponent) on the CPU (32-bit): no GPU was available for Fast export"
                 : "Exported \(url.lastPathComponent)"
@@ -4976,6 +5543,7 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
     private func startBatch(_ journal: BatchJournal) -> BatchRun? {
         guard canStartBatch else { return nil }
         let run = BatchRun(journal: journal, journalURL: batchJournalURL)
+        run.prepareTimeEstimates()
         batch = run
         requestNotificationPermission()
         launchBatch(run)
@@ -5058,10 +5626,22 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         run.job = job
         defer { run.job = nil }
         do {
-            try await job.run(paths: paths, scratch: scratch, source: photo, destination: destination, state: exportState,
-                              crop: state.crop.cropped ? state.crop : nil, border: state.border.exported(for: state.crop.size(of: size ?? .zero)),
-                              size: options.size, save: options.save, engine: options.exportEngine, rating: item.rating)
+            run.beginCurrentItem(item, size: size)
+            let raw = Self.rawExtensions.contains(photo.pathExtension.lowercased())
+            let measuredSize = size ?? Self.imagePixelSize(of: photo)
+            let megapixels = measuredSize.map { max(0.1, Double($0.width * $0.height) / 1_000_000) } ?? 0.1
+            let exportStarted = Date()
+            let outcome = try await job.run(paths: paths, scratch: scratch, source: photo, destination: destination, state: exportState,
+                                            crop: state.crop.cropped ? state.crop : nil, border: state.border.exported(for: state.crop.size(of: size ?? .zero)),
+                                            size: options.size, save: options.save, engine: options.exportEngine, rating: item.rating)
+            let duration = Date().timeIntervalSince(exportStarted)
+            let actualEngine: ExportEngine = outcome.fellBackToCPU ? .reference : options.exportEngine
+            if outcome.fellBackToCPU { ExportTiming.noteCPUFallback() }
+            ExportTiming.record(engine: actualEngine, raw: raw, megapixels: megapixels, duration: duration)
+            run.useTimingEngine(actualEngine)
+            run.recordCurrentDuration(duration, for: item)
             item.status = .done; item.written = destination; item.reason = nil
+            run.prepareTimeEstimates()
         } catch is CancellationError {
             return item
         } catch {
@@ -5450,12 +6030,12 @@ enum PreviewCompareMode: String, CaseIterable, Identifiable {
         matchCache.flush()
 
         closing = true; pendingRender?.cancel(); activityTimer?.cancel()
-        histogramTask?.cancel(); diagnosticOverlayTask?.cancel(); versionPreviewTask?.cancel(); originalLoad?.cancel()
+        histogramTask?.cancel(); diagnosticOverlayTask?.cancel(); backgroundMaskTask?.cancel(); versionPreviewTask?.cancel(); originalLoad?.cancel()
         toneCurveTask?.cancel(); interactionEndTask?.cancel()
         if let powerStateObserver { NotificationCenter.default.removeObserver(powerStateObserver); self.powerStateObserver = nil }
         thumbnailTask?.cancel(); thumbnailIdle?.cancel()
         thumbnailsDeveloping.values.forEach { $0.task.cancel() }; thumbnailEngines.values.forEach { $0.stop() }
-        exportJob?.cancel(); batch?.job?.cancel(); batchEngine?.stop(); engine?.stop()
+        exportJob?.cancel(); batch?.job?.cancel(); batchEngine?.stop(); comparisonEngine?.stop(); engine?.stop()
     }
     private func report(_ error: Error) { self.error = error.localizedDescription; status = "Could not complete the operation" }
 }

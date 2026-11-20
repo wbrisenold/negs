@@ -39,16 +39,20 @@ private struct StatusWords: View {
         if let note = model.libraryNote {
             NoteWords(note: note)
         } else if let run = model.batch, run.running {
-            HStack(spacing: 14) {
-                Text(StatusText.exporting(run.finished, of: run.total))
-                ProgressRule(fraction: run.fraction)
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                let times = run.remainingTimes(at: timeline.date)
+                HStack(spacing: 12) {
+                    Text(StatusText.exporting(run.finished, of: run.total))
+                    Text("Image left \(ExportTiming.eta(times.image)) · Total left \(ExportTiming.eta(times.total))")
+                        .foregroundStyle(Theme.dim)
+                    ProgressRule(fraction: times.image == nil ? nil : run.progress(at: timeline.date))
+                }
             }
             .foregroundStyle(Theme.label)
         } else if let run = model.batch, run.needsAttention {
             BatchOutcome(model: model, run: run)
         } else if model.exporting {
-            Text("Exporting \(model.sourceItem.map { model.library.name(of: $0) } ?? "the photograph")")
-                .foregroundStyle(Theme.label)
+            ExportProgressWords(model: model)
         } else if let session = model.cropSession {
             Text(StatusText.cropping(session.aspect.title, size: session.exportedSize(working: model.workingSize)))
         } else if model.renderFailed {
@@ -60,6 +64,37 @@ private struct StatusWords: View {
             .accessibilityElement(children: .combine)
         } else {
             Text(model.status).textSelection(.enabled)
+        }
+    }
+}
+
+/// Shows per-image and total remaining time, using a per-Mac ETA learned from completed exports.
+/// Before a matching export has been measured, the bar stays indeterminate
+/// instead of inventing a percentage.
+private struct ExportProgressWords: View {
+    let model: EditorModel
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            let elapsed = max(0, timeline.date.timeIntervalSince(model.exportStarted))
+            let remaining = model.exportExpectedDuration.map { $0 - elapsed }
+            let etaText = ExportTiming.eta(remaining.flatMap { $0 > 1 ? $0 : nil })
+            HStack(spacing: 9) {
+                Text("Image left \(etaText) · Total left \(etaText)")
+                    .foregroundStyle(Theme.label)
+                    .lineLimit(1)
+                    .accessibilityLabel("Exporting. Time left for this image \(etaText). Total time left \(etaText).")
+                Group {
+                    if let remaining, remaining > 1, let expected = model.exportExpectedDuration {
+                        ProgressView(value: min(0.97, elapsed / expected))
+                    } else {
+                        ProgressView()
+                    }
+                }
+                .progressViewStyle(.linear)
+                .frame(width: 88)
+                .accessibilityHidden(true)
+            }
         }
     }
 }
@@ -152,17 +187,23 @@ private struct BatchOutcome: View {
 
 /// The export's progress: a 150 pt line in `track` with the pencil's yellow along it.
 private struct ProgressRule: View {
-    let fraction: Double
+    let fraction: Double?
 
     var body: some View {
-        ZStack(alignment: .leading) {
-            Rectangle().fill(Theme.track).frame(height: 1)
-            Rectangle().fill(Theme.accent).frame(width: 150 * min(max(fraction, 0), 1), height: 2)
+        Group {
+            if let fraction {
+                ZStack(alignment: .leading) {
+                    Rectangle().fill(Theme.track).frame(height: 1)
+                    Rectangle().fill(Theme.accent).frame(width: 150 * min(max(fraction, 0), 1), height: 2)
+                }
+                .accessibilityLabel("Export progress")
+                .accessibilityValue("\(Int((fraction * 100).rounded())) percent")
+            } else {
+                ProgressView().progressViewStyle(.linear).tint(Theme.accent)
+            }
         }
-        .frame(width: 150, height: 2)
+        .frame(width: 150, height: 8)
         .accessibilityElement()
-        .accessibilityLabel("Export progress")
-        .accessibilityValue("\(Int((fraction * 100).rounded())) percent")
     }
 }
 

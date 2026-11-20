@@ -2,17 +2,10 @@ import AppKit
 import CoreText
 import SwiftUI
 
-/// The label under the photograph, like the line under a print: the film,
-/// paper and output transform selectors (IMPLEMENTATION.md §4.2).
-///
-/// One row when both names fit under the photograph; two when they don't,
-/// with the paper's row free to run past the photograph's right edge up to
-/// the canvas's margin, where it's cut with an ellipsis.
+/// Film, paper, and output choices live together in the develop rail. Keeping
+/// them in a labeled control group leaves the photograph's caption clear.
 struct PrintLabel: View {
     let model: EditorModel
-    /// The widest the photograph allows (one row) and the canvas allows (two).
-    let photoWidth: CGFloat
-    let canvasWidth: CGFloat
     @Environment(\.sheetInk) private var ink
 
     var body: some View {
@@ -20,35 +13,47 @@ struct PrintLabel: View {
         let original = model.original != nil
         let kind = PrintLabelLayout.kind(scanning: scanning)
         let look = RenderLook(rawValue: model.value("io.render_look").string) ?? .referentOutput
-        let oneRow = PrintLabelLayout.fitsOneRow(film: model.filmName, paper: model.paperName, kind: kind,
-                                                  output: look.compactTitle, width: photoWidth)
-        let film = StockName(model: model, paper: false, name: model.filmName, size: 24, weight: 600,
-                             strike: original ? .original : nil, opens: !original)
-        let paper = HStack(alignment: .firstTextBaseline, spacing: PrintLabelLayout.inner) {
-            Text(kind).font(Theme.text(14, italic: true)).foregroundStyle(ink.dim).lineLimit(1).fixedSize()
-            StockName(model: model, paper: true, name: model.paperName, size: 17.5, weight: 400,
-                      strike: original ? .original : scanning ? .scanning : nil, opens: !original && !scanning)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 7) {
+                Image(systemName: "camera.aperture").font(.system(size: 10, weight: .semibold))
+                Text("STOCKS").font(Theme.ui(10, weight: .bold)).tracking(0.8)
+                Spacer(minLength: 0)
+                Text(scanning ? "SCAN" : "PRINT").font(Theme.ui(9, weight: .semibold)).tracking(0.5)
+                    .foregroundStyle(ink.dim)
+            }
+            .foregroundStyle(ink.label)
+
+            controlRow("FILM") {
+                StockName(model: model, paper: false, name: model.filmName, size: 12.5, weight: 600,
+                          strike: original ? .original : nil, opens: !original, compact: true)
+            }
+            controlRow("PAPER") {
+                StockName(model: model, paper: true, name: model.paperName, size: 12.5, weight: 500,
+                          strike: original ? .original : scanning ? .scanning : nil,
+                          opens: !original && !scanning, compact: true)
+            }
             if original {
-                Text("the original").font(Theme.text(16, italic: true)).foregroundStyle(ink.paper).lineLimit(1).fixedSize()
-                    .padding(.leading, 6 - PrintLabelLayout.inner)
+                Text("Showing original · \(kind)")
+                    .font(Theme.text(11, italic: true)).foregroundStyle(ink.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            controlRow("OUTPUT") {
+                OutputLookMenu(model: model, selected: look, compact: true)
             }
         }
-        let output = OutputLookMenu(model: model, selected: look)
-        Group {
-            if oneRow {
-                HStack(alignment: .firstTextBaseline, spacing: PrintLabelLayout.gap) { film; paper; output }
-                    .padding(.top, 11)
-            } else {
-                VStack(alignment: .leading, spacing: 0) {
-                    film
-                    HStack(alignment: .firstTextBaseline, spacing: PrintLabelLayout.gap) { paper; output }
-                }
-                    .padding(.top, 8)
-            }
-        }
-        .frame(width: oneRow ? photoWidth : canvasWidth, alignment: .topLeading)
+        .padding(.horizontal, 11).padding(.vertical, 11)
+        .frame(width: Theme.Size.photoRail, alignment: .leading)
+        .background(Theme.panel)
+        .overlay(alignment: .bottom) { Theme.line.frame(height: 1) }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Film and paper")
+        .accessibilityLabel("Film, paper, and output")
+    }
+
+    private func controlRow<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(Theme.ui(8.5, weight: .bold)).tracking(0.7).foregroundStyle(ink.dim)
+            content().frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }
 
@@ -88,6 +93,7 @@ struct PrintLabel: View {
 }
 
 private enum RenderLook: String, CaseIterable, Identifiable {
+    case original = "off"
     case hncs = "hasselblad_hncs"
     case hncsSmooth = "hasselblad_hncs_smooth"
     case referentOutput = "referent_output"
@@ -97,6 +103,7 @@ private enum RenderLook: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var compactTitle: String {
         switch self {
+        case .original: "Original Tone"
         case .hncs: "HNCS · Reference"
         case .hncsSmooth: "HNCS · Smooth"
         case .referentOutput: "Full Output"
@@ -106,6 +113,7 @@ private enum RenderLook: String, CaseIterable, Identifiable {
     }
     var menuTitle: String {
         switch self {
+        case .original: "Original Tone Mapper"
         case .hncs: "HNCS Lightness Look · Reference (CLAHE)"
         case .hncsSmooth: "HNCS Lightness Look · Smooth (no local contrast)"
         case .referentOutput: "Referent Full Output Transform"
@@ -120,6 +128,7 @@ private enum RenderLook: String, CaseIterable, Identifiable {
 private struct OutputLookMenu: View {
     let model: EditorModel
     let selected: RenderLook
+    var compact = false
     @Environment(\.sheetInk) private var ink
 
     var body: some View {
@@ -140,8 +149,13 @@ private struct OutputLookMenu: View {
                 Text(selected.compactTitle).lineLimit(1).truncationMode(.tail)
                 Text("⌄").font(.system(size: 13)).foregroundStyle(ink.dim)
             }
-            .font(Theme.text(14, weight: 550))
+            .font(Theme.text(compact ? 11.5 : 14, weight: 550))
             .foregroundStyle(model.isModified("io.render_look") ? ink.accent : ink.paper)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, compact ? 8 : 0)
+            .padding(.vertical, compact ? 7 : 0)
+            .background { if compact { RoundedRectangle(cornerRadius: 6).fill(Theme.card) } }
+            .overlay { if compact { RoundedRectangle(cornerRadius: 6).stroke(Theme.line, lineWidth: 1) } }
             .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
@@ -171,6 +185,7 @@ private struct StockName: View {
     var strike: Strike?
     /// False while scanning (the paper) or holding Original: the name is only words.
     var opens = true
+    var compact = false
     @State private var hovered = false
     @State private var anchor = MenuAnchor()
     @Environment(\.sheetInk) private var ink
@@ -187,6 +202,11 @@ private struct StockName: View {
                         Image(systemName: "chevron.down")
                             .font(.system(size: 9, weight: .semibold)).foregroundStyle(ink.dim)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, compact ? 8 : 0)
+                    .padding(.vertical, compact ? 6 : 0)
+                    .background { if compact { RoundedRectangle(cornerRadius: 6).fill(Theme.card) } }
+                    .overlay { if compact { RoundedRectangle(cornerRadius: 6).stroke(Theme.line, lineWidth: 1) } }
                     .contentShape(Rectangle())
                     .background(AnchorView(anchor: anchor))
                 }
@@ -210,7 +230,7 @@ private struct StockName: View {
                     .accessibilityLabel("Preview and compare \(paper ? "papers" : "films")")
                 }
             } else {
-                stockName
+                stockName.frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .contentShape(Rectangle())
@@ -225,13 +245,13 @@ private struct StockName: View {
             .tracking(paper ? 0 : -0.24)
             .foregroundStyle(strike == nil ? ink.paper : ink.dim)
             .lineLimit(1).truncationMode(.tail)
-            .padding(.bottom, 5)
+            .padding(.bottom, compact ? 0 : 5)
             .overlay(alignment: .bottom) { underline }
-            .overlay { struck }
+            .overlay { if !compact { struck } }
     }
 
     @ViewBuilder private var underline: some View {
-        if strike == nil {
+        if !compact, strike == nil {
             if open {
                 PencilStroke().pencil(ink.accent).frame(height: 6).allowsHitTesting(false)
             } else if hovered {

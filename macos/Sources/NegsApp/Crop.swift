@@ -101,6 +101,22 @@ enum CropAspect: String, Codable, Sendable, CaseIterable, Identifiable {
     var turns: Bool { self != .freeform && self != .square }
 }
 
+/// Composition guides shown in the crop editor; they never affect saved pixels.
+enum CropGuide: String, CaseIterable, Identifiable {
+    case thirds, golden, fifths, diagonals, center, none
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .thirds: "Rule of thirds"
+        case .golden: "Golden ratio"
+        case .fifths: "Fifths"
+        case .diagonals: "Diagonals"
+        case .center: "Center cross"
+        case .none: "No guides"
+        }
+    }
+}
+
 /// Crop rectangle edits, in pixels of the photograph as shown (origin top
 /// left). A straightened photograph turns about its centre, so its edges are
 /// no longer the rectangle's bounds: `fits`, `constrain`, and `inscribe`
@@ -275,6 +291,7 @@ enum CropGeometry {
     private(set) var rotation: Int
     /// A handle is being dragged; the thirds grid shows.
     var adjusting = false
+    var guide: CropGuide = .thirds
     /// The dial or slider is turning the photograph; a finer grid shows.
     private(set) var straightening = false
     /// A ratio field has focus, so Return and Escape belong to it.
@@ -459,7 +476,7 @@ struct CropEditor: View {
             ZStack(alignment: .topLeading) {
                 CropPhoto(image: image, frame: frame, rotation: session.rotation, angle: session.angle)
                 CropOverlay(photo: CropGeometry.corners(of: frame.size, angle: session.angle).map { CGPoint(x: $0.x + frame.minX, y: $0.y + frame.minY) },
-                            crop: crop, fine: session.straightening)
+                            crop: crop, guide: session.guide, fine: session.straightening)
             }
             .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
             .contentShape(Rectangle())
@@ -545,6 +562,7 @@ private struct CropOverlay: View {
     /// The turned photograph's corners.
     let photo: [CGPoint]
     let crop: CGRect
+    let guide: CropGuide
     let fine: Bool
     @Environment(\.sheetInk) private var ink
 
@@ -556,13 +574,30 @@ private struct CropOverlay: View {
             outside.addLines(photo); outside.closeSubpath()
             outside.addRect(crop)
             context.fill(outside, with: .color(Self.shade), style: FillStyle(eoFill: true))
-            let lines = fine ? 9 : 3
             var grid = Path()
-            for i in 1..<lines {
-                let x = (crop.minX + crop.width * CGFloat(i) / CGFloat(lines)).rounded() + 0.5
-                let y = (crop.minY + crop.height * CGFloat(i) / CGFloat(lines)).rounded() + 0.5
+            if fine || guide == .thirds || guide == .fifths || guide == .golden {
+                let fractions: [CGFloat]
+                if fine { fractions = (1..<10).map { CGFloat($0) / 10 } }
+                else {
+                    switch guide {
+                    case .fifths: fractions = (1..<5).map { CGFloat($0) / 5 }
+                    case .golden: fractions = [0.382, 0.618]
+                    default: fractions = [1.0 / 3, 2.0 / 3]
+                    }
+                }
+                for fraction in fractions {
+                    let x = (crop.minX + crop.width * fraction).rounded() + 0.5
+                    let y = (crop.minY + crop.height * fraction).rounded() + 0.5
+                    grid.move(to: CGPoint(x: x, y: crop.minY)); grid.addLine(to: CGPoint(x: x, y: crop.maxY))
+                    grid.move(to: CGPoint(x: crop.minX, y: y)); grid.addLine(to: CGPoint(x: crop.maxX, y: y))
+                }
+            } else if guide == .center {
+                let x = crop.midX.rounded() + 0.5, y = crop.midY.rounded() + 0.5
                 grid.move(to: CGPoint(x: x, y: crop.minY)); grid.addLine(to: CGPoint(x: x, y: crop.maxY))
                 grid.move(to: CGPoint(x: crop.minX, y: y)); grid.addLine(to: CGPoint(x: crop.maxX, y: y))
+            } else if guide == .diagonals {
+                grid.move(to: crop.origin); grid.addLine(to: CGPoint(x: crop.maxX, y: crop.maxY))
+                grid.move(to: CGPoint(x: crop.maxX, y: crop.minY)); grid.addLine(to: CGPoint(x: crop.minX, y: crop.maxY))
             }
             context.stroke(grid, with: .color(Theme.paper.opacity(0.3)), lineWidth: 1)
             context.stroke(Path(crop.insetBy(dx: -0.5, dy: -0.5)), with: .color(Theme.paper.opacity(0.9)), lineWidth: 1)
@@ -785,6 +820,33 @@ struct CropInspector: View {
                                       editing: { $0 ? session.beginStraightening() : session.endStraightening() },
                                       help: "Turns the photograph to level a crooked horizon. The crop shrinks to stay on the photograph.")
                     }
+                    InkSection(title: "Composition Guides") {
+                        HStack {
+                            RowLabel(title: "Overlay")
+                            Spacer(minLength: 8)
+                            Menu {
+                                ForEach(CropGuide.allCases) { guide in
+                                    Button {
+                                        session.guide = guide
+                                    } label: {
+                                        if session.guide == guide { Label(guide.title, systemImage: "checkmark") }
+                                        else { Text(guide.title) }
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Text(session.guide.title).font(Theme.ui(11)).foregroundStyle(Theme.paper)
+                                    Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(Theme.dim)
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .menuStyle(.borderlessButton)
+                            .help("Choose the crop composition guide")
+                        }
+                        .padding(.horizontal, Theme.Size.gutter)
+                        .frame(height: Theme.Size.row)
+                        HintText("Guides help align the crop and never appear in the export.")
+                    }
                     InkSection(title: nil) {
                         let size = session.exportedSize(working: model.workingSize)
                         ReadoutRow(title: "Size", value: "\(Int(size.width.rounded())) × \(Int(size.height.rounded())) px")
@@ -945,10 +1007,12 @@ private struct RatioSide: View {
 /// Crop's Cancel: outlined like the other buttons, but square-cornered and
 /// 36 tall beside Done.
 struct SquareOutlinedButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View { Outlined(configuration: configuration) }
+    var height: CGFloat = 36
+    func makeBody(configuration: Configuration) -> some View { Outlined(configuration: configuration, height: height) }
 
     private struct Outlined: View {
         let configuration: Configuration
+        let height: CGFloat
         @Environment(\.isEnabled) private var enabled
         @State private var hovered = false
 
@@ -956,7 +1020,7 @@ struct SquareOutlinedButtonStyle: ButtonStyle {
             configuration.label
                 .font(Theme.text(16, weight: 500))
                 .foregroundStyle(Theme.paper)
-                .frame(maxWidth: .infinity, minHeight: 36, maxHeight: 36)
+                .frame(maxWidth: .infinity, minHeight: height, maxHeight: height)
                 .padding(.bottom, 1)
                 .background(RoundedRectangle(cornerRadius: 3).fill(Theme.paper.opacity(configuration.isPressed ? 0.09 : hovered ? 0.04 : 0)))
                 .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(hovered || configuration.isPressed ? Theme.dim : Theme.track, lineWidth: 1))

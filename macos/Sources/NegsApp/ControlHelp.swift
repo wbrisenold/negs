@@ -122,8 +122,9 @@ enum ControlHelp {
 
         // Scanner
         "scanner.lens_blur": "Softness of the scanner’s lens, in pixels. 0 is off.",
-        "scanner.unsharp_mask.0": "The radius of the scanner’s sharpening, in pixels.",
-        "scanner.unsharp_mask.1": "The strength of the scanner’s sharpening. 0 is off, for sharpening later in another app.",
+        "scanner.unsharp_mask.0": "Sets the size of the edges to sharpen, in pixels. Smaller values sharpen fine detail; larger values affect broader edges.",
+        "scanner.unsharp_mask.1": "Adds a controlled high-pass signal back to the scan. 0 is off. Compare at 100% to avoid crunchy edges.",
+        "scanner.unsharp_threshold": "Ignores small differences between the scan and its blur, so sharpening adds less grain and sensor noise. Raise it if fine noise gets emphasized.",
         "scanner.white_correction": "Sets the scan’s lightest tone to White level. Off, the highlights stay where the paper puts them. Mostly for slides.",
         "scanner.white_level": "The lightest tone with White correction on. 1 is full white.",
         "scanner.black_correction": "Sets the scan’s darkest tone to Black level. Off, the shadows stay where the paper puts them. Mostly for slides.",
@@ -132,7 +133,7 @@ enum ControlHelp {
         // Color Management
         "io.output_gamut_compress.algorithm": "Rolls colours the output colour space can’t hold back inside it, leaving colours within it untouched. ACES RGC is the industry standard; OKLCh, OKLrab and CAM16-UCS keep hue more evenly. Off clips them.",
         "io.input_gamut_compress.algorithm": "Pulls the photograph’s colours that lie outside what eyes can see (possible in wide-gamut RAWs) inside, before they become spectra. Off passes them as they are.",
-        "settings.use_cat16": "Adapts the photograph’s white to the light the film was characterised in, with CAT16. Off uses CAT02.",
+        "settings.use_cat16": "Controls CAT16 versus CAT02 for spectral RGB-to-spectrum conversion. RAW white balance has its own CAT16 chromatic adaptation control in the WB tab.",
         "settings.rgb_to_raw_method": "How each colour is turned into the spectrum of light the film is exposed to. Arctic 2026 (Beta 04) is the default; Hanatos 2025 and Mallett 2019 remain available for comparison."
     ]
 
@@ -147,7 +148,8 @@ enum ControlHelp {
         "Print Curves": "Shapes how the paper develops: its contrast, per layer and per colour.",
         "Print Base": "The colour and density of the paper itself, its whitest white.",
         "Glare": "Room light reflecting off the print’s surface.",
-        "Scanner": "Scans the finished print: sharpness and black and white points.",
+        "Sharpening": "Sharpens the scanned print with adjustable edge size, strength and a noise threshold. Set amount to 0 to disable it.",
+        "Scanner": "Controls scanner lens softness and the scan's black and white points.",
         "Color Management": "How colours enter and leave the spectral simulation.",
         "Input Colour": "How the file’s values are read: its colour space and curve.",
         "Output": "The colour space the preview develops in."

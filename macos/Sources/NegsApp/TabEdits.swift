@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// What a tab's count stands for: the controls that differ from their
-/// defaults, each able to go back alone or all together (Reset Prep).
+/// defaults, each able to go back alone or all together.
 enum ResetTarget: Hashable {
     case param(String)
     case stock(String, Int)
@@ -11,6 +11,7 @@ enum ResetTarget: Hashable {
     case exposure
     /// Lab › Scan film directly, back to what the film is (negative or slide).
     case scanFilm
+    case removeBackgroundMask(Int)
     /// Lab › Output › Colour space, back to the first of the spaces.
     case previewSpace
     case border
@@ -30,21 +31,18 @@ struct TabEdit: Identifiable, Equatable {
     /// tab shows them. Always as many as `count(tab, model)`.
     static func edits(_ tab: InspectorTab, _ model: EditorModel) -> [TabEdit] {
         switch tab {
-        case .prep: prepEdits(model)
-        case .lab: InspectorSection.allCases.flatMap { labEdits($0, model) }
+        case .exposure: exposureEdits(model)
+        case .color: colorEdits(model)
+        case .lab: InspectorSection.allCases.filter { $0 != .scan }.flatMap { labEdits($0, model) }
+        case .mask: maskEdits(model)
         case .output: outputEdits(model)
         }
     }
 
-    private static func prepEdits(_ model: EditorModel) -> [TabEdit] {
+    private static func exposureEdits(_ model: EditorModel) -> [TabEdit] {
         var out: [TabEdit] = []
         func path(_ title: String, _ path: String) {
             if model.isModified(path) { out.append(TabEdit(title: title, value: display(model.value(path), path), target: .param(path))) }
-        }
-        if model.isRaw {
-            path("White balance", "io.raw_white_balance.mode")
-            path("Temperature (K)", "io.raw_white_balance.temperature")
-            path("Tint", "io.raw_white_balance.tint")
         }
         if model.matchesBrightness != model.autoPlaceNewImages {
             out.append(TabEdit(title: "Match camera brightness", value: model.matchesBrightness ? "On" : "Off", target: .matchBrightness))
@@ -54,23 +52,65 @@ struct TabEdit: Identifiable, Equatable {
         }
         path("Auto exposure", "camera.auto_exposure")
         path("Metering", "camera.auto_exposure_method")
-        for control in prepToneControls + prepColorControls + prepDetailControls { append(control, group: nil, model, &out) }
-        let offsetPath = "prep.color_correction_offset"
-        if model.isModified(offsetPath) {
-            let values = model.value(offsetPath).array
-            let hue = values.first?.double ?? 0, strength = values.dropFirst().first?.double ?? 0
-            out.append(TabEdit(title: "Color offset", value: "\(number(hue))° / \(number(strength))%", target: .param(offsetPath)))
-        }
-        if model.isModified("prep.color_correction_saturation") {
-            let value = model.value("prep.color_correction_saturation").double
-            out.append(TabEdit(title: "Color correction saturation", value: signed(value), target: .param("prep.color_correction_saturation")))
+        for control in prepToneControls + prepDetailControls { append(control, group: nil, model, &out) }
+        return out
+    }
+
+    private static func colorEdits(_ model: EditorModel) -> [TabEdit] {
+        var out: [TabEdit] = []
+        func path(_ title: String, _ path: String) {
+            if model.isModified(path) { out.append(TabEdit(title: title, value: display(model.value(path), path), target: .param(path))) }
         }
         if model.isRaw {
+            path("White balance", "io.raw_white_balance.mode")
+            path("Camera WB preset", "io.raw_white_balance.camera_preset_index")
+            path("Camera WB fine tuning", "io.raw_white_balance.camera_tuning")
+            path("Temperature (K)", "io.raw_white_balance.temperature")
+            path("Tint", "io.raw_white_balance.tint")
+            path("Chromatic adaptation", "io.raw_white_balance.method")
             if model.lensCorrectionSupported { path("Lens corrections", EditorModel.lensCorrectionPath) }
         } else {
             for inputPath in inputPaths { path("Input " + words(inputPath), inputPath) }
         }
         path("Rendering", "io.render_look")
+        for control in prepColorControls { append(control, group: nil, model, &out) }
+        path("Color correction saturation", "prep.color_correction_saturation")
+        if model.isModified("prep.color_correction_offset") {
+            let values = model.value("prep.color_correction_offset").array
+            let hue = values.first?.double ?? 0, strength = values.dropFirst().first?.double ?? 0
+            out.append(TabEdit(title: "Color offset", value: "\(number(hue))° / \(number(strength))%", target: .param("prep.color_correction_offset")))
+        }
+        for field in ["strength", "target_hue", "complementary_hue", "target_saturation", "luminance_mask", "neutral_protection", "method", "color_wash"] {
+            path("Color separation · \(words(field))", "post.color_separation.\(field)")
+        }
+        for field in ["master", "red", "yellow", "green", "cyan", "blue", "magenta"] {
+            path("Color density · \(words(field))", "post.color_density.\(field)")
+        }
+        out += labEdits(.scan, model)
+        path("Local contrast", "post.hncs.clahe_strength")
+        path("Skin protection", "post.hncs.skin_protection")
+        return out
+    }
+
+    private static func maskEdits(_ model: EditorModel) -> [TabEdit] {
+        var out: [TabEdit] = []
+        if model.backgroundMaskLabels.isEmpty {
+            if model.hasBackgroundMask {
+                out.append(TabEdit(title: "AI Background Mask", value: "On", target: .removeBackgroundMask(-1)))
+            }
+            for field in ["exposure_ev", "temperature", "tint", "saturation"] {
+                let path = "post.background_\(field)"
+                if model.isModified(path) { out.append(TabEdit(title: "Mask · \(words(field))", value: display(model.value(path), path), target: .param(path))) }
+            }
+            return out
+        }
+        for (index, label) in model.backgroundMaskLabels.enumerated() {
+            out.append(TabEdit(title: label, value: "Selected region", target: .removeBackgroundMask(index)))
+            for field in ["exposure_ev", "temperature", "tint", "saturation"] {
+                let path = "post.background_masks.\(index).\(field)"
+                if model.isModified(path) { out.append(TabEdit(title: "\(label) · \(words(field))", value: display(model.value(path), path), target: .param(path))) }
+            }
+        }
         return out
     }
 

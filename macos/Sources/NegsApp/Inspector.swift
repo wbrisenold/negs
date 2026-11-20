@@ -33,20 +33,24 @@ enum InspectorSection: String, CaseIterable {
 
 /// Prepare the photograph, develop the film, then finish the scan.
 enum InspectorTab: String, CaseIterable {
-    case prep = "Prep", lab = "Lab", output = "Output"
+    case exposure = "Light", color = "Color", lab = "Film", mask = "Masks", output = "Export"
 
     var title: String {
         switch self {
-        case .prep: "Balance"
+        case .exposure: "Light"
+        case .color: "Color"
         case .lab: "Film"
+        case .mask: "Masks"
         case .output: "Export"
         }
     }
 
     var symbol: String {
         switch self {
-        case .prep: "slider.horizontal.3"
+        case .exposure: "sun.max"
+        case .color: "slider.horizontal.3"
         case .lab: "camera.macro"
+        case .mask: "person.crop.rectangle"
         case .output: "square.and.arrow.up"
         }
     }
@@ -81,9 +85,6 @@ struct AdjustmentGroup: Identifiable {
 }
 
 let adjustmentGroups: [AdjustmentGroup] = [
-    .init(title: "Silver Retention", symbol: "circle.lefthalf.filled", section: .film, basic: 1, controls: [
-        .silverRetention
-    ]),
     .init(title: "Lens Diffusion", symbol: "camera.filters", section: .camera, enable: "camera.diffusion_filter.active", basic: 2, controls: [
         .choice("Filter", "camera.diffusion_filter.filter_family", ["black_pro_mist", "glimmerglass", "pro_mist", "cinebloom"]),
         .slider("Strength", "camera.diffusion_filter.strength", 0...2, 0.01),
@@ -173,10 +174,13 @@ let adjustmentGroups: [AdjustmentGroup] = [
         .slider("Roughness", "print_render.glare.roughness", 0...2, 0.01),
         .slider("Blur (px)", "print_render.glare.blur", 0...5, 0.01)
     ]),
+    .init(title: "Sharpening", symbol: "viewfinder", section: .scan, basic: 3, controls: [
+        .slider("Amount", "scanner.unsharp_mask.1", 0...2, 0.01),
+        .slider("Radius (px)", "scanner.unsharp_mask.0", 0...3, 0.01),
+        .slider("Noise threshold", "scanner.unsharp_threshold", 0...0.08, 0.001)
+    ]),
     .init(title: "Scanner", symbol: "scanner", section: .scan, controls: [
         .slider("Lens blur (px)", "scanner.lens_blur", 0...5, 0.01),
-        .slider("Unsharp radius (px)", "scanner.unsharp_mask.0", 0...3, 0.01),
-        .slider("Unsharp amount", "scanner.unsharp_mask.1", 0...2, 0.01),
         .toggle("White correction", "scanner.white_correction"),
         .slider("White level", "scanner.white_level", 0.5...1, 0.01),
         .toggle("Black correction", "scanner.black_correction"),
@@ -185,7 +189,7 @@ let adjustmentGroups: [AdjustmentGroup] = [
     .init(title: "Color Management", symbol: "paintpalette", section: .scan, controls: [
         .choice("Output gamut", "io.output_gamut_compress.algorithm", ["off", "oklch", "oklrab", "cam16ucs", "aces_rgc"]),
         .choice("Input gamut", "io.input_gamut_compress.algorithm", ["off", "xy"]),
-        .toggle("CAT16 adaptation", "settings.use_cat16"),
+        .toggle("CAT16 spectral conversion", "settings.use_cat16"),
         .choice("Spectral upsampling", "settings.rgb_to_raw_method", ["hanatos2025", "arctic2026beta04", "mallett2019"])
     ])
 ]
@@ -671,7 +675,7 @@ extension AdjustmentInspector {
         (model.previewSpace != SaveSettings.colorSpaces[0] ? 1 : 0) + (model.isModified("io.output_cctf_encoding") ? 1 : 0)
     }
 
-    static let whiteBalancePaths = ["io.raw_white_balance.mode", "io.raw_white_balance.temperature", "io.raw_white_balance.tint"]
+    static let whiteBalancePaths = ["io.raw_white_balance.mode", "io.raw_white_balance.temperature", "io.raw_white_balance.tint", "io.raw_white_balance.method", "io.raw_white_balance.camera_preset", "io.raw_white_balance.camera_tuning"]
     static let inputPaths = ["io.input_interpretation.mode", "io.input_interpretation.color_space", "io.input_interpretation.linear",
                              "io.input_color_space", "io.input_cctf_decoding"]
     static func brightnessCount(_ model: EditorModel) -> Int {
@@ -680,26 +684,57 @@ extension AdjustmentInspector {
     }
     static func prepCount(_ model: EditorModel) -> Int {
         var count = brightnessCount(model)
-        count += (prepToneControls + prepColorControls + prepDetailControls).filter { isModified($0, model) }.count
-        count += ["prep.color_correction_offset", "prep.color_correction_saturation"].filter(model.isModified).count
+        count += (prepToneControls + prepDetailControls).filter { isModified($0, model) }.count
+        if model.isModified("film_render.silver_retention") { count += 1 }
+        return count
+    }
+    static func whiteBalanceCount(_ model: EditorModel) -> Int {
+        var count = whiteBalancePaths.filter(model.isModified).count
         if model.isRaw {
-            count += whiteBalancePaths.filter(model.isModified).count
             if model.lensCorrectionSupported, model.isModified(EditorModel.lensCorrectionPath) { count += 1 }
         } else {
             count += inputPaths.filter(model.isModified).count
+            count += ["prep.color_correction_offset"].filter(model.isModified).count
         }
         return count
     }
     static func labCount(_ model: EditorModel) -> Int {
-        InspectorSection.allCases.map { count($0, model) }.reduce(0, +)
+        InspectorSection.allCases.filter { $0 != .scan }.map { count($0, model) }.reduce(0, +)
+    }
+    static func colorCount(_ model: EditorModel) -> Int {
+        let separation = ["strength", "target_hue", "complementary_hue", "target_saturation", "luminance_mask", "neutral_protection", "method", "color_wash"]
+        let density = ["master", "red", "yellow", "green", "cyan", "blue", "magenta"]
+        let colorPaths = ["prep.color_correction_saturation", "io.render_look",
+                          "post.hncs.clahe_strength", "post.hncs.skin_protection"]
+        let colorPathCount = colorPaths.filter { model.isModified($0) }.count
+        let separationCount = separation.filter { model.isModified("post.color_separation.\($0)") }.count
+        let densityCount = density.filter { model.isModified("post.color_density.\($0)") }.count
+        let correctionOffsetCount = model.isRaw && model.isModified("prep.color_correction_offset") ? 1 : 0
+        let prepColorCount = prepColorControls.filter { isModified($0, model) }.count
+        return whiteBalanceCount(model) + prepColorCount + colorPathCount + correctionOffsetCount
+            + separationCount + densityCount + count(.scan, model)
+    }
+    static func maskCount(_ model: EditorModel) -> Int {
+        let fields = ["exposure_ev", "temperature", "tint", "saturation"]
+        var total = model.backgroundMaskLabels.count
+        if total == 0 && model.hasBackgroundMask { total = 1 }
+        for index in model.backgroundMaskLabels.indices {
+            total += fields.filter { model.isModified("post.background_masks.\(index).\($0)") }.count
+        }
+        if model.backgroundMaskLabels.isEmpty {
+            total += fields.filter { model.isModified("post.background_\($0)") }.count
+        }
+        return total
     }
     static func outputTabCount(_ model: EditorModel) -> Int {
         (model.isModified(ImageSize.targetPath) ? 1 : 0) + (model.border.enabled ? 1 : 0)
     }
     static func count(_ tab: InspectorTab, _ model: EditorModel) -> Int {
         switch tab {
-        case .prep: prepCount(model)
+        case .exposure: prepCount(model)
+        case .color: colorCount(model)
         case .lab: labCount(model)
+        case .mask: maskCount(model)
         case .output: outputTabCount(model)
         }
     }
@@ -716,7 +751,7 @@ struct PaneHeader: View {
 
     var body: some View {
         let presets = model.inspectorPane == .presets
-        HStack(alignment: .firstTextBaseline, spacing: 16) {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
             paneWord("Adjust", pane: .adjustments, help: "Show the adjustments (⌥⌘I)")
             paneWord("Presets", pane: .presets, help: "Show the presets (⌥⌘P)")
             Spacer(minLength: 0)
@@ -755,11 +790,11 @@ struct PaneHeader: View {
                                 .font(Theme.ui(11)).foregroundStyle(Theme.dim).fixedSize(horizontal: false, vertical: true)
                             ForEach(ResetKeepGroup.allCases) { group in
                                 Toggle(group.rawValue, isOn: Binding(
-                                    get: { resetKeepGroups.split(separator: "|").contains(Substring(group.rawValue)) },
+                                    get: { ResetKeepGroup.selected(from: resetKeepGroups).contains(group) },
                                     set: { enabled in
-                                        var groups = Set(resetKeepGroups.split(separator: "|").map(String.init))
-                                        if enabled { groups.insert(group.rawValue) } else { groups.remove(group.rawValue) }
-                                        resetKeepGroups = ResetKeepGroup.allCases.filter { groups.contains($0.rawValue) }.map(\.rawValue).joined(separator: "|")
+                                        var groups = ResetKeepGroup.selected(from: resetKeepGroups)
+                                        if enabled { groups.insert(group) } else { groups.remove(group) }
+                                        resetKeepGroups = ResetKeepGroup.allCases.filter { groups.contains($0) }.map(\.rawValue).joined(separator: "|")
                                     }))
                                 .toggleStyle(.checkbox)
                                 .font(Theme.ui(11))
@@ -780,9 +815,9 @@ struct PaneHeader: View {
                     .help("Choose and save global reset defaults")
             }
         }
-        .padding(.horizontal, Theme.Size.gutter)
+        .padding(.horizontal, 14)
         .padding(.top, 13)
-        .frame(height: Theme.Size.paneHeader, alignment: .top)
+        .frame(maxWidth: .infinity, minHeight: Theme.Size.paneHeader, maxHeight: Theme.Size.paneHeader, alignment: .topLeading)
     }
 
     private func paneWord(_ title: String, pane: InspectorPane, help: String) -> some View {
@@ -818,28 +853,27 @@ struct TabRow: View {
     var edits: ((InspectorTab, @escaping () -> Void) -> AnyView)? = nil
 
     var body: some View {
-        HStack(alignment: .center, spacing: TabWord.gap) {
+        HStack(alignment: .center, spacing: 2) {
             ForEach(InspectorTab.allCases, id: \.self) { item in
                 TabWord(title: item.title, symbol: item.symbol, chosen: tab == item, count: counts[item] ?? 0,
                         edits: edits.map { make in { dismiss in make(item, dismiss) } }) { tab = item }
             }
-            Spacer(minLength: 0)
         }
-        .padding(.horizontal, Theme.Size.gutter)
-        .frame(height: 42, alignment: .center)
+        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, minHeight: 52, maxHeight: 52, alignment: .center)
         .overlay(alignment: .bottom) { Theme.line.frame(height: 1) }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Inspector tabs")
     }
 }
 
-/// A compact task tab with a clear selected state and edit-count badge.
+/// A compact task tab with a clear selected state and a quiet edit marker.
 struct TabWord: View {
     let title: String
     let symbol: String
     let chosen: Bool
     var count = 0
-    /// The list a click on the count opens; none, and the count is a mark.
+    /// The edit list opened from the small marker when this tab has changes.
     var edits: ((@escaping () -> Void) -> AnyView)? = nil
     let choose: () -> Void
     @State private var hovered = false
@@ -874,14 +908,16 @@ struct TabWord: View {
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 0) {
+        ZStack(alignment: .topTrailing) {
             Button(action: choose) {
-                HStack(spacing: 6) {
-                    Image(systemName: symbol).font(.system(size: 11, weight: .medium))
-                    Text(title).font(Theme.text(Self.size, weight: chosen ? 600 : 500))
+                VStack(spacing: 3) {
+                    Image(systemName: symbol).font(.system(size: 12, weight: .medium))
+                    Text(title).font(Theme.text(9.5, weight: chosen ? 600 : 500))
+                        .lineLimit(1).minimumScaleFactor(0.8)
                 }
+                .frame(maxWidth: .infinity, minHeight: 38, maxHeight: 38)
                 .foregroundStyle(chosen ? Theme.accent : hovered ? Theme.paper : Theme.label)
-                .padding(.horizontal, 10).padding(.vertical, 7)
+                .padding(.horizontal, 2).padding(.vertical, 5)
                 .background(chosen ? Theme.accent.opacity(0.13) : .clear,
                             in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                 .overlay {
@@ -896,23 +932,22 @@ struct TabWord: View {
             .inkFocus(activate: choose)
             .accessibilityLabel(count > 0 ? "\(title), \(count) \(count == 1 ? "edit" : "edits")" : title)
             .accessibilityAddTraits(chosen ? [.isSelected, .isButton] : .isButton)
-            // In the flow, so the gap after a tab with edits starts at its
-            // count. Hangs from the title's top, never above it.
+            .frame(maxWidth: .infinity)
             if count > 0 {
-                countMark
+                countMark.padding(.top, 2).padding(.trailing, 4)
             }
         }
+        .frame(maxWidth: .infinity)
     }
 
     @ViewBuilder private var countMark: some View {
-        let mark = Text("\(count)").font(Theme.metadata(9, weight: .semibold))
-            .foregroundStyle(Theme.label).padding(.horizontal, 5).padding(.vertical, 3)
-            .background(Theme.line, in: Capsule())
+        let mark = Circle().fill(Theme.accent).frame(width: 5, height: 5)
+            .frame(width: 12, height: 24, alignment: .center)
         if let edits {
             Button { listShown.toggle() } label: { mark }
                 .buttonStyle(InkPressStyle())
                 .popover(isPresented: $listShown, arrowEdge: .bottom) { edits { listShown = false } }
-                .tooltip("Show the \(count == 1 ? "edit" : "edits") on \(title)")
+                .tooltip("Show \(count) \(count == 1 ? "edit" : "edits") on \(title)")
                 .accessibilityLabel("\(count) \(count == 1 ? "edit" : "edits") on \(title)")
         } else {
             mark.accessibilityHidden(true)
@@ -923,7 +958,7 @@ struct TabWord: View {
 struct AdjustmentInspector: View {
     let model: EditorModel
     @AppStorage("expandedAdjustments") private var expanded = "Enlarger"
-    @AppStorage("inspectorTab") private var tab = InspectorTab.prep
+    @AppStorage("inspectorTab") private var tab = InspectorTab.exposure
     @AppStorage("negs.whiteBalance.linkTemperatureTint") private var linkTemperatureTint = false
     @AppStorage("negs.whiteBalance.fineTuneExpanded") private var fineTuneWhiteBalance = false
     /// View › Show All Controls: every control, as the Lab's Advanced
@@ -940,6 +975,8 @@ struct AdjustmentInspector: View {
         VStack(spacing: 0) {
             ScopePanelView(histogram: model.histogram, waveform: model.waveform,
                             vectorscope: model.vectorscope, skinAnalysis: model.skinAnalysis,
+                            chromaticity: model.chromaticity, colorSample: model.colorSample,
+                            saturation: model.saturation,
                             isUpdating: model.scopesUpdating,
                             setScopeMode: { model.scopeModeChanged($0) },
                             clippingEnabled: model.clippingOverlayEnabled,
@@ -952,8 +989,10 @@ struct AdjustmentInspector: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     switch tab {
-                    case .prep: prep
+                    case .exposure: exposure
+                    case .color: color
                     case .lab: lab
+                    case .mask: mask
                     case .output: output
                     }
                 }
@@ -965,56 +1004,9 @@ struct AdjustmentInspector: View {
         .disabled(!model.hasCatalog)
     }
 
-    // MARK: Prep
+    // MARK: Exposure
 
-    @ViewBuilder private var prep: some View {
-        if model.isRaw {
-            let whiteBalanceMode = model.value("io.raw_white_balance.mode").string
-            let kelvinPresets: [(String, Double)] = [("d50", 5003), ("d55", 5503), ("d60", 6000), ("d65", 6504), ("d75", 7500), ("d93", 9300)]
-            let currentKelvin = model.value("io.raw_white_balance.temperature").double
-            let nearestPreset = kelvinPresets.min { abs($0.1 - currentKelvin) < abs($1.1 - currentKelvin) }
-            let selectedWhiteBalance = whiteBalanceMode == "as_shot" ? "as_shot"
-                : whiteBalanceMode == "tungsten" ? "tungsten"
-                : whiteBalanceMode == "daylight" ? "d65"
-                : nearestPreset.map { abs($0.1 - currentKelvin) <= 30 ? $0.0 : "custom" } ?? "custom"
-            InkSection(title: "White Balance", edited: ["io.raw_white_balance.mode", "io.raw_white_balance.temperature", "io.raw_white_balance.tint", "io.raw_white_balance.method"].contains(where: model.isModified)) {
-                if let gains = model.asShotWhiteBalance {
-                    let channels = ["R", "G1", "B", "G2"].enumerated().compactMap { index, label in
-                        gains.indices.contains(index) ? gains[index].map { "\(label) \($0.formatted(.number.precision(.fractionLength(0...3))))×" } : nil
-                    }
-                    HStack(spacing: 6) {
-                        Text("AS SHOT").font(Theme.metadata(9, weight: .semibold)).foregroundStyle(Theme.dim)
-                        Text(channels.joined(separator: "  ·  ")).font(Theme.metadata(10)).foregroundStyle(Theme.label)
-                            .lineLimit(1).minimumScaleFactor(0.8)
-                    }
-                    .padding(.horizontal, Theme.Size.gutter)
-                    .padding(.vertical, 5)
-                } else {
-                    HintText("Camera white balance recorded in this RAW.")
-                }
-                ChoiceRow(title: "Target white balance", items: [
-                    .option("As Shot", tag: "as_shot"),
-                    .option("D50 · 5003 K", tag: "d50"), .option("D55 · 5503 K", tag: "d55"),
-                    .option("D60 · 6000 K", tag: "d60"), .option("D65 · 6504 K", tag: "d65"),
-                    .option("D75 · 7500 K", tag: "d75"), .option("D93 · 9300 K", tag: "d93"),
-                    .option("Tungsten · 2850 K", tag: "tungsten"), .option("Custom", tag: "custom")
-                ],
-                          selection: selectedWhiteBalance,
-                          changed: model.isModified("io.raw_white_balance.mode"),
-                          help: "As Shot uses the recorded camera balance. Named daylight targets set Kelvin and neutral tint for the selected adaptation method; Custom accepts any Kelvin and tint.") { option in
-                    switch option {
-                    case "as_shot", "tungsten": model.setWhiteBalanceMode(option)
-                    case "d50": model.setWhiteBalancePreset(5003)
-                    case "d55": model.setWhiteBalancePreset(5503)
-                    case "d60": model.setWhiteBalancePreset(6000)
-                    case "d65": model.setWhiteBalancePreset(6504)
-                    case "d75": model.setWhiteBalancePreset(7500)
-                    case "d93": model.setWhiteBalancePreset(9300)
-                    default: model.setWhiteBalanceMode("custom")
-                    }
-                }
-            }
-        }
+    @ViewBuilder private var exposure: some View {
         InkSection(title: "Light", edited: InspectorEdits.brightnessCount(model) > 0) {
             TickRow(title: model.isRaw ? "Match camera brightness" : "Match original brightness",
                     isOn: Binding(get: { model.matchesBrightness }, set: model.setMatchesBrightness),
@@ -1042,11 +1034,32 @@ struct AdjustmentInspector: View {
             }
         }
         controlSection("Tone", prepToneControls)
-        if model.isRaw { whiteBalanceFineTune }
-        InkSection(title: "Color", edited: [
-            "prep.color_correction_offset", "prep.color_correction_saturation"
-        ].contains(where: model.isModified) || prepColorControls.contains { InspectorEdits.isModified($0, model) }) {
-            if !model.isRaw { ColorCorrectionWheel(model: model) }
+        InkSection(title: "Silver Retention", edited: model.isModified("film_render.silver_retention")) {
+            let path = "film_render.silver_retention"
+            LabeledSlider(title: "Silver retention",
+                          value: Binding(get: { model.value(path).double * 80 },
+                                         set: { model.set(path, .number(min(max($0, 0), 80) / 80)) }),
+                          range: 0...80, step: 1, defaultValue: 0,
+                          modified: model.isModified(path), reset: { model.resetValue(path) },
+                          editing: { $0 ? model.beginInteraction() : model.endInteraction() },
+                          help: ControlHelp.text(path))
+                .disabled(model.filmIsBW || model.value("io.scan_film").bool)
+        }
+        filmExpand
+        controlSection("Detail", prepDetailControls)
+    }
+
+    // MARK: Color
+
+    @ViewBuilder private var color: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            wb
+        InkSection(title: "Color", edited: ["prep.color_correction_saturation"].contains(where: model.isModified)
+                   || prepColorControls.contains { InspectorEdits.isModified($0, model) }
+                   || ["strength", "target_hue", "complementary_hue", "target_saturation", "luminance_mask", "neutral_protection", "method", "color_wash"]
+                    .contains { model.isModified("post.color_separation.\($0)") }
+                   || ["master", "red", "yellow", "green", "cyan", "blue", "magenta"]
+                    .contains { model.isModified("post.color_density.\($0)") }) {
             LabeledSlider(title: "Correction saturation", value: model.number("prep.color_correction_saturation", range: -100...100, step: 1),
                           range: -100...100, step: 1, defaultValue: 0,
                           modified: model.isModified("prep.color_correction_saturation"),
@@ -1054,13 +1067,368 @@ struct AdjustmentInspector: View {
                           editing: { $0 ? model.beginInteraction() : model.endInteraction() },
                           help: "Adjust overall colour saturation before the film scan.")
             ForEach(prepColorControls) { control($0) }
+            Divider().overlay(Theme.line)
+            Text("Color Separation").font(Theme.ui(10, weight: .semibold)).foregroundStyle(Theme.label)
+                .padding(.top, 3)
+            LabeledSlider(title: "Strength", value: model.number("post.color_separation.strength", range: 0...100, step: 1),
+                          range: 0...100, step: 1, unit: "%", defaultValue: 0,
+                          modified: model.isModified("post.color_separation.strength"), reset: { model.resetValue("post.color_separation.strength") },
+                          editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Change Color Separation") },
+                          help: "Separates two selected hue families in the finished scan. Set this above zero to activate the remaining controls.")
+            LabeledSlider(title: "Target hue", value: model.number("post.color_separation.target_hue", range: 0...360, step: 1),
+                          range: 0...360, step: 1, unit: "°", defaultValue: 35,
+                          modified: model.isModified("post.color_separation.target_hue"), reset: { model.resetValue("post.color_separation.target_hue") },
+                          editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Change Color Separation") },
+                          help: "Hue angle of the first colour family, measured in the displayed scan's encoded RGB hue wheel.")
+            LabeledSlider(title: "Complement", value: model.number("post.color_separation.complementary_hue", range: 0...360, step: 1),
+                          range: 0...360, step: 1, unit: "°", defaultValue: 215,
+                          modified: model.isModified("post.color_separation.complementary_hue"), reset: { model.resetValue("post.color_separation.complementary_hue") },
+                          editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Change Color Separation") },
+                          help: "Hue angle of the opposing colour family. The default pair is warm orange and cool blue.")
+            LabeledSlider(title: "Saturation floor", value: model.number("post.color_separation.target_saturation", range: 0...100, step: 1),
+                          range: 0...100, step: 1, unit: "%", defaultValue: 20,
+                          modified: model.isModified("post.color_separation.target_saturation"), reset: { model.resetValue("post.color_separation.target_saturation") },
+                          editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Change Color Separation") },
+                          help: "Leaves low-saturation pixels alone so neutrals stay neutral.")
+            LabeledSlider(title: "Luminance focus", value: model.number("post.color_separation.luminance_mask", range: -100...100, step: 1),
+                          range: -100...100, step: 1, defaultValue: 0,
+                          modified: model.isModified("post.color_separation.luminance_mask"), reset: { model.resetValue("post.color_separation.luminance_mask") },
+                          editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Change Color Separation") },
+                          help: "Moves the luminance range where the hue separation is strongest. Zero centers it on midtones.")
+            LabeledSlider(title: "Protect neutrals", value: model.number("post.color_separation.neutral_protection", range: 0...100, step: 1),
+                          range: 0...100, step: 1, unit: "%", defaultValue: 70,
+                          modified: model.isModified("post.color_separation.neutral_protection"), reset: { model.resetValue("post.color_separation.neutral_protection") },
+                          editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Change Color Separation") },
+                          help: "Reduces the effect on weakly coloured pixels.")
+            LabeledSlider(title: "Method", value: model.number("post.color_separation.method", range: 0...100, step: 1),
+                          range: 0...100, step: 1, unit: "%", defaultValue: 50,
+                          modified: model.isModified("post.color_separation.method"), reset: { model.resetValue("post.color_separation.method") },
+                          editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Change Color Separation") },
+                          help: "Blends hue separation with saturation emphasis.")
+            TickRow(title: "Color wash", isOn: model.toggle("post.color_separation.color_wash"),
+                    changed: model.isModified("post.color_separation.color_wash"),
+                    help: "Pushes the selected hue family toward the target instead of separating it from the complement.")
+            Divider().overlay(Theme.line)
+            Text("Color Density · ME deSatch").font(Theme.ui(10, weight: .semibold)).foregroundStyle(Theme.label)
+                .padding(.top, 3)
+            HintText("Zero leaves the image unchanged. Move left to reduce color density globally or in one hue family.")
+            ForEach([
+                ("Global deSatch", "master"), ("Red deSatch", "red"), ("Yellow deSatch", "yellow"),
+                ("Green deSatch", "green"), ("Cyan deSatch", "cyan"), ("Blue deSatch", "blue"),
+                ("Magenta deSatch", "magenta")
+            ], id: \.1) { title, channel in
+                let path = "post.color_density.\(channel)"
+                LabeledSlider(title: title,
+                              value: model.number(path, range: -1...0, step: 0.0001),
+                              range: -1...0, step: 0.0001, defaultValue: 0,
+                              modified: model.isModified(path), reset: { model.resetValue(path) },
+                              editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Change Color Density") },
+                              help: channel == "master"
+                                  ? "ME deSatch global density control. Zero is identity; move left to darken and de-saturate color density."
+                                  : "ME deSatch hue-family density control using the original cone-coordinate falloff.")
+            }
+            HintText("ME deSatch behavior · SpektraFilm Studio · GPL-3.0")
         }
-        controlSection("Detail", prepDetailControls)
+        let outputChanged = InspectorEdits.outputCount(model) > 0
+        let outputShown = outputChanged || shows(section: .scan)
+        InkSection(title: "Scan & Color", edited: InspectorEdits.count(.scan, model) > 0) {
+            modules(.scan, ruledFirst: false)
+            if outputShown {
+                module("Output", help: ControlHelp.group("Output"), summary: model.previewSpace, edited: outputChanged,
+                       ruled: adjustmentGroups.contains { $0.section == .scan && shows($0) }) {
+                    ChoiceRow(title: "Colour space", items: SaveSettings.colorSpaces.map { .option($0, tag: $0) }, selection: model.previewSpace,
+                              changed: model.previewSpace != SaveSettings.colorSpaces[0],
+                              help: "The preview develops in this colour space, so it shows the colours an export in it can hold. Save and Export use it next, and switch it when you pick another.",
+                              choose: model.choosePreviewSpace)
+                    TickRow(title: "Encode with the colour space’s curve", isOn: model.toggle("io.output_cctf_encoding"),
+                            changed: model.isModified("io.output_cctf_encoding"), help: "Off writes linear values, for further processing.")
+                }
+            }
+            moreLine(.scan, loose: outputChanged ? [] : ["Output"])
+        }
+        outputTransform
+        }
+    }
+
+    // MARK: AI Masks
+
+    @ViewBuilder private var mask: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            InkSection(title: "Selection", edited: model.hasBackgroundMask) {
+                HStack(spacing: 7) {
+                    Menu {
+                        ForEach(BackgroundMask.Selection.allCases.filter { $0 != .custom }) { selection in
+                            Button { model.addBackgroundMask(selection: selection) } label: {
+                                Label(selection.title, systemImage: selection.symbol)
+                            }
+                            .disabled(model.backgroundMaskGenerating)
+                        }
+                    } label: {
+                        Label("AI Select", systemImage: "sparkle.magnifyingglass")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .controlSize(.small)
+                    .disabled(model.backgroundMaskGenerating)
+                    .help("Create an on-device selection")
+                    Button { model.createBrushBackgroundMask() } label: {
+                        Label("New Brush", systemImage: "paintbrush.pointed")
+                    }
+                    .buttonStyle(SquareOutlinedButtonStyle(height: 25))
+                    .controlSize(.small)
+                    .disabled(model.backgroundMaskGenerating || model.image == nil)
+                }
+                HStack(spacing: 12) {
+                    TickRow(title: "Mask overlay", isOn: Binding(
+                        get: { model.backgroundMaskOverlayVisible },
+                        set: { model.backgroundMaskOverlayVisible = $0 }),
+                            help: "Show or hide the mask preview on the photograph. This never changes the mask or its adjustments.")
+                    Spacer(minLength: 8)
+                    Text("Opacity").font(Theme.ui(10)).foregroundStyle(Theme.dim)
+                    Slider(value: Binding(
+                        get: { model.backgroundMaskOverlayOpacity },
+                        set: { model.backgroundMaskOverlayOpacity = $0 }), in: 0.15...1, step: 0.05)
+                        .frame(maxWidth: 94)
+                        .disabled(!model.backgroundMaskOverlayVisible)
+                        .help("Mask overlay opacity")
+                    Text("\(Int(model.backgroundMaskOverlayOpacity * 100))%")
+                        .font(Theme.metadata(9)).foregroundStyle(Theme.dim).monospacedDigit()
+                        .frame(width: 30, alignment: .trailing)
+                }
+                .padding(.top, 4)
+                if model.backgroundMaskGenerating {
+                    HStack(spacing: 7) {
+                        ProgressView().controlSize(.small)
+                        Text(model.backgroundMaskStatus.isEmpty ? "Working…" : model.backgroundMaskStatus)
+                            .font(Theme.ui(10)).foregroundStyle(Theme.dim).lineLimit(1).truncationMode(.tail)
+                    }
+                    .padding(.top, 5)
+                }
+                if !model.backgroundMaskLabels.isEmpty {
+                    HStack(spacing: 6) {
+                        Menu {
+                            ForEach(Array(model.backgroundMaskLabels.enumerated()), id: \.offset) { index, label in
+                                Button {
+                                    model.selectBackgroundMask(at: index)
+                                    model.backgroundMaskBrushActive = false
+                                } label: {
+                                    if index == model.selectedBackgroundMaskIndex {
+                                        Label(label, systemImage: "checkmark")
+                                    } else { Text(label) }
+                                }
+                            }
+                            Divider()
+                            Button("Remove All Masks", systemImage: "trash", role: .destructive) {
+                                model.clearBackgroundMask()
+                            }
+                            .disabled(model.backgroundMaskGenerating)
+                        } label: {
+                            Label(model.backgroundMaskLabels.indices.contains(model.selectedBackgroundMaskIndex)
+                                  ? model.backgroundMaskLabels[model.selectedBackgroundMaskIndex] : "Select Mask",
+                                  systemImage: "square.dashed.inset.filled")
+                                .lineLimit(1).truncationMode(.middle)
+                        }
+                        .menuStyle(.borderlessButton)
+                        .controlSize(.small)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        Button(role: .destructive) { model.removeSelectedBackgroundMask() } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Remove selected mask")
+                        .disabled(model.backgroundMaskGenerating)
+                        Button { model.invertSelectedBackgroundMask() } label: {
+                            Label("Invert", systemImage: "circle.lefthalf.filled")
+                        }
+                        .buttonStyle(SquareOutlinedButtonStyle(height: 25))
+                        .help("Invert the selected and unselected areas")
+                        .disabled(model.backgroundMaskGenerating)
+                        Button { model.invertSelectedBackgroundMask() } label: {
+                            Label("Invert", systemImage: "circle.lefthalf.filled")
+                        }
+                        .buttonStyle(SquareOutlinedButtonStyle(height: 25))
+                        .controlSize(.small)
+                        .help("Invert the selected and unselected areas")
+                        .disabled(model.backgroundMaskGenerating)
+                    }
+                    .padding(.top, 6)
+                    HStack(spacing: 6) {
+                        Button {
+                            model.backgroundMaskBrushActive.toggle()
+                        } label: {
+                            Label(model.backgroundMaskBrushActive ? "Done" : "Brush",
+                                  systemImage: model.backgroundMaskBrushActive ? "checkmark" : "paintbrush.pointed")
+                        }
+                        .buttonStyle(SquareOutlinedButtonStyle())
+                        .controlSize(.small)
+                        .help("Paint directly on the image to add or remove areas from this mask")
+                        .disabled(model.backgroundMaskGenerating)
+                        if model.backgroundMaskBrushActive {
+                            Picker("Brush mode", selection: Binding(
+                                get: { model.backgroundMaskBrushSubtract },
+                                set: { model.backgroundMaskBrushSubtract = $0 })) {
+                                Text("Add").tag(false)
+                                Text("Erase").tag(true)
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .frame(width: 116)
+                            Slider(value: Binding(
+                                get: { model.backgroundMaskBrushSize },
+                                set: { model.backgroundMaskBrushSize = $0 }), in: 8...180, step: 1)
+                                .help("Brush diameter")
+                            Text("\(Int(model.backgroundMaskBrushSize)) px")
+                                .font(Theme.metadata(9)).foregroundStyle(Theme.dim).monospacedDigit()
+                                .frame(width: 38, alignment: .trailing)
+                        }
+                    }
+                    .padding(.top, 5)
+                    if model.backgroundMaskBrushActive {
+                        HintText("Paint on the photo. Add fills the mask; Erase subtracts from it.")
+                            .padding(.top, 3)
+                    }
+                } else {
+                    HintText("Use AI Select or paint a new mask directly on the photo.")
+                        .padding(.top, 6)
+                }
+                if model.backgroundMaskLabels.indices.contains(model.selectedBackgroundMaskIndex) {
+                    Picker("Erase with", selection: Binding(
+                        get: { model.backgroundMaskRemovalProvider },
+                        set: { model.backgroundMaskRemovalProvider = $0 })) {
+                        ForEach(BackgroundMaskRemovalProvider.allCases) { provider in
+                            Text(provider.title).tag(provider)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .help("Choose GPT Image online or local LaMa for removal")
+                    if model.backgroundMaskRemovalProvider == .openAI {
+                        HintText("GPT Image uploads the selected area to OpenAI. API usage is billed separately.")
+                            .padding(.top, 3)
+                    }
+                    Button {
+                        model.removeSelectedBackgroundObject()
+                    } label: {
+                        Label("Remove Selected Area", systemImage: "eraser")
+                            .frame(maxWidth: .infinity, minHeight: 31)
+                    }
+                    .buttonStyle(PencilButtonStyle(height: 34))
+                    .controlSize(.regular)
+                    .disabled(model.backgroundMaskGenerating || model.rendering || model.saving)
+                    .help(model.backgroundMaskRemovalProvider == .openAI
+                          ? "Remove the selected area with GPT Image through OpenAI"
+                          : "Inpaint the selected area on this Mac with LaMa")
+                }
+            }
+            InkSection(title: "Selected Mask Adjustments", edited: ["exposure_ev", "temperature", "tint", "saturation"]
+                .contains { model.isModified(model.backgroundMaskPath($0)) }) {
+                let exposurePath = model.backgroundMaskPath("exposure_ev")
+                let temperaturePath = model.backgroundMaskPath("temperature")
+                let tintPath = model.backgroundMaskPath("tint")
+                let saturationPath = model.backgroundMaskPath("saturation")
+                LabeledSlider(title: "Exposure", value: model.backgroundMaskNumber("exposure_ev", range: -5...5, step: 0.05),
+                              range: -5...5, step: 0.05, unit: " EV", defaultValue: 0,
+                              modified: model.isModified(exposurePath), reset: { model.resetValue(exposurePath) },
+                              editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Adjust Mask") },
+                              help: "Brighten or darken pixels selected by this mask.")
+                LabeledSlider(title: "Temperature", value: model.backgroundMaskNumber("temperature", range: -100...100, step: 1),
+                              range: -100...100, step: 1, defaultValue: 0,
+                              modified: model.isModified(temperaturePath), reset: { model.resetValue(temperaturePath) },
+                              editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Adjust Mask") },
+                              help: "Shift this mask cooler or warmer.", endLabels: ("Cooler", "Warmer"))
+                LabeledSlider(title: "Tint", value: model.backgroundMaskNumber("tint", range: -100...100, step: 1),
+                              range: -100...100, step: 1, defaultValue: 0,
+                              modified: model.isModified(tintPath), reset: { model.resetValue(tintPath) },
+                              editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Adjust Mask") },
+                              help: "Shift this mask toward magenta or green.", endLabels: ("Magenta", "Green"))
+                LabeledSlider(title: "Saturation", value: model.backgroundMaskNumber("saturation", range: -100...100, step: 1),
+                              range: -100...100, step: 1, defaultValue: 0,
+                              modified: model.isModified(saturationPath), reset: { model.resetValue(saturationPath) },
+                              editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Adjust Mask") },
+                              help: "Increase or reduce colour within this mask.")
+            }
+            .disabled(!model.hasBackgroundMask)
+        }
+    }
+
+    // MARK: White Balance
+
+    @ViewBuilder private var wb: some View {
+        if model.isRaw {
+            let whiteBalanceMode = model.value("io.raw_white_balance.mode").string
+            let cameraPreset = model.value("io.raw_white_balance.camera_preset").string
+            let cameraPresetIndex = model.value("io.raw_white_balance.camera_preset_index").integer ?? 0
+            let cameraProfile = model.cameraWhiteBalance
+            let cameraPresets = cameraProfile["presets"].array
+            let hasCameraWhiteBalance = !cameraPresets.isEmpty
+            let cameraModelName = cameraProfile["model"].string
+            let cameraMakerName = cameraProfile["maker"].string
+            let normalizedCameraPreset = cameraPreset.lowercased().filter { $0.isLetter || $0.isNumber }
+            let selectedPreset = (cameraPresetIndex > 0 ? cameraPresets.first { $0["index"].integer == cameraPresetIndex - 1 } : nil) ?? cameraPresets.first {
+                $0["name"].string.lowercased().filter { $0.isLetter || $0.isNumber } == normalizedCameraPreset
+            }
+            let selectedCameraPreset = selectedPreset?["name"].string ?? cameraPreset
+            let selectedIndex = selectedPreset?["index"].integer ?? 0
+            let selectedWhiteBalance = whiteBalanceMode == "camera_preset" ? "camera:\(selectedIndex)"
+                : whiteBalanceMode == "as_shot" ? "as_shot"
+                : "custom"
+            let cameraWhiteBalanceOptions = cameraPresets.map { preset in
+                let name = preset["name"].string
+                return ChoiceItem.option("\(cameraMakerName) \(cameraModelName) · \(name)", tag: "camera:\(preset["index"].integer ?? 0)")
+            }
+            let whiteBalanceOptions: [ChoiceItem] = [.option("As Shot", tag: "as_shot")]
+                + cameraWhiteBalanceOptions + [.option("Custom", tag: "custom")]
+            InkSection(title: "RAW White Balance", edited: ["io.raw_white_balance.mode", "io.raw_white_balance.temperature", "io.raw_white_balance.tint", "io.raw_white_balance.method", "io.raw_white_balance.camera_preset_index", "io.raw_white_balance.camera_tuning"].contains(where: model.isModified)) {
+                if let gains = model.asShotWhiteBalance {
+                    let channels = ["R", "G1", "B", "G2"].enumerated().compactMap { index, label in
+                        gains.indices.contains(index) ? gains[index].map { "\(label) \($0.formatted(.number.precision(.fractionLength(0...3))))×" } : nil
+                    }
+                    HStack(spacing: 6) {
+                        Text("AS SHOT").font(Theme.metadata(9, weight: .semibold)).foregroundStyle(Theme.dim)
+                        Text(channels.joined(separator: "  ·  ")).font(Theme.metadata(10)).foregroundStyle(Theme.label)
+                            .lineLimit(1).minimumScaleFactor(0.8)
+                    }
+                    .padding(.horizontal, Theme.Size.gutter)
+                    .padding(.vertical, 5)
+                } else {
+                    HintText("Camera white balance recorded in this RAW.")
+                }
+                ChoiceRow(title: "Target white balance", items: whiteBalanceOptions, selection: selectedWhiteBalance,
+                   changed: model.isModified("io.raw_white_balance.mode"),
+                   help: hasCameraWhiteBalance
+                    ? "Camera presets and fine tuning come from Darktable's WB data for the camera recorded in this RAW."
+                    : "Choose As Shot or Custom temperature and tint. No matching Darktable camera WB entry was found for this RAW.") { option in
+                    switch option {
+                    case "as_shot": model.setWhiteBalanceMode(option)
+                    case let value where value.hasPrefix("camera:"):
+                        if let index = Int(value.dropFirst("camera:".count)) { model.setCameraWhiteBalancePreset(index: index) }
+                    default: model.setWhiteBalanceMode("custom")
+                    }
+                }
+                if hasCameraWhiteBalance {
+                    cameraWhiteBalanceFineTune(active: whiteBalanceMode == "camera_preset", presets: cameraPresets,
+                                              selected: selectedCameraPreset, camera: "\(cameraMakerName) \(cameraModelName)")
+                    if whiteBalanceMode == "custom" { whiteBalanceFineTune }
+                } else {
+                    ChoiceRow(title: "Chromatic adaptation", items: [
+                        .option("CAT16", tag: "cat16"),
+                        .option("CAT02", tag: "cat02"),
+                        .option("XYZ Scaling", tag: "xyz_scaling")
+                    ], selection: model.value("io.raw_white_balance.method").string.isEmpty ? "cat16" : model.value("io.raw_white_balance.method").string,
+                       changed: model.isModified("io.raw_white_balance.method"),
+                       help: "Adapts the RAW illuminant to neutral in cone-response space. CAT16 is the modern CAT transform; CAT02 preserves older edits; XYZ Scaling is direct channel scaling.") {
+                        model.set("io.raw_white_balance.method", .string($0))
+                    }
+                    whiteBalanceFineTune
+                }
+            }
+        } else {
+            InkSection(title: "White Balance", edited: model.isModified("prep.color_correction_offset")) {
+                ColorCorrectionWheel(model: model)
+            }
+        }
         sourceSetup
     }
 
-    /// File interpretation and lens corrections stay together at the end of
-    /// the Balance workflow, out of the way of image-level adjustments.
+    /// File interpretation and lens corrections stay with RAW development inputs.
     @ViewBuilder private var sourceSetup: some View {
         if model.isRaw {
             if model.lensCorrectionSupported {
@@ -1077,9 +1445,17 @@ struct AdjustmentInspector: View {
 
     @ViewBuilder private var whiteBalanceFineTune: some View {
         let whiteBalanceMode = model.value("io.raw_white_balance.mode").string
-        DisclosureGroup("WB + CAT adaptation", isExpanded: $fineTuneWhiteBalance) {
+        DisclosureGroup(whiteBalanceMode == "camera_preset" ? "Camera fine tuning" : "Temperature and tint", isExpanded: $fineTuneWhiteBalance) {
             VStack(alignment: .leading, spacing: 7) {
-                if whiteBalanceMode == "custom" {
+                if whiteBalanceMode == "camera_preset" {
+                    LabeledSlider(title: "Fine tuning", value: model.number("io.raw_white_balance.camera_tuning", range: -9...9, step: 1),
+                                  range: -9...9, step: 1, defaultValue: 0,
+                                  modified: model.isModified("io.raw_white_balance.camera_tuning"),
+                                  reset: { model.set("io.raw_white_balance.camera_tuning", .number(0)) },
+                                  editing: { $0 ? model.beginInteraction() : model.endInteraction() },
+                                  help: "Camera-specific fine tuning from -9 to +9, following the Darktable EOS R5 WB table.",
+                                  endLabels: ("-9", "+9"))
+                } else if whiteBalanceMode == "custom" {
                     let defaultTemperature = model.defaultValue("io.raw_white_balance.temperature").double
                     LabeledSlider(title: "Temperature", value: model.whiteBalanceTemperature(linkTint: linkTemperatureTint),
                                   range: 1667...25000, step: 1, unit: " K", defaultValue: defaultTemperature,
@@ -1089,32 +1465,23 @@ struct AdjustmentInspector: View {
                                   help: "Lower Kelvin settings cool the image; higher settings warm it. Click the readout to type an exact Kelvin value.",
                                   endLabels: ("Cooler", "Warmer"),
                                   trackValue: model.whiteBalanceTemperaturePosition(linkTint: linkTemperatureTint),
-                                  trackRange: -100...100, trackStep: 1,
-                                  trackNeutral: model.whiteBalanceTemperaturePosition(defaultTemperature),
-                                  trackDefault: model.whiteBalanceTemperaturePosition(defaultTemperature))
+                                  trackRange: -400...400, trackStep: 1, trackScale: 4,
+                                  trackNeutral: model.whiteBalanceTemperaturePosition(defaultTemperature) * 4,
+                                  trackDefault: model.whiteBalanceTemperaturePosition(defaultTemperature) * 4)
                     LabeledSlider(title: "Tint", value: model.whiteBalanceTintAmount(),
                                   range: -100...100, step: 0.1, defaultValue: 0,
                                   modified: model.isModified("io.raw_white_balance.tint"),
                                   reset: { model.set("io.raw_white_balance.tint", .number(model.defaultValue("io.raw_white_balance.tint").double)) },
                                   editing: { $0 ? model.beginInteraction() : model.endInteraction() },
                                   help: "Zero is neutral. Drag left toward magenta or right toward green. Click the readout to type a correction.",
-                                  endLabels: ("Magenta", "Green"), trackNeutral: 0, trackDefault: 0)
+                                  endLabels: ("Magenta", "Green"),
+                                  trackValue: model.whiteBalanceTintAmount(), trackRange: -400...400,
+                                  trackStep: 1, trackScale: 4, trackNeutral: 0, trackDefault: 0)
                     TickRow(title: "Link tint to temperature", isOn: $linkTemperatureTint, changed: false,
                             help: "When enabled, warming shifts tint toward green; cooling shifts it toward magenta.")
                 } else {
                     HintText("Choose Custom above to adjust temperature and tint.")
                 }
-                ChoiceRow(title: "Adaptation", items: [
-                    .option("CAT02", tag: "cat02"),
-                    .option("XYZ Scaling", tag: "xyz_scaling")
-                ], selection: model.value("io.raw_white_balance.method").string.isEmpty ? "cat02" : model.value("io.raw_white_balance.method").string,
-                          changed: model.isModified("io.raw_white_balance.method"),
-                          help: "Choose how the source white is adapted to neutral. CAT02 adapts in cone-response space; XYZ Scaling directly scales CIE X, Y and Z.") {
-                    model.set("io.raw_white_balance.method", .string($0))
-                }
-                HintText(model.value("io.raw_white_balance.method").string == "xyz_scaling"
-                         ? "XYZ Scaling · direct channel adaptation."
-                         : "CAT02 · adapts the selected illuminant white to D65. Tint is applied separately; magenta ← 0 → green.")
                 ColorCorrectionWheel(model: model)
             }
             .padding(.top, 4)
@@ -1122,6 +1489,45 @@ struct AdjustmentInspector: View {
         .font(Theme.ui(11, weight: .medium))
         .padding(.horizontal, Theme.Size.gutter)
         .padding(.top, 4)
+    }
+
+    @ViewBuilder private func cameraWhiteBalanceFineTune(active: Bool, presets: [JSONValue], selected: String, camera: String) -> some View {
+        let presetKey = selected.lowercased().filter { $0.isLetter || $0.isNumber }
+        let preset = presets.first { $0["name"].string.lowercased().filter { $0.isLetter || $0.isNumber } == presetKey }
+        let tunings = preset?["tunings"].array ?? []
+        let tuningValues = tunings.compactMap { $0["tuning"].integer }
+        let supportsFineTuning = Set(tuningValues).count > 1
+        let lower = Double(tuningValues.min() ?? 0)
+        let upper = Double(tuningValues.max() ?? 0)
+        let tuning = Int(model.number("io.raw_white_balance.camera_tuning", range: lower...upper, step: 1).wrappedValue.rounded())
+        let target = tunings.first { $0["tuning"].integer == tuning }?["channels"].array ?? []
+        let targetText = ["R", "G1", "B", "G2"].enumerated().compactMap { index, label in
+            target.indices.contains(index) ? "\(label) \(target[index].double.formatted(.number.precision(.fractionLength(0...3))))×" : nil
+        }.joined(separator: "  ·  ")
+        VStack(alignment: .leading, spacing: 5) {
+            if !targetText.isEmpty {
+                HStack {
+                    Text("DARKTABLE TARGET").font(Theme.metadata(9, weight: .semibold)).foregroundStyle(Theme.dim)
+                    Spacer(minLength: 4)
+                    Text(targetText).font(Theme.metadata(10)).foregroundStyle(Theme.label).lineLimit(1).minimumScaleFactor(0.75)
+                }
+                Text("\(camera) · \(preset?["name"].string ?? selected)").font(Theme.metadata(9)).foregroundStyle(Theme.dim)
+            }
+            if supportsFineTuning {
+                LabeledSlider(title: "Fine tuning", value: model.number("io.raw_white_balance.camera_tuning", range: lower...upper, step: 1),
+                              range: lower...upper, step: 1, defaultValue: 0,
+                              modified: model.isModified("io.raw_white_balance.camera_tuning"),
+                              reset: { model.set("io.raw_white_balance.camera_tuning", .number(0)) },
+                              editing: { $0 ? model.beginInteraction() : model.endInteraction() },
+                              help: "Camera-specific tuning values recorded in Darktable's WB table.",
+                              endLabels: ("\(Int(lower))", "+\(Int(upper))"))
+                    .disabled(!active)
+            } else if active {
+                HintText("Darktable has no fine-tuning data for this camera preset.")
+            } else {
+                HintText("Choose a camera preset to enable fine tuning.")
+            }
+        }
     }
 
     private func controlSection(_ title: String, _ controls: [Adjustment]) -> some View {
@@ -1185,25 +1591,6 @@ struct AdjustmentInspector: View {
             modules(.print, ruledFirst: scanSwitch || printTime, skipped: scanning)
             if !scanning { moreLine(.print, loose: ["Scan film directly"]) }
         }
-        let outputChanged = InspectorEdits.outputCount(model) > 0
-        let outputShown = outputChanged || shows(section: .scan)
-        InkSection(title: "Scan & Color", edited: InspectorEdits.count(.scan, model) > 0) {
-            modules(.scan, ruledFirst: false)
-            if outputShown {
-                module("Output", help: ControlHelp.group("Output"), summary: model.previewSpace, edited: outputChanged,
-                       ruled: adjustmentGroups.contains { $0.section == .scan && shows($0) }) {
-                    ChoiceRow(title: "Colour space", items: SaveSettings.colorSpaces.map { .option($0, tag: $0) }, selection: model.previewSpace,
-                              changed: model.previewSpace != SaveSettings.colorSpaces[0],
-                              help: "The preview develops in this colour space, so it shows the colours an export in it can hold. Save and Export use it next, and switch it when you pick another.",
-                              choose: model.choosePreviewSpace)
-                    TickRow(title: "Encode with the colour space’s curve", isOn: model.toggle("io.output_cctf_encoding"),
-                            changed: model.isModified("io.output_cctf_encoding"), help: "Off writes linear values, for further processing.")
-                }
-            }
-            moreLine(.scan, loose: outputChanged ? [] : ["Output"])
-        }
-        filmExpand
-        outputTransform
     }
 
     @ViewBuilder private var filmExpand: some View {
@@ -1234,12 +1621,26 @@ struct AdjustmentInspector: View {
         let renderLookPath = "io.render_look"
         let legacyReferentEnabled = "io.referent_logc3_enabled"
         let renderLookValue = model.value(renderLookPath).string
-        let renderLook = ["hasselblad_hncs", "hasselblad_hncs_smooth", "referent_output", "referent_output_hncs_tone", "referent_output_hncs_smooth_tone"].contains(renderLookValue)
+        let renderLook = ["off", "hasselblad_hncs", "hasselblad_hncs_smooth", "referent_output", "referent_output_hncs_tone", "referent_output_hncs_smooth_tone"].contains(renderLookValue)
             ? renderLookValue
             : "referent_output"
         let referentPath = model.value("io.referent_logc3_path").string
         InkSection(title: "Output Transform",
-                   edited: model.isModified(renderLookPath) || model.isModified(legacyReferentEnabled) || model.isModified("io.referent_logc3_path")) {
+                   edited: model.isModified(renderLookPath) || model.isModified(legacyReferentEnabled) || model.isModified("io.referent_logc3_path")
+                    || model.isModified("post.hncs.clahe_strength") || model.isModified("post.hncs.skin_protection")) {
+            ChoiceRow(title: "Output look",
+                      items: [
+                        .option("Original Tone Mapper", tag: "off"),
+                        .option("HNCS Reference", tag: "hasselblad_hncs"),
+                        .option("HNCS Smooth", tag: "hasselblad_hncs_smooth"),
+                        .option("Full Output Transform", tag: "referent_output"),
+                        .option("Full Output + HNCS", tag: "referent_output_hncs_tone"),
+                        .option("Full Output + HNCS Smooth", tag: "referent_output_hncs_smooth_tone")
+                      ],
+                      selection: renderLook,
+                      changed: model.isModified(renderLookPath) || model.isModified(legacyReferentEnabled),
+                      help: "Choose the transform applied after the film scan. The preview updates immediately.",
+                      choose: { model.set(renderLookPath, .string($0)) })
             if ["referent_output", "referent_output_hncs_tone", "referent_output_hncs_smooth_tone"].contains(renderLook) {
                 ReadoutRow(title: "Referent LUT", value: referentPath.isEmpty ? "Not selected" : URL(fileURLWithPath: referentPath).lastPathComponent)
                 WordButton(title: "Choose .cube…", help: "Choose the Referent LogC3-to-Rec.709 3D LUT", action: model.chooseReferentLUT)
@@ -1253,10 +1654,26 @@ struct AdjustmentInspector: View {
                 } else {
                     HintText("Applies the Referent LUT, then a smooth global HNCS-style tone without local CLAHE contrast.")
                 }
+            } else if renderLook == "off" {
+                HintText("Uses Negs’ original output path without the Referent transform or HNCS tone mapping.")
             } else if renderLook == "hasselblad_hncs" || renderLook == "hasselblad_hncs_smooth" {
                 HintText(renderLook == "hasselblad_hncs"
                          ? "Applies the reference HNCS-style gamma lift, local CLAHE contrast, and film curve to finished-image luminance."
                          : "Applies a smooth global HNCS-style gamma lift and film curve to finished-image luminance, without tile-local contrast.")
+            }
+            if renderLook.contains("hncs") && !renderLook.contains("smooth") {
+                LabeledSlider(title: "Local contrast", value: model.number("post.hncs.clahe_strength", range: 0...100, step: 1),
+                              range: 0...100, step: 1, unit: "%", defaultValue: 55,
+                              modified: model.isModified("post.hncs.clahe_strength"), reset: { model.resetValue("post.hncs.clahe_strength") },
+                              editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Adjust HNCS") },
+                              help: "Controls how strongly the reference HNCS option uses local CLAHE contrast.")
+            }
+            if renderLook.contains("hncs") {
+                LabeledSlider(title: "Skin / highlight protection", value: model.number("post.hncs.skin_protection", range: 0...100, step: 1),
+                              range: 0...100, step: 1, unit: "%", defaultValue: 55,
+                              modified: model.isModified("post.hncs.skin_protection"), reset: { model.resetValue("post.hncs.skin_protection") },
+                              editing: { $0 ? model.beginInteraction() : model.endInteraction(action: "Adjust HNCS") },
+                              help: "Softly reduces upward HNCS lift in warm skin-like tones and bright highlights to retain color and texture.")
             }
         }
     }

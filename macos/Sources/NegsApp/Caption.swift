@@ -5,6 +5,8 @@ import SwiftUI
 /// camera, ISO, shutter, aperture and focal length (IMPLEMENTATION.md §4.1).
 struct PhotoFacts: Equatable, Sendable {
     var camera: String?
+    var cameraMake: String?
+    var cameraModel: String?
     var iso: Double?
     /// Seconds.
     var exposure: Double?
@@ -19,8 +21,9 @@ struct PhotoFacts: Equatable, Sendable {
         return PhotoFacts(properties: properties)
     }
 
-    init(camera: String? = nil, iso: Double? = nil, exposure: Double? = nil, aperture: Double? = nil, focalLength: Double? = nil) {
-        self.camera = camera; self.iso = iso; self.exposure = exposure; self.aperture = aperture; self.focalLength = focalLength
+    init(camera: String? = nil, cameraMake: String? = nil, cameraModel: String? = nil, iso: Double? = nil, exposure: Double? = nil, aperture: Double? = nil, focalLength: Double? = nil) {
+        self.camera = camera; self.cameraMake = cameraMake; self.cameraModel = cameraModel
+        self.iso = iso; self.exposure = exposure; self.aperture = aperture; self.focalLength = focalLength
     }
 
     init(properties: [CFString: Any]) {
@@ -31,7 +34,9 @@ struct PhotoFacts: Equatable, Sendable {
             guard let number = (value as? NSNumber)?.doubleValue, number > 0, number.isFinite else { return nil }
             return number
         }
-        camera = Self.camera(make: tiff[kCGImagePropertyTIFFMake] as? String, model: tiff[kCGImagePropertyTIFFModel] as? String)
+        cameraMake = tiff[kCGImagePropertyTIFFMake] as? String
+        cameraModel = tiff[kCGImagePropertyTIFFModel] as? String
+        camera = Self.camera(make: cameraMake, model: cameraModel)
         iso = number(exif[kCGImagePropertyExifISOSpeedRatings])
         exposure = number(exif[kCGImagePropertyExifExposureTime])
         aperture = number(exif[kCGImagePropertyExifFNumber])

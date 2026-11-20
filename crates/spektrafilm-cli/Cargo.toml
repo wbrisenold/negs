@@ -50,11 +50,8 @@ spektrafilm-io.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 image.workspace = true
-exr.workspace = true
 anyhow.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true
-rayon.workspace = true
 tiff = "0.10"
 # golden_probes drives the numpy-compatible samplers with their own MT19937.
 rand_mt = "5"

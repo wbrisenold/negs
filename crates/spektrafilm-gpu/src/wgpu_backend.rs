@@ -6023,7 +6023,7 @@ fn build_unsharp_state(
     struct CombineParams {
         n_pixels: u32,
         amount: f32,
-        _pad0: u32,
+        threshold: f32,
         _pad1: u32,
     }
     let combine_params = backend.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -6031,7 +6031,7 @@ fn build_unsharp_state(
         contents: bytemuck::bytes_of(&CombineParams {
             n_pixels: n_pixels as u32,
             amount: up.amount,
-            _pad0: 0,
+            threshold: up.threshold,
             _pad1: 0,
         }),
         usage: wgpu::BufferUsages::UNIFORM,
@@ -7657,7 +7657,7 @@ mod film_cache_tests {
             }),
             glare: Some(crate::GlareGpuParams { mu: -3.0, sigma: 0.5, blur_px: 0.5, base_seed: 42, rgb_offset: [0.01; 3] }),
             gamut: None,
-            unsharp: Some(crate::UnsharpGpuParams { sigma_px: 0.7, amount: 0.7 }),
+            unsharp: Some(crate::UnsharpGpuParams { sigma_px: 0.7, amount: 0.7, threshold: 0.0 }),
             camera_lens_blur_px: Some(1.5),
             scanner_lens_blur_px: None,
             highlight_boost: Some(crate::HighlightBoostGpuParams { boost_ev: 0.5, boost_range: 0.3, protect_ev: 1.0 }),

@@ -76,11 +76,16 @@ struct PlaceReport: ViewModifier {
 
     static var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
-    /// The strip's band in the root's coordinates.
+    /// The film rail, or the status line when the rail is hidden, in root coordinates.
     private var band: CGRect {
-        let height = (model.stripShown ? Theme.Size.strip : 0) + Theme.Size.statusLine
         let canvasRect = root.convert(canvas.bounds, from: canvas)
-        return CGRect(x: canvasRect.minX, y: root.isFlipped ? canvasRect.maxY - height : canvasRect.minY,
+        if model.stripShown {
+            return CGRect(x: canvasRect.minX, y: canvasRect.minY,
+                          width: min(PhotoRail.width, canvasRect.width), height: canvasRect.height)
+        }
+        let height = Theme.Size.statusLine
+        return CGRect(x: canvasRect.minX,
+                      y: root.isFlipped ? canvasRect.maxY - height : canvasRect.minY,
                       width: canvasRect.width, height: height)
     }
 

@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import SwiftUI
 
 /// AppKit runs the application, menus, window, and title bar; the canvas and
@@ -6,13 +7,60 @@ import SwiftUI
 /// toolbar and inspector took about twice as long to show the window
 /// (docs/native-macos-ui.md, Startup).
 @main enum NegsMain {
+    private static var instanceLockDescriptor: Int32 = -1
+
     static func main() {
         MainActor.assumeIsolated {
+            guard acquireSingleInstance() else { return }
             let app = NSApplication.shared
             let delegate = ApplicationDelegate()
             app.delegate = delegate
             withExtendedLifetime(delegate) { app.run() }
         }
+    }
+
+    /// This launch replaces any older copy before it creates the editor or
+    /// starts an engine. The advisory lock also closes the race between two
+    /// nearly simultaneous launches.
+    private static func acquireSingleInstance() -> Bool {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return true }
+        let lockURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(bundleID).instance.lock")
+        let descriptor = open(lockURL.path, O_CREAT | O_RDWR, mode_t(0o600))
+        guard descriptor >= 0 else { return false }
+
+        if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+            instanceLockDescriptor = descriptor
+            return true
+        }
+
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        let older = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .filter { $0.processIdentifier != currentPID && !$0.isTerminated }
+        older.forEach { $0.terminate() }
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+                instanceLockDescriptor = descriptor
+                return true
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+
+        older.filter { !$0.isTerminated }.forEach { $0.forceTerminate() }
+        let forceDeadline = Date().addingTimeInterval(2)
+        while Date() < forceDeadline {
+            if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+                instanceLockDescriptor = descriptor
+                return true
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+
+        Darwin.close(descriptor)
+        fputs("Negs could not acquire its single-instance lock.\n", stderr)
+        return false
     }
 }
 
@@ -233,37 +281,40 @@ struct EditorCanvas: View {
 
     var body: some View {
         let grid = model.mode == .grid
-        VStack(spacing: 0) {
-            // The grid's sheet covers it (`GridSheet`), so coming back to
-            // the same photograph is instant and keeps its zoom.
-            CanvasArea(model: model, dropping: dropTargeted)
-            // The tray takes the strip's and the status line's place (§4.5),
-            // in Image Only too, which comes back when it closes.
-            if let tray = model.tray, !grid {
-                StockTray(model: model, visit: tray)
-            } else if !dropTargeted, !model.imageOnly {
+        HStack(spacing: 0) {
+            if model.source != nil, !model.imageOnly {
                 VStack(spacing: 0) {
-                    // It stays under the grid's sheet, which folds back into it.
-                    if model.stripShown, model.source != nil {
-                        PhotoBrowser(model: model)
-                    }
-                    // None in the empty window (§4.14).
-                    if model.source != nil || model.exporting || model.batch != nil {
-                        // No rule: strip and status line are 186 pt, the
-                        // tray's height, so the photograph doesn't move (§2.3).
-                        StatusBar(model: model)
+                    PrintLabel(model: model)
+                    if model.stripShown, model.tray == nil {
+                        PhotoRail(model: model).frame(maxHeight: .infinity)
+                    } else if model.tray == nil {
+                        VStack(spacing: 9) {
+                            Text("Photo strip hidden").font(Theme.text(12, italic: true)).foregroundStyle(Theme.dim)
+                            Button("Show Film Strip") { model.toggleFilmstrip() }
+                                .buttonStyle(OutlinedButtonStyle())
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        Spacer(minLength: 0)
                     }
                 }
-                // The leader rises from the strip's right end, or from the
-                // status line's top edge with the strip hidden (§11). It
-                // stands on that edge, over the canvas: an `alignmentGuide`
-                // to its bottom was ignored and left it covering the frame.
-                .overlay(alignment: .topTrailing) {
-                    if model.source != nil, !grid, !model.cropping {
-                        StripLeader(model: model).offset(y: -StripLeader.raised)
-                    }
+                .frame(width: PhotoRail.width)
+                .frame(maxHeight: .infinity)
+                .background(Theme.film)
+            }
+
+            VStack(spacing: 0) {
+                // The grid's sheet covers the canvas, so returning is instant
+                // and keeps the current photograph's zoom.
+                CanvasArea(model: model, dropping: dropTargeted)
+                if let tray = model.tray, !grid {
+                    StockTray(model: model, visit: tray)
+                } else if !dropTargeted, !model.imageOnly,
+                          model.source != nil || model.exporting || model.batch != nil {
+                    StatusBar(model: model)
                 }
             }
+            .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
         }
         // Where the strip's frames report their places (`SheetFlight`).
         .coordinateSpace(.named(ThumbnailPlaces.space))
@@ -344,9 +395,11 @@ struct CanvasArea: View {
     @AppStorage("negs.viewer.frameBorder") private var frameBorderVisible = false
     @State private var showingFilmFormat = false
 
-    /// Above the photograph, for the caption; below it, for the label's two rows (§2.3).
-    static let captionBand: CGFloat = 54
-    static let labelBand = PrintLabelLayout.band
+    /// A single metadata caption above the image. Stock selectors live in the
+    /// left develop rail, leaving the photograph's top edge visually quiet.
+    static let captionBand: CGFloat = 82
+    private var headerBand: CGFloat { model.source == nil ? 54 : Self.captionBand }
+    static let labelBand: CGFloat = 0
 
     var body: some View {
         ZStack {
@@ -359,12 +412,11 @@ struct CanvasArea: View {
                 let failure = model.developFailure
                 if failure == nil, !dropping, model.comparisonMode != .threeUp { lightTable }
                 VStack(spacing: 0) {
-                    Color.clear.frame(height: Self.captionBand)
+                    Color.clear.frame(height: headerBand)
                     // Couldn't develop: the last develop, faded and greyed.
                     photograph
                         .grayscale(failure == nil ? 0 : 1)
                         .opacity(dropping ? 0 : failure == nil ? 1 : 0.12)
-                    Color.clear.frame(height: Self.labelBand)
                 }
                 .overlay(alignment: .topLeading) {
                     if model.comparisonMode != .threeUp, !dropping, model.image != nil || model.standIn != nil || model.placeholder != nil {
@@ -376,19 +428,23 @@ struct CanvasArea: View {
                 } else if let failure {
                     DevelopFailure(name: model.sourceItem.map { model.library.name(of: $0) } ?? "The photograph",
                                    reason: failure, retry: model.retryDevelop)
-                        .padding(.top, Self.captionBand).padding(.bottom, Self.labelBand)
+                        .padding(.top, headerBand).padding(.bottom, Self.labelBand)
                 }
             }
         }
         .overlay(alignment: .topTrailing) {
             if model.source != nil, !model.cropping {
-                HStack(spacing: 8) {
-                    Button("Film Format") { showingFilmFormat.toggle() }
+                HStack(spacing: 2) {
+                    Button { showingFilmFormat.toggle() } label: {
+                        Label("Format", systemImage: "camera.aperture")
+                            .padding(.horizontal, 9).padding(.vertical, 6)
+                    }
                         .popover(isPresented: $showingFilmFormat, arrowEdge: .top) {
                             FilmFormatPicker(model: model)
                                 .padding(10).frame(width: 300).background(Theme.panel)
                         }
                         .help("Choose the camera film format used for this photograph")
+                    toolbarDivider
                     Menu {
                         Picker("Preview", selection: Binding(get: { model.comparisonMode }, set: { model.comparisonMode = $0 })) {
                             ForEach(PreviewCompareMode.allCases) { mode in Text(mode.title).tag(mode) }
@@ -400,23 +456,39 @@ struct CanvasArea: View {
                         ForEach(model.savedVersions) { version in Button("Apply \(version.name)") { model.applyVersion(version.slot) } }
                     } label: {
                         Label("Compare", systemImage: "square.split.2x1")
+                            .padding(.horizontal, 9).padding(.vertical, 6)
                     }
                     .help("Save and compare this photo’s original and edit versions")
-                    Button(frameBorderVisible ? "Frame On" : "Frame") { frameBorderVisible.toggle() }
+                    toolbarDivider
+                    Button { frameBorderVisible.toggle() } label: {
+                        Label("Frame", systemImage: "viewfinder")
+                            .padding(.horizontal, 9).padding(.vertical, 6)
+                    }
+                    .foregroundStyle(frameBorderVisible ? Theme.accent : Theme.label)
+                    .accessibilityAddTraits(frameBorderVisible ? .isSelected : [])
                         .help("Show a viewer-only frame; it is never exported")
                 }
-                .buttonStyle(InkPressStyle()).padding(.top, 8).padding(.trailing, 12)
+                .buttonStyle(InkPressStyle())
+                .font(Theme.text(12, weight: 600))
+                .foregroundStyle(Theme.label)
+                .padding(.horizontal, 5).padding(.vertical, 4)
+                .background(Theme.panel.opacity(0.94), in: Capsule())
+                .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
+                .padding(.top, 8).padding(.trailing, 12)
             }
         }
         .overlay {
             if (model.comparisonMode == .wipe && model.comparisonOriginal != nil)
                 || model.comparisonMode == .versionWipe {
                 GeometryReader { proxy in
-                    let y = Self.captionBand
-                    let height = max(proxy.size.height - Self.captionBand - Self.labelBand, 1)
+                    let y = headerBand
+                    let height = max(proxy.size.height - headerBand - Self.labelBand, 1)
                     let print = shownPrint ?? CGRect(x: 0, y: y, width: proxy.size.width, height: height)
                     ZStack {
-                        if wipeComparisonImage != nil {
+                        let comparisonReady = model.comparisonMode == .versionWipe
+                            ? model.versionImages[1] != nil && model.versionImages[2] != nil
+                            : model.comparisonOriginal != nil
+                        if comparisonReady {
                             Capsule().fill(.black.opacity(0.38)).frame(width: 28, height: height)
                                 .overlay(Rectangle().fill(.white.opacity(0.95)).frame(width: 2, height: height - 12))
                                 .position(x: print.minX + print.width * model.wipePosition, y: y + height / 2)
@@ -426,24 +498,49 @@ struct CanvasArea: View {
                                         model.wipePosition = min(max((value.location.x - print.minX) / max(print.width, 1), 0.02), 0.98)
                                     })
                         } else {
-                            Text("Save Version 1 and Version 2 to compare them")
+                            let hasBothVersions = [1, 2].allSatisfy { slot in model.savedVersions.contains(where: { $0.slot == slot }) }
+                            Text(hasBothVersions ? "Rendering both saved versions at preview quality…" : "Save Version 1 and Version 2 to compare them")
                                 .font(.system(size: 13, weight: .medium, design: .monospaced))
                                 .padding(10).background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 7))
                                 .position(x: proxy.size.width / 2, y: y + height / 2)
                         }
-                        HStack {
-                            Text(model.comparisonMode == .versionWipe ? "VERSION 1" : "BEFORE").padding(.leading, 12)
-                            Spacer()
-                            Text(model.comparisonMode == .versionWipe ? "VERSION 2" : "CURRENT").padding(.trailing, 12)
+                        if model.comparisonMode == .versionWipe {
+                            HStack(spacing: 8) {
+                                versionChoice(1)
+                                Spacer()
+                                versionChoice(2)
+                            }
+                            .frame(height: 28)
+                            .position(x: proxy.size.width / 2, y: y + 18)
+                            HStack(spacing: 8) {
+                                Button { model.exportVersion(1) } label: { Label("Export Version 1", systemImage: "square.and.arrow.up") }
+                                    .disabled(!model.savedVersions.contains(where: { $0.slot == 1 }) || !model.canExport)
+                                Button { model.exportVersion(2) } label: { Label("Export Version 2", systemImage: "square.and.arrow.up") }
+                                    .disabled(!model.savedVersions.contains(where: { $0.slot == 2 }) || !model.canExport)
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                            .padding(.horizontal, 10).padding(.vertical, 7)
+                            .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 8))
+                            .foregroundStyle(.white)
+                            .position(x: proxy.size.width / 2, y: y + height - 24)
+                        } else {
+                            HStack {
+                                Text("BEFORE").padding(.leading, 12)
+                                Spacer()
+                                Text("CURRENT").padding(.trailing, 12)
+                            }
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white).shadow(color: .black.opacity(0.7), radius: 3)
+                            .frame(height: 24).position(x: proxy.size.width / 2, y: y + 16)
                         }
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.white).shadow(color: .black.opacity(0.7), radius: 3)
-                        .frame(height: 24).position(x: proxy.size.width / 2, y: y + 16)
                         HStack(spacing: 5) {
                             Button { model.canvasScale.zoom(by: 0.8) } label: { Image(systemName: "minus.magnifyingglass") }
                                 .help("Zoom out")
-                            Button { model.zoom(fit: true) } label: { Text("Fit") }
-                                .help("Fit the full photograph in the preview")
+                            Button { model.zoom(fit: true) } label: { Text(model.comparisonMode == .versionWipe ? "Fit Both" : "Fit") }
+                                .help(model.comparisonMode == .versionWipe
+                                      ? "Fit both versions together. Pan and zoom stay matched."
+                                      : "Fit the full photograph in the preview")
                             Button { model.canvasScale.zoom(by: 1.25) } label: { Image(systemName: "plus.magnifyingglass") }
                                 .help("Zoom in")
                             Divider().frame(height: 16)
@@ -471,9 +568,13 @@ struct CanvasArea: View {
         }
     }
 
+    private var toolbarDivider: some View {
+        Rectangle().fill(Theme.line).frame(width: 1, height: 16).padding(.horizontal, 3)
+    }
+
     /// The print's place on the canvas, once it's laid out.
     private var shownPrint: CGRect? {
-        geometry.print.width > 0 ? geometry.print.offsetBy(dx: 0, dy: Self.captionBand) : nil
+        geometry.print.width > 0 ? geometry.print.offsetBy(dx: 0, dy: headerBand) : nil
     }
 
     /// The border on screen, as `photograph` passes it to the preview.
@@ -507,7 +608,7 @@ struct CanvasArea: View {
             if let title, !dropping, !model.cropping {
                 GeometryReader { proxy in
                     let canvas = CGRect(origin: .zero, size: proxy.size)
-                    let visible = shownPrint.map { $0.intersection(canvas) } ?? CGRect(x: 0, y: Self.captionBand, width: proxy.size.width, height: 0)
+                    let visible = shownPrint.map { $0.intersection(canvas) } ?? CGRect(x: 0, y: headerBand, width: proxy.size.width, height: 0)
                     DevelopTag(title: title)
                         .frame(width: max(visible.width, 1))
                         .offset(x: visible.minX, y: visible.minY + 16)
@@ -544,10 +645,9 @@ struct CanvasArea: View {
         }
     }
 
-    /// The caption 10 pt over the print and the label under it, kept within
-    /// the canvas's margins; zoomed in, they stay in their bands.
+    /// Camera metadata above the print, kept inside the short caption band.
     @ViewBuilder private func marks(in size: CGSize) -> some View {
-        let print = geometry.print.offsetBy(dx: 0, dy: Self.captionBand)
+        let print = geometry.print.offsetBy(dx: 0, dy: headerBand)
         if print.width > 0 {
             let margin = ImageScrollView.fitInset
             let left = max(print.minX, margin)
@@ -555,10 +655,18 @@ struct CanvasArea: View {
             let width = max(right - left, 1)
             let portrait = !geometry.zoomed && print.height > print.width
             PhotoCaption(facts: model.photoFacts, fileName: model.sourceItem.map { model.library.name(of: $0) } ?? "", portrait: portrait)
-                .frame(width: width, height: 40, alignment: .bottom)
-                .offset(x: left, y: print.minY - 10 - 40)
-            PrintLabel(model: model, photoWidth: width, canvasWidth: max(size.width - margin - left, width))
-                .offset(x: left, y: print.maxY)
+                .frame(width: width, height: 24, alignment: .center)
+                .offset(x: left, y: 50)
+            if let slot = model.previewVersionSlot, model.comparisonMode == .off {
+                Text("VERSION \(slot)")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .tracking(0.6)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8).padding(.vertical, 5)
+                    .background(.black.opacity(0.68), in: Capsule())
+                    .position(x: left + 42, y: print.minY + 18)
+                    .accessibilityLabel("Showing saved Version \(slot)")
+            }
             // Not zoomed in: the corners are off the canvas then (§4.3).
             // Nor in Image Only, which crops nothing.
             if !geometry.zoomed, !model.imageOnly, model.image != nil, model.developFailure == nil {
@@ -577,28 +685,77 @@ struct CanvasArea: View {
     }
 
     private func canvas(_ image: AnyObject, size: CGSize, rotation: Int) -> some View {
-        let wipeBase: AnyObject = model.comparisonMode == .versionWipe ? (model.versionImages[1] ?? image) : image
+        let wipeBase: AnyObject = model.comparisonMode == .versionWipe ? (model.versionImages[2] ?? image) : image
         return PreviewCanvas(image: wipeBase, size: size, rotation: rotation, crop: model.crop, border: previewBorder(for: model.crop.size(of: size)), filmTexture: model.filmTexture,
                       filmStrip: model.filmStrip, diagnosticOverlay: model.comparisonMode == .off && model.original == nil ? model.diagnosticOverlay : nil,
+                      backgroundMaskOverlay: model.comparisonMode == .off && model.original == nil ? model.visibleBackgroundMaskOverlay : nil,
+                      backgroundMaskOverlayOpacity: CGFloat(model.backgroundMaskOverlayOpacity),
                       comparisonImage: wipeComparisonImage, wipeFraction: model.wipePosition,
                       zoomCommand: model.zoomCommand, fit: model.fitImage, scale: model.canvasScale, geometry: geometry,
                       upsideDown: model.upsideDown, settled: model.original != nil || model.showsSettledFrame,
-                      doubleClick: { [model] in model.doubleClickPhotograph(zoomed: $0) })
+                      doubleClick: { [model] in model.doubleClickPhotograph(zoomed: $0) },
+                      colorPickTapEnabled: model.scopeMode == .picker,
+                      colorPicked: { [model] point in model.pickColor(at: point) },
+                      maskPaintingEnabled: model.backgroundMaskBrushActive && !model.backgroundMaskGenerating,
+                      maskBrushSubtract: model.backgroundMaskBrushSubtract,
+                      maskStrokeBegan: { [model] point in model.beginBackgroundMaskStroke(at: point) },
+                      maskStrokeChanged: { [model] point in model.continueBackgroundMaskStroke(at: point) },
+                      maskStrokeEnded: { [model] in model.endBackgroundMaskStroke() })
     }
 
     private var wipeComparisonImage: AnyObject? {
         switch model.comparisonMode {
         case .wipe: model.comparisonOriginal
-        case .versionWipe: model.versionImages[2]
+        case .versionWipe: model.versionImages[1]
         case .off, .threeUp: nil
         }
     }
 
+    private func versionChoice(_ slot: Int) -> some View {
+        let saved = model.savedVersions.contains(where: { $0.slot == slot })
+        let selected = model.editingVersionSlot == slot
+        return Button { model.selectVersionForEditing(slot) } label: {
+            VStack(spacing: 2) {
+                Text("VERSION \(slot)").font(.system(size: 10, weight: .bold, design: .rounded))
+                Text(selected ? "EDITING" : saved ? "Click to edit" : "Not saved")
+                    .font(.system(size: 9, weight: .medium, design: .rounded))
+            }
+            .foregroundStyle(selected ? Theme.accent : .white)
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(selected ? Theme.accent.opacity(0.18) : .black.opacity(0.72), in: RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(selected ? Theme.accent.opacity(0.85) : .white.opacity(0.28), lineWidth: 1))
+        }
+        .buttonStyle(.borderless)
+        .disabled(!saved)
+        .help(saved ? "Select Version \(slot) to edit it; changes are saved back to that version." : "Save an edit to Version \(slot) first.")
+    }
+
     @ViewBuilder private var comparePanels: some View {
-        HStack(spacing: 1) {
-            comparePanel("Before", image: model.comparisonOriginal, crop: model.crop)
-            ForEach(1...2, id: \.self) { slot in
-                comparePanel("Version \(slot)", image: model.versionImages[slot], crop: model.savedVersions.first(where: { $0.slot == slot })?.state.crop ?? model.crop)
+        VStack(spacing: 3) {
+            HStack {
+                Spacer()
+                Label("VIEWS LINKED", systemImage: "link")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .tracking(0.5)
+                    .foregroundStyle(Theme.accent)
+                    .padding(.horizontal, 9).padding(.vertical, 6)
+                    .background(Theme.accent.opacity(0.12), in: Capsule())
+                Button { model.zoom(fit: true) } label: {
+                    Label("Fit & Sync", systemImage: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(Theme.onAccent)
+                        .padding(.horizontal, 11).padding(.vertical, 6)
+                        .background(Theme.accent, in: Capsule())
+                }
+                .buttonStyle(.borderless)
+                .help("Fit both saved versions to their panels. Panning and zooming either version keeps the other matched.")
+            }
+            .padding(.horizontal, 12).frame(height: 34)
+            HStack(spacing: 1) {
+                comparePanel("Before", image: model.comparisonOriginal, crop: model.crop)
+                ForEach(1...2, id: \.self) { slot in
+                    comparePanel("Version \(slot)", image: model.versionImages[slot], crop: model.savedVersions.first(where: { $0.slot == slot })?.state.crop ?? model.crop)
+                }
             }
         }
         .background(.black.opacity(0.2))
@@ -606,12 +763,53 @@ struct CanvasArea: View {
 
     private func comparePanel(_ title: String, image: AnyObject?, crop: CropSettings) -> some View {
         VStack(spacing: 0) {
-            Text(title).font(.system(size: 11, weight: .semibold, design: .rounded))
-                .foregroundStyle(.white.opacity(0.9)).frame(height: 28)
+            HStack(spacing: 9) {
+                if title == "Before" {
+                    Text(title).font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.9))
+                } else if let slot = Int(title.split(separator: " ").last ?? "") {
+                    Button { model.selectVersionForEditing(slot) } label: {
+                        HStack(spacing: 7) {
+                            Image(systemName: model.editingVersionSlot == slot ? "slider.horizontal.3" : "hand.tap")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text("VERSION \(slot)")
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .tracking(0.45)
+                            Text(model.editingVersionSlot == slot ? "EDITING" : "EDIT")
+                                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                .tracking(0.35)
+                        }
+                        .foregroundStyle(model.editingVersionSlot == slot ? Theme.onAccent : Theme.label)
+                        .padding(.horizontal, 11).padding(.vertical, 7)
+                        .background(model.editingVersionSlot == slot ? Theme.accent : Theme.panel,
+                                    in: RoundedRectangle(cornerRadius: 7))
+                        .overlay(RoundedRectangle(cornerRadius: 7)
+                            .stroke(model.editingVersionSlot == slot ? Theme.accent : Theme.line, lineWidth: 1))
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Click to load Version \(slot) into the controls. Changes save back here while comparison stays open.")
+                    Spacer()
+                    Button { model.exportVersion(slot) } label: {
+                        Label("Export", systemImage: "square.and.arrow.up")
+                            .font(.system(size: 9, weight: .semibold, design: .rounded))
+                            .foregroundStyle(Theme.label)
+                            .padding(.horizontal, 9).padding(.vertical, 6)
+                            .background(Theme.panel, in: Capsule())
+                            .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!model.canExport)
+                    .help("Export this saved version")
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 40)
             if let image {
                 PreviewCanvas(image: image, size: model.imageSize, rotation: model.imageRotation, crop: crop,
                               border: previewBorder(for: crop.size(of: model.imageSize)), filmTexture: model.filmTexture,
-                              filmStrip: model.filmStrip, zoomCommand: model.zoomCommand, fit: true)
+                              filmStrip: model.filmStrip, zoomCommand: model.zoomCommand, fit: true,
+                              navigation: title == "Before" ? nil : model.versionNavigation,
+                              navigationSlot: Int(title.split(separator: " ").last ?? ""))
             } else {
                 ContentUnavailableView(title, systemImage: "photo", description: Text(title == "Before" ? "Loading original" : "Save a version to this slot"))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -262,6 +262,10 @@ enum ExportRating {
     var current: Int?
     var running = false
     var cancelled = false
+    private(set) var currentStartedAt: Date?
+    private(set) var currentExpectedDuration: TimeInterval?
+    private(set) var timingEngine: ExportEngine
+    @ObservationIgnored private var expectedDurationByItem: [URL: TimeInterval] = [:]
     /// Where the journal is kept.
     @ObservationIgnored let journalURL: URL
     @ObservationIgnored var job: ExportJob?
@@ -270,6 +274,7 @@ enum ExportRating {
     init(journal: BatchJournal, journalURL: URL) {
         self.journal = journal
         self.journalURL = journalURL
+        timingEngine = journal.options.exportEngine
     }
 
     var items: [BatchItem] { journal.items }
@@ -280,6 +285,64 @@ enum ExportRating {
     var failures: [BatchItem] { items.filter { $0.status == .failed } }
     var skipped: [BatchItem] { items.filter { $0.status == .skipped } }
     var fraction: Double { total == 0 ? 1 : Double(finished) / Double(total) }
+    var currentTitle: String? { current.flatMap { items.indices.contains($0) ? items[$0].title : nil } }
+
+    func prepareTimeEstimates() {
+        let engine = timingEngine
+        for item in items where item.status == .waiting {
+            let photo = item.item.photoFile
+            let raw = EditorModel.rawExtensions.contains(photo.pathExtension.lowercased())
+            let size = item.size ?? EditorModel.imagePixelSize(of: photo)
+            guard let size, size.width > 0, size.height > 0 else { continue }
+            let megapixels = Double(size.width * size.height) / 1_000_000
+            if let seconds = ExportTiming.estimate(engine: engine, raw: raw, megapixels: megapixels) {
+                expectedDurationByItem[item.item] = seconds
+            }
+        }
+    }
+
+    func beginCurrentItem(_ item: BatchItem, size: CGSize? = nil, at date: Date = .now) {
+        currentStartedAt = date
+        currentExpectedDuration = expectedDurationByItem[item.item]
+        if currentExpectedDuration == nil, let size, size.width > 0, size.height > 0 {
+            let raw = EditorModel.rawExtensions.contains(item.item.photoFile.pathExtension.lowercased())
+            let megapixels = Double(size.width * size.height) / 1_000_000
+            currentExpectedDuration = ExportTiming.estimate(engine: timingEngine,
+                                                            raw: raw, megapixels: megapixels)
+            if let currentExpectedDuration { expectedDurationByItem[item.item] = currentExpectedDuration }
+        }
+    }
+
+    func recordCurrentDuration(_ duration: TimeInterval, for item: BatchItem) {
+        expectedDurationByItem[item.item] = duration
+        currentExpectedDuration = duration
+    }
+
+    func useTimingEngine(_ engine: ExportEngine) {
+        timingEngine = engine
+    }
+
+    func remainingTimes(at date: Date) -> (image: TimeInterval?, total: TimeInterval?) {
+        guard let current, items.indices.contains(current), let expected = currentExpectedDuration,
+              let currentStartedAt else { return (nil, nil) }
+        let imageRemaining = max(0, expected - date.timeIntervalSince(currentStartedAt))
+        var totalRemaining = imageRemaining
+        for (index, item) in items.enumerated() where index != current && item.status == .waiting {
+            guard let duration = expectedDurationByItem[item.item] else { return (imageRemaining, nil) }
+            totalRemaining += duration
+        }
+        return (imageRemaining, totalRemaining)
+    }
+
+    func progress(at date: Date) -> Double {
+        guard total > 0, let current, items.indices.contains(current),
+              let expected = currentExpectedDuration, let currentStartedAt else { return fraction }
+        guard items[current].status == .waiting else { return fraction }
+        let elapsed = max(0, date.timeIntervalSince(currentStartedAt))
+        let withinImage = min(0.99, elapsed / max(expected, 0.01))
+        return min(0.999, (Double(finished) + withinImage) / Double(total))
+    }
+
     /// The popover's rule: the share exported, then the share that failed
     /// or was skipped. A batch that all failed draws no yellow.
     var ruleParts: (exported: Double, other: Double) {
@@ -389,6 +452,30 @@ struct BatchProgressView: View {
             }
             .font(Theme.text(14, italic: true)).foregroundStyle(Theme.label).lineLimit(1)
             .padding(.top, 8)
+            if run.running {
+                TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                    let times = run.remainingTimes(at: timeline.date)
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack {
+                            Text("This image · \(ExportTiming.eta(times.image)) left")
+                            Spacer(minLength: 12)
+                            Text("Queue · \(ExportTiming.eta(times.total)) left")
+                        }
+                        .font(Theme.text(12.5, italic: true))
+                        .foregroundStyle(Theme.dim)
+                        Group {
+                            if times.image == nil {
+                                ProgressView()
+                            } else {
+                                ProgressView(value: run.progress(at: timeline.date))
+                            }
+                        }
+                        .progressViewStyle(.linear)
+                        .tint(Theme.accent)
+                    }
+                    .padding(.top, 8)
+                }
+            }
             if !run.failures.isEmpty {
                 Rectangle().fill(Theme.line).frame(height: 1).padding(.vertical, 10)
                 Text(run.failures.count == 1 ? "1 failed" : "\(run.failures.count) failed")

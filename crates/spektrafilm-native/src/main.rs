@@ -86,6 +86,12 @@ enum Command {
     PreviewColourSpace {
         input: PathBuf,
     },
+    /// Darktable's camera-specific WB targets for the make/model recorded by
+    /// the RAW. Returned once per opened photo so the inspector can show the
+    /// actual preset gains and tuning range instead of a camera-specific list.
+    CameraWhiteBalance {
+        input: PathBuf,
+    },
     /// Spectral-reference RAW white-balance estimate. Decodes a small native
     /// RAW preview so estimation uses sensor data, never the embedded JPEG.
     EstimateItcwb {
@@ -564,6 +570,14 @@ impl Session {
         let processed = started.elapsed();
         let encoding = Encoding::new(&params.io.output_color_space, params.io.output_cctf_encoding);
         let (width, height) = write_display(output, encoding, &post, &preview_path)?;
+        // The scan can exceed white here, but finishing controls (especially
+        // highlight recovery) can map those pixels below white. Preserve the
+        // scan's clipping provenance beside the finished display proxy.
+        let (mask_width, mask_height, clipped_highlights) =
+            spektrafilm_core::preview::display_clipped_highlights(output, DISPLAY_MAX_DIM, encoding);
+        ensure!((mask_width, mask_height) == (width, height), "Clipping mask dimensions do not match preview");
+        std::fs::write(preview_path.with_extension("clip"), clipped_highlights)
+            .context("Writing preview clipping mask")?;
         let mut result = json!({
             "width": width, "height": height, "backend": used_backend,
             "display_color_space": DisplaySpace::of(encoding).name(),
@@ -587,6 +601,13 @@ impl Session {
             Command::PreviewColourSpace { input } => Ok(json!({
                 "colour_space": declared_preview_colour_space(&input)?
             })),
+            Command::CameraWhiteBalance { input } => {
+                let camera_white_balance = spektrafilm_io::read_metadata(&input).and_then(|metadata| {
+                    metadata.make.as_deref().zip(metadata.model.as_deref())
+                        .and_then(|(make, model)| spektrafilm_io::darktable_camera_white_balance(make, model))
+                });
+                Ok(json!({"camera_white_balance": camera_white_balance}))
+            }
             Command::BalancePrint { film, paper, params } => {
                 let started = Instant::now();
                 let (m, y) = spektrafilm_core::print_balance::solve_neutral_filter_shifts(

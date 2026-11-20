@@ -8,8 +8,9 @@ to rawler. Rendering and file-I/O errors are reported rather than silently
 changing the colour processing. See [decoder architecture](apple-raw-decoder.md).
 
 Apple As Shot uses the stored camera white balance. Other modes develop at D65
-(`neutralChromaticity = (0.3127, 0.3290)`) before applying the existing shared
-CAT02/ACES temperature/tint operation. Apple's own numerical tint control is
+(`neutralChromaticity = (0.3127, 0.3290)`) before applying the shared
+CAT16/ACES temperature/tint operation by default. CAT02 and XYZ scaling remain
+selectable. Apple's own numerical tint control is
 not used, so Tint keeps its established Spektrafilm meaning. Custom 6504 K /
 tint 1 is exactly Daylight. Both preview and f64 export call the same loader.
 
@@ -29,10 +30,13 @@ Open a camera RAW, then use **RAW white balance** above Profiles:
 | **Daylight** | Develops at D65 through Apple, or matrix-derived daylight coefficients through rawler. |
 | **Tungsten (2850 K)** | Starts from Daylight and adapts a 2850 K scene white to the daylight reference. |
 | **Custom** | Same adaptation using Temperature, then a green-channel multiplier in linear ACES2065-1 using Tint. |
+| **Camera presets** | Matches the RAW's recorded make/model to Darktable's camera WB table, then uses that camera's channel gains and recorded fine-tuning values before demosaicing. EOS R5 C uses the requested EOS R5 table entry. |
 
 Custom defaults to **5500 K, tint 1.0**. Temperature is **1667–25000 K**;
 tint is **greater than 0 through 4** (the GUI slider starts at 0.01).
 Tint 1 is neutral, higher values are greener, lower values more magenta.
+The D50–D93 temperature presets move tint using the same temperature-to-tint
+coupling as the linked temperature slider.
 Temperature/tint controls are disabled and ignored in the other modes.
 
 Edits automatically re-read and re-develop the original RAW on the preview
@@ -64,7 +68,8 @@ spektrafilm-f64 process input.NEF -o out.tiff --film kodak_gold_200 \
   --raw-wb daylight
 ```
 
-`--raw-wb` accepts `as_shot`, `daylight`, `tungsten`, or `custom`.
+`--raw-wb` accepts `as_shot`, `daylight`, `tungsten`, `custom`, or
+`camera_preset` (camera preset and tuning are stored in params and resolved from the RAW make/model).
 `--raw-temperature` / `--raw-tint` require `--raw-wb custom`. Omitting all
 flags preserves the settings from `--params`, or As shot if none were saved.
 Flags override only the specified fields. Non-RAW input pixels ignore WB.
@@ -77,7 +82,8 @@ The GUI export's existing RuntimeParams JSON now carries:
     "raw_white_balance": {
       "mode": "custom",
       "temperature": 3200.0,
-      "tint": 0.85
+      "tint": 0.85,
+      "method": "cat16"
     }
   }
 }
@@ -98,6 +104,23 @@ cargo build --release -p spektrafilm-gui
 For RAW exports the GUI also passes explicit WB flags. This prevents an older
 companion from silently ignoring the new JSON field and exporting As shot;
 an incompatible companion reports its path and the rebuild command instead.
+
+## Darktable camera WB table
+
+`crates/spektrafilm-io/src/darktable_wb_presets.json` is Darktable's complete
+camera WB preset table from
+[`wb_presets.json` at commit `d7c0b170`](https://github.com/darktable-org/darktable/blob/d7c0b1706661dbef93af2c64837128a7c4558e9f/data/wb_presets.json).
+The RAW's make/model tags select a matching table entry. The inspector then
+shows that camera's preset names, actual target gains, and the tuning range
+available for the selected preset. Missing tuning points are interpolated
+between adjacent Darktable entries. Legacy EOS R5 C edits still resolve to
+the EOS R5 preset names. Darktable's zero fourth channel for cameras such as
+the EOS R5 C is displayed and applied as G1, the second green gain Rawler
+expects. Camera presets force the Rawler backend because Apple RAW returns
+already-demosaiced pixels.
+
+This bundled data is GPL-3.0, matching this repository's license. Preserve
+the upstream attribution and pinned source when updating it.
 
 ## Python implementation investigated
 

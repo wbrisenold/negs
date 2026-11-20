@@ -174,6 +174,7 @@ fn unsharp_mask_borders_match_python() {
             rgb_image(&fixture.rgb_field),
             case.sigma,
             case.amount,
+            0.0,
             &CpuBackend,
         );
         assert_close(

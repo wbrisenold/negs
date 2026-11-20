@@ -841,6 +841,7 @@ impl Pipeline {
                     &mut image,
                     &self.params.io.output_color_space,
                     self.params.io.output_cctf_encoding,
+                    &self.params.post.hncs,
                 );
             }
             crate::params::RenderLook::HasselbladHncsSmooth
@@ -849,6 +850,7 @@ impl Pipeline {
                     &mut image,
                     &self.params.io.output_color_space,
                     self.params.io.output_cctf_encoding,
+                    &self.params.post.hncs,
                 );
             }
             _ => {}
@@ -1153,12 +1155,13 @@ impl Pipeline {
                     crate::params::RenderLook::HasselbladHncsSmooth
                         | crate::params::RenderLook::ReferentOutputHncsSmoothTone
                 ) {
-                    crate::hncs::apply(&mut scan, &render_params.io.output_color_space, encoded);
+                    crate::hncs::apply(&mut scan, &render_params.io.output_color_space, encoded, &render_params.post.hncs);
                 } else {
                     crate::hncs::apply_reference(
                         &mut scan,
                         &render_params.io.output_color_space,
                         encoded,
+                        &render_params.post.hncs,
                     );
                 }
             }
@@ -1357,6 +1360,10 @@ impl Pipeline {
     /// makes them; none when they change nothing.
     pub fn display_post(&self) -> Option<spektrafilm_gpu::DisplayPost> {
         let post = &self.params.post;
+        // The resident display shader cannot sample this per-pixel mask. Leave
+        // all post work to the coordinate-aware CPU pass while a matte is active.
+        if !post.background_mask_png_base64.is_empty() || !post.background_masks.is_empty()
+            || !post.color_density.is_identity() { return None; }
         (!post.is_identity()).then(|| {
             crate::post::PostProcess::new(
                 post,
@@ -1811,6 +1818,7 @@ impl Pipeline {
             Some(spektrafilm_gpu::UnsharpGpuParams {
                 sigma_px: usm_sigma,
                 amount: usm_amount,
+                threshold: self.params.scanner.unsharp_threshold,
             })
         } else {
             None
@@ -1931,7 +1939,9 @@ impl Pipeline {
     /// The resident chain's output, finished: encoded on the CPU when the
     /// backend left the post-scan pass to us or couldn't encode this curve.
     fn finish_resident(&self, rgb: ImageBuf, backend: &dyn ComputeBackend) -> ImageBuf {
-        if !backend.resident_chain_applies_post_scan()
+        if !self.params.post.background_mask_png_base64.is_empty()
+            || !self.params.post.background_masks.is_empty()
+            || !backend.resident_chain_applies_post_scan()
             || (self.params.io.output_cctf_encoding && !self.gpu_encodes_output())
         {
             self.apply_post_scan(rgb)

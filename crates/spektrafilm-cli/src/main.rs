@@ -541,6 +541,7 @@ fn apply_raw_wb_overrides(
             "daylight" => RawWhiteBalanceMode::Daylight,
             "tungsten" => RawWhiteBalanceMode::Tungsten,
             "custom" => RawWhiteBalanceMode::Custom,
+            "camera_preset" => RawWhiteBalanceMode::CameraPreset,
             _ => bail!("unknown RAW WB mode: {mode}"),
         };
     }

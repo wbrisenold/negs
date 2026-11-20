@@ -10,6 +10,7 @@ pub fn apply_unsharp_mask(
     mut image: ImageBuf,
     sigma: f32,
     amount: f32,
+    threshold: f32,
     backend: &dyn ComputeBackend,
 ) -> ImageBuf {
     if sigma <= 0.0 || amount <= 0.0 {
@@ -17,8 +18,11 @@ pub fn apply_unsharp_mask(
     }
     let blurred = backend.gaussian_blur(&image, sigma);
     let amount_s = from_f32(amount);
+    let threshold_s = from_f32(threshold.max(0.0));
     for (o, b) in image.data.iter_mut().zip(blurred.data.iter()) {
-        *o = *o + amount_s * (*o - b);
+        let detail = *o - b;
+        let retained = detail.signum() * (detail.abs() - threshold_s).max(ZERO);
+        *o += amount_s * retained;
     }
     image
 }

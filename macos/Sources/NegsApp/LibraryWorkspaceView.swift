@@ -67,8 +67,16 @@ struct LibraryWorkspaceView: View {
         }
         .background(Theme.film)
         .preferredColorScheme(.dark)
+        .tint(Theme.accent)
         .buttonStyle(OutlinedButtonStyle())
-        .task { await library.load() }
+        .task {
+            await library.load()
+            if let source = model.source { await library.syncEditedPhoto(source) }
+        }
+        .onChange(of: model.source) { _, source in
+            guard model.workspace == .library, let source else { return }
+            Task { await library.syncEditedPhoto(source) }
+        }
         .onChange(of: model.librarySearchFocusRequest) { _, _ in focusLibrarySearch() }
         .onAppear {
             if model.librarySearchFocusRequest > 0 { focusLibrarySearch() }
@@ -204,9 +212,9 @@ struct LibraryWorkspaceView: View {
         return VStack(spacing: 0) {
             HStack(spacing: StudioStyle.Space.compact) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(currentScopeLabel).font(Theme.ui(10, weight: .semibold)).tracking(1.0).foregroundStyle(Theme.dim)
+                    Text(currentScopeLabel).font(Theme.metadata(10)).tracking(1.0).foregroundStyle(Theme.dim)
                     HStack(spacing: 7) {
-                        Text(currentTitle).font(Theme.ui(18, weight: .semibold)).foregroundStyle(Theme.paper)
+                        Text(currentTitle).font(Theme.text(18, weight: 600)).foregroundStyle(Theme.paper)
                             .lineLimit(1).truncationMode(.tail)
                         Text("\(displayedPhotos.count) photos").font(Theme.metadata(10.5)).foregroundStyle(Theme.dim)
                             .lineLimit(1).fixedSize(horizontal: true, vertical: false)
@@ -292,17 +300,19 @@ struct LibraryWorkspaceView: View {
                     Divider()
                     Slider(value: $thumbnailSize, in: 120...256) { Text("Thumbnail Size") }
                 } label: {
-                    Label("Actions", systemImage: "ellipsis.circle")
+                    Image(systemName: "ellipsis.circle")
+                        .font(Theme.ui(14))
                 }
                 .menuStyle(.borderlessButton).fixedSize().controlSize(.small)
                 .help("Project, analysis and display actions")
                 Button { showInspector.toggle() } label: {
-                    Text(showInspector ? "Hide Details" : "Details")
+                    Image(systemName: "sidebar.trailing")
+                        .font(Theme.ui(14))
                         .foregroundStyle(showInspector ? Theme.paper : Theme.dim)
+                        .frame(width: 28, height: 26)
                 }
-                .buttonStyle(OutlinedButtonStyle())
+                .buttonStyle(WordActionStyle())
                 .help(showInspector ? "Hide photo details" : "Show photo details")
-                Spacer(minLength: 4)
             }
             .controlSize(.small)
             .padding(.horizontal, StudioStyle.Space.section).padding(.vertical, 11)
@@ -495,7 +505,7 @@ struct LibraryWorkspaceView: View {
                         .help("Add the selected photos to the Export Queue")
                     }
                 }
-                if library.selectedProjectID != nil {
+                if library.selectedProjectID != nil && !projectIsEmpty {
                     Button("Add Photos…", action: { showingProjectPhotoPicker = true })
                         .buttonStyle(OutlinedButtonStyle())
                     if let projectID = library.selectedProjectID {
@@ -533,12 +543,25 @@ struct LibraryWorkspaceView: View {
             } else if displayedPhotos.isEmpty {
                 VStack(spacing: 12) {
                     if projectIsEmpty {
-                        ContentUnavailableView("Project Ready", systemImage: "briefcase",
-                                               description: Text("Add photos to this project. Originals stay where they are."))
-                        Button("Add Photos…", systemImage: "photo.badge.plus", action: importFolders)
-                            .buttonStyle(OutlinedButtonStyle(prominent: true))
-                        Button("Select Photos…", action: { showingProjectPhotoPicker = true })
-                            .buttonStyle(OutlinedButtonStyle())
+                        VStack(spacing: 10) {
+                            Image(systemName: "briefcase")
+                                .font(.system(size: 25, weight: .regular))
+                                .foregroundStyle(Theme.accent)
+                                .accessibilityHidden(true)
+                            Text("Project Ready")
+                                .font(Theme.text(17, weight: 600)).foregroundStyle(Theme.paper)
+                            Text("Add photos to this project. Originals stay where they are.")
+                                .font(Theme.ui(12)).foregroundStyle(Theme.dim)
+                                .multilineTextAlignment(.center)
+                            HStack(spacing: 8) {
+                                Button("Add Photos…", systemImage: "photo.badge.plus", action: importFolders)
+                                    .buttonStyle(OutlinedButtonStyle(prominent: true))
+                                Button("Select Photos…", action: { showingProjectPhotoPicker = true })
+                                    .buttonStyle(OutlinedButtonStyle())
+                            }
+                            .padding(.top, 3)
+                        }
+                        .padding(24)
                     } else if !library.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         ContentUnavailableView("No Photos Match", systemImage: "magnifyingglass",
                                                description: Text("Try another name or clear the search to see the photographs in this view."))
@@ -1251,7 +1274,7 @@ private struct LibraryPhotoCard: View {
     }
 
     private var thumbnail: some View {
-        ZStack(alignment: .topTrailing) {
+        ZStack {
             RoundedRectangle(cornerRadius: 3).fill(Theme.film)
             if let image {
                 Image(decorative: image, scale: 2).resizable().scaledToFit().padding(4)
@@ -1266,15 +1289,17 @@ private struct LibraryPhotoCard: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Theme.blank)
             }
+        }
+        // Match the grid zoom to the actual image area so portrait frames remain
+        // legible at the user's chosen thumbnail size.
+        .frame(maxWidth: .infinity).frame(height: size)
+        .overlay(alignment: .topTrailing) {
             if photo.flag == .picked {
                 Image(systemName: "flag.fill").foregroundStyle(.green).padding(7)
             } else if photo.flag == .rejected {
                 Image(systemName: "xmark.circle.fill").foregroundStyle(.red).padding(7)
             }
         }
-        // Match the grid zoom to the actual image area so portrait frames remain
-        // legible at the user's chosen thumbnail size.
-        .frame(height: size)
         .overlay {
             RoundedRectangle(cornerRadius: 3)
                 .strokeBorder(selected ? Theme.accent : Theme.line, lineWidth: selected ? 1.2 : 0.6)

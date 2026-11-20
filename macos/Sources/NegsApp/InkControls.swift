@@ -533,10 +533,17 @@ struct InkSection<Content: View>: View {
             } else {
                 Color.clear.frame(height: 8)
             }
-            content
-            Color.clear.frame(height: 9)
-            InkRule()
+            content.padding(.bottom, 12)
         }
+        .padding(.horizontal, 9)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 2))
+        .overlay {
+            RoundedRectangle(cornerRadius: 2)
+                .strokeBorder(Theme.cardLine.opacity(0.9), lineWidth: 1)
+                .allowsHitTesting(false)
+        }
+        .padding(.horizontal, 9)
+        .padding(.top, 8)
     }
 }
 

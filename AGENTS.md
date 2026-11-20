@@ -28,5 +28,9 @@
 ## Build and package
 
 - Use `scripts/package_macos_app.sh` for a local app bundle. To build only Intel, set `MACOS_ARCHS=x86_64`. Verify the architecture with `lipo -archs` and the bundle with `scripts/verify_macos_package.py`.
+- Serialize local builds: run only one Cargo, SwiftPM, or packaging build at a time. Do not start a second build while one is running, including from another terminal or agent.
+- Reuse the established local outputs (`target/macos-app` for packaged app builds and SwiftPM scratch output under it); do not create dated, per-feature, or duplicate build directories. For this Intel workstation, use `MACOS_ARCHS=x86_64` and the default `BUILD_TARGET_DIR=target/macos-app`.
+- After a successful local package, `scripts/package_macos_app.sh` removes `target/macos-app`, the Intel test cache at `target/x86_64-apple-darwin`, and `target/debug`; the app and releases remain in `dist/`, and `target/release` is preserved. Set `CLEAN_BUILD_CACHE=0` to retain local caches when iterating.
+- Before switching a local build configuration, stop the prior build and remove stale generated outputs instead of keeping parallel copies. Use `scripts/cleanup_storage.py` to inspect safe cleanup candidates; preserve `target/release` binaries referenced by the app, tests, and analysis scripts. CI may use its isolated matrix outputs.
 - Public CI and release builds must remain reproducible without local files, external LUTs, or developer credentials. Keep third-party assets out of source tarballs.
 - Avoid committing build output or screenshots; keep only source, tests, docs, and intentional small fixtures.

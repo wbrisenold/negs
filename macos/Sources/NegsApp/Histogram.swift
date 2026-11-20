@@ -16,12 +16,14 @@ struct Histogram: Equatable, Sendable {
         ImageScopes.of(surface, crop: crop, maxSamples: maxSamples, mode: .histogram).histogram
     }
 
-    /// The tallest bin, leaving out pure black and white so clipping doesn't
-    /// flatten the rest; their spikes run off the top instead.
+    /// The tallest bin across the full signal range. The view uses a log
+    /// transfer curve so clipping spikes remain visible without hiding detail.
     var peak: UInt32 {
-        let inner = [red, green, blue].map { $0[1..<255].max() ?? 0 }.max() ?? 0
-        return inner > 0 ? inner : [red, green, blue].map { $0.max() ?? 0 }.max() ?? 0
+        [red, green, blue].map { $0.max() ?? 0 }.max() ?? 0
     }
+
+    /// Each channel counts the same sampled preview pixels.
+    var sampleCount: Int { red.reduce(0) { $0 + Int($1) } }
 }
 
 /// RGB signal level against horizontal position in the displayed crop.
@@ -78,6 +80,41 @@ struct Waveform: Equatable, Sendable {
     }
 }
 
+struct ChromaticityScope: Equatable, Sendable {
+    let size: Int
+    let bins: [UInt32]
+    let sampleCount: Int
+    init(size: Int = 128, bins: [UInt32] = []) {
+        self.size = size; self.bins = bins
+        sampleCount = Int(bins.reduce(0, +))
+    }
+}
+
+/// Distribution of display-referred pixel saturation, from neutral to vivid.
+struct SaturationScope: Equatable, Sendable {
+    let bins: [UInt32]
+    let sampleCount: Int
+
+    init(bins: [UInt32] = Array(repeating: 0, count: 256)) {
+        self.bins = bins
+        sampleCount = Int(bins.reduce(0, +))
+    }
+}
+
+struct ColorSample: Equatable, Sendable {
+    let red: UInt8, green: UInt8, blue: UInt8
+    var xy: (Double, Double) {
+        let r = Self.linear(Double(red) / 255), g = Self.linear(Double(green) / 255), b = Self.linear(Double(blue) / 255)
+        let x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b
+        let y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b
+        let z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b
+        let sum = x + y + z
+        return sum > 0 ? (x / sum, y / sum) : (0, 0)
+    }
+    static func linear(_ value: Double) -> Double { value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4) }
+    var hex: String { String(format: "#%02X%02X%02X", red, green, blue) }
+}
+
 /// Both scopes are derived from the same bounded grid and crop transform.
 /// A single surface lock/pass avoids competing background scans on every edit.
 struct ImageScopes: Equatable, Sendable {
@@ -85,6 +122,8 @@ struct ImageScopes: Equatable, Sendable {
     var waveform = Waveform()
     var vectorscope = Vectorscope()
     var skinAnalysis = SkinAnalysis()
+    var chromaticity = ChromaticityScope()
+    var saturation = SaturationScope()
 
     /// BT.709 luma from the developed display-referred 8-bit RGB values.
     /// Keep the viewer diagnostics on the same signal and rounding rule.
@@ -97,7 +136,8 @@ struct ImageScopes: Equatable, Sendable {
     /// individually clipped RGB channel, so saturated colour clipping is
     /// visible even when the weighted luma remains below white. Generated
     /// only when the viewer overlay is on.
-    static func clippingOverlay(_ surface: IOSurface, low: Double, high: Double) -> CGImage? {
+    static func clippingOverlay(_ surface: IOSurface, low: Double, high: Double,
+                                clippedHighlights: Data? = nil) -> CGImage? {
         guard surface.width > 0, surface.height > 0, surface.bytesPerElement == 4,
               surface.planeCount <= 1, !Task.isCancelled else { return nil }
         surface.lock(options: .readOnly, seed: nil)
@@ -122,9 +162,12 @@ struct ImageScopes: Equatable, Sendable {
                 // highlight band earlier, at 96 IRE.
                 let y = Double(displayLuma(red: r, green: g, blue: b)) / 255
                 let channelClipped = Double(max(r, max(g, b))) / 255 >= high
+                let scanClipped = clippedHighlights.flatMap { mask in
+                    mask.count == sourceWidth * sourceHeight ? mask[sy * sourceWidth + sx] > 0 : nil
+                } ?? false
                 if y <= low {
                     rgba[offset] = 12; rgba[offset + 1] = 34; rgba[offset + 2] = 230; rgba[offset + 3] = 230
-                } else if y >= high || channelClipped {
+                } else if y >= high || channelClipped || scanClipped {
                     rgba[offset] = 230; rgba[offset + 1] = 18; rgba[offset + 2] = 12; rgba[offset + 3] = 230
                 }
             }
@@ -196,6 +239,8 @@ struct ImageScopes: Equatable, Sendable {
         let wantsWaveform = mode == nil || mode == .waveform
         let wantsVectorscope = mode == nil || mode == .vectorscope || mode == .skin
         let wantsSkin = mode == nil || mode == .skin
+        let wantsChromaticity = mode == .chromaticity
+        let wantsSaturation = mode == .saturation
         let width = Int(area.width), height = Int(area.height)
         // This also bounds very thin panoramas: a single common pixel stride
         // can exceed the budget when one of the dimensions is much shorter.
@@ -207,9 +252,12 @@ struct ImageScopes: Equatable, Sendable {
         var red = [UInt32](repeating: 0, count: wantsWaveform ? waveWidth * 256 : 0)
         var green = red, blue = red
         var histogram = Histogram()
+        let chromaSize = 128
+        var chromaBins = [UInt32](repeating: 0, count: wantsChromaticity ? chromaSize * chromaSize : 0)
+        var saturationBins = [UInt32](repeating: 0, count: wantsSaturation ? 256 : 0)
         let vectorSize = 128
-        var vectorBins = [UInt16](repeating: 0, count: wantsVectorscope ? vectorSize * vectorSize : 0)
-        var skinBins = [UInt16](repeating: 0, count: wantsSkin ? vectorSize * vectorSize : 0)
+        var vectorBins = [UInt32](repeating: 0, count: wantsVectorscope ? vectorSize * vectorSize : 0)
+        var skinBins = [UInt32](repeating: 0, count: wantsSkin ? vectorSize * vectorSize : 0)
         var skinAngles: Double = 0
         var skinSamples = 0
         var onTarget = 0, tooMagenta = 0, tooGreen = 0
@@ -240,6 +288,27 @@ struct ImageScopes: Equatable, Sendable {
                 guard x >= 0, x < surface.width, y >= 0, y < surface.height else { continue }
                 let pixel = base + y * rowBytes + x * 4
                 let (r, g, b) = (Int(pixel[2]), Int(pixel[1]), Int(pixel[0]))
+                if wantsSaturation {
+                    let maximum = max(r, g, b)
+                    let minimum = min(r, g, b)
+                    let level = maximum == 0 ? 0 : (maximum - minimum) * 255 / maximum
+                    saturationBins[level] &+= 1
+                }
+                if wantsChromaticity {
+                    let rf = ColorSample.linear(Double(r) / 255), gf = ColorSample.linear(Double(g) / 255), bf = ColorSample.linear(Double(b) / 255)
+                    let x = 0.4124564 * rf + 0.3575761 * gf + 0.1804375 * bf
+                    let y = 0.2126729 * rf + 0.7151522 * gf + 0.0721750 * bf
+                    let z = 0.0193339 * rf + 0.1191920 * gf + 0.9503041 * bf
+                    let sum = x + y + z
+                    if sum > 1e-8 {
+                        let cx = x / sum, cy = y / sum
+                        if (0.0...0.8).contains(cx), (0.0...0.9).contains(cy) {
+                            let bx = min(chromaSize - 1, Int(cx / 0.8 * Double(chromaSize - 1)))
+                            let by = min(chromaSize - 1, Int(cy / 0.9 * Double(chromaSize - 1)))
+                            chromaBins[by * chromaSize + bx] &+= 1
+                        }
+                    }
+                }
                 if wantsHistogram {
                     histogram.red[r] += 1; histogram.green[g] += 1; histogram.blue[b] += 1
                 }
@@ -252,7 +321,7 @@ struct ImageScopes: Equatable, Sendable {
                     vx = min(vectorSize - 1, max(0, Int(((cb + 0.5) * Double(vectorSize - 1)).rounded())))
                     vy = min(vectorSize - 1, max(0, Int(((0.5 - cr) * Double(vectorSize - 1)).rounded())))
                     let bin = vy * vectorSize + vx
-                    if vectorBins[bin] < UInt16.max { vectorBins[bin] += 1 }
+                    vectorBins[bin] += 1
                 }
                 // Skin estimate follows the studio vectorscope's hue analysis,
                 // limited to a broad chroma envelope. It is not a semantic mask.
@@ -270,7 +339,7 @@ struct ImageScopes: Equatable, Sendable {
                         else if delta < 0 { tooMagenta += 1 }
                         else { tooGreen += 1 }
                         let bin = vy * vectorSize + vx
-                        if skinBins[bin] < UInt16.max { skinBins[bin] += 1 }
+                        skinBins[bin] += 1
                     }
                 }
                 guard wantsWaveform else { continue }
@@ -293,7 +362,31 @@ struct ImageScopes: Equatable, Sendable {
         return ImageScopes(histogram: histogram,
             waveform: wantsWaveform ? Waveform(width: waveWidth, red: red, green: green, blue: blue) : Waveform(),
             vectorscope: wantsVectorscope ? Vectorscope(size: vectorSize, bins: vectorBins, skinBins: skinBins) : Vectorscope(),
-            skinAnalysis: wantsSkin ? analysis : SkinAnalysis())
+            skinAnalysis: wantsSkin ? analysis : SkinAnalysis(),
+            chromaticity: wantsChromaticity ? ChromaticityScope(size: chromaSize, bins: chromaBins) : ChromaticityScope(),
+            saturation: wantsSaturation ? SaturationScope(bins: saturationBins) : SaturationScope())
+    }
+
+    static func sample(_ surface: IOSurface, displayedPoint: CGPoint, crop: CropSettings, rotation: Int) -> ColorSample? {
+        guard surface.width > 0, surface.height > 0, surface.bytesPerElement == 4, (0...1).contains(displayedPoint.x), (0...1).contains(displayedPoint.y) else { return nil }
+        let area = crop.pixels(in: CGSize(width: surface.width, height: surface.height))
+        var u = displayedPoint.x, v = displayedPoint.y
+        switch (rotation % 4 + 4) % 4 {
+        case 1: (u, v) = (v, 1 - u)
+        case 2: (u, v) = (1 - u, 1 - v)
+        case 3: (u, v) = (1 - v, u)
+        default: break
+        }
+        let (cx, cy) = (Double(surface.width) / 2, Double(surface.height) / 2)
+        let (dx, dy) = (area.minX + u * area.width - cx, area.minY + v * area.height - cy)
+        let angle = -crop.angle * .pi / 180
+        let x = Int((cx + dx * cos(angle) - dy * sin(angle)).rounded(.down))
+        let y = Int((cy + dx * sin(angle) + dy * cos(angle)).rounded(.down))
+        guard x >= 0, x < surface.width, y >= 0, y < surface.height else { return nil }
+        surface.lock(options: .readOnly, seed: nil)
+        defer { surface.unlock(options: .readOnly, seed: nil) }
+        let pixel = surface.baseAddress.assumingMemoryBound(to: UInt8.self) + y * surface.bytesPerRow + x * 4
+        return ColorSample(red: pixel[2], green: pixel[1], blue: pixel[0])
     }
 }
 
@@ -323,10 +416,10 @@ struct SkinAnalysis: Equatable, Sendable {
 
 struct Vectorscope: Equatable, Sendable {
     let size: Int
-    let bins: [UInt16]
-    let skinBins: [UInt16]
+    let bins: [UInt32]
+    let skinBins: [UInt32]
 
-    init(size: Int = 128, bins: [UInt16] = [], skinBins: [UInt16] = []) {
+    init(size: Int = 128, bins: [UInt32] = [], skinBins: [UInt32] = []) {
         self.size = size
         self.bins = bins
         self.skinBins = skinBins
@@ -344,30 +437,70 @@ struct HistogramView: View {
         Canvas { context, size in
             scopeGrid(context: &context, size: size)
             guard let histogram, histogram.peak > 0 else { return }
-            let peak = Double(histogram.peak)
-            context.blendMode = .plusLighter
+            let peak = log1p(Double(histogram.peak))
             for (bins, color) in [(histogram.red, Color(red: 1, green: 0.42, blue: 0.42)),
                                   (histogram.green, Color(red: 0.42, green: 0.8, blue: 0.47)),
                                   (histogram.blue, Color(red: 0.3, green: 0.59, blue: 1))] {
                 var line = Path()
                 for (index, count) in bins.enumerated() {
+                    let density = peak > 0 ? log1p(Double(count)) / peak : 0
                     let point = CGPoint(x: size.width * CGFloat(index) / CGFloat(bins.count - 1),
-                                        y: size.height * (1 - min(Double(count) / peak, 1)))
+                                        y: size.height * (1 - min(density, 1)))
                     if index == 0 { line.move(to: point) } else { line.addLine(to: point) }
                 }
                 var fill = line
                 fill.addLine(to: CGPoint(x: size.width, y: size.height))
                 fill.addLine(to: CGPoint(x: 0, y: size.height))
                 fill.closeSubpath()
-                context.fill(fill, with: .color(color.opacity(0.4)))
+                // A restrained source-over fill keeps overlapping channel
+                // distributions from accumulating into a misleading gray slab.
+                context.fill(fill, with: .color(color.opacity(0.12)))
                 context.stroke(line, with: .color(color.opacity(0.9)), lineWidth: 1)
             }
+            context.draw(Text("LOG  ·  PREVIEW RGB")
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundColor(Theme.dim), at: CGPoint(x: 62, y: 10))
+            context.draw(Text("\(histogram.sampleCount.formatted()) px")
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundColor(Theme.dim), at: CGPoint(x: size.width - 38, y: 10))
         }
         .padding(.horizontal, 4).padding(.top, 6)
         .background(Theme.bg, in: RoundedRectangle(cornerRadius: 3))
         .accessibilityElement()
         .accessibilityLabel("Histogram")
-        .accessibilityValue(histogram == nil ? "No developed photograph" : "Red, green, and blue tones of the developed photograph")
+        .accessibilityValue(histogram.map { "Red, green, and blue tones of the developed preview; logarithmic vertical scale; \($0.sampleCount) pixels counted" } ?? "No developed photograph")
+    }
+}
+
+struct SaturationScopeView: View {
+    let scope: SaturationScope?
+
+    var body: some View {
+        Canvas { context, size in
+            scopeGrid(context: &context, size: size)
+            guard let scope, let peak = scope.bins.max(), peak > 0 else { return }
+            let logPeak = log1p(Double(peak))
+            let bottom = size.height - 12
+            let plotHeight = max(1, bottom - 4)
+            let binWidth = size.width / CGFloat(scope.bins.count)
+            for (index, count) in scope.bins.enumerated() where count > 0 {
+                let fraction = Double(index) / Double(scope.bins.count - 1)
+                let barHeight = plotHeight * CGFloat(log1p(Double(count)) / logPeak)
+                let rect = CGRect(x: CGFloat(index) * binWidth, y: bottom - barHeight,
+                                  width: max(1, binWidth + 0.25), height: barHeight)
+                let color = Color(hue: 0.49, saturation: fraction, brightness: 0.72 + 0.23 * fraction)
+                context.fill(Path(rect), with: .color(color.opacity(0.88)))
+            }
+            context.draw(Text("NEUTRAL").font(.system(size: 8, weight: .medium, design: .monospaced))
+                .foregroundColor(Theme.dim), at: CGPoint(x: 22, y: size.height - 5))
+            context.draw(Text("VIVID").font(.system(size: 8, weight: .medium, design: .monospaced))
+                .foregroundColor(Theme.dim), at: CGPoint(x: size.width - 18, y: size.height - 5))
+        }
+        .padding(6)
+        .background(Theme.bg, in: RoundedRectangle(cornerRadius: 3))
+        .accessibilityElement()
+        .accessibilityLabel("Saturation scope")
+        .accessibilityValue(scope == nil ? "No developed photograph" : "Pixel saturation distribution from neutral to vivid")
     }
 }
 
@@ -434,6 +567,7 @@ private func scopeGrid(context: inout GraphicsContext, size: CGSize) {
 
 enum ScopeMode: String, CaseIterable, Sendable {
     case histogram = "Histogram", waveform = "Waveform", vectorscope = "Vectorscope", skin = "Skin Analysis"
+    case chromaticity = "CIE Chromaticity", saturation = "Saturation", picker = "Color Picker"
 
     var symbol: String {
         switch self {
@@ -441,6 +575,9 @@ enum ScopeMode: String, CaseIterable, Sendable {
         case .waveform: "waveform.path"
         case .vectorscope: "circle.hexagongrid"
         case .skin: "person.crop.circle"
+        case .chromaticity: "point.3.connected.trianglepath.dotted"
+        case .saturation: "circle.lefthalf.filled"
+        case .picker: "eyedropper"
         }
     }
 
@@ -449,6 +586,9 @@ enum ScopeMode: String, CaseIterable, Sendable {
         case .histogram, .waveform: "RGB"
         case .vectorscope: "Cb · Cr"
         case .skin: "FACE CHROMA"
+        case .chromaticity: "CIE xy"
+        case .saturation: "SATURATION"
+        case .picker: "SAMPLE"
         }
     }
 }
@@ -458,6 +598,9 @@ struct ScopePanelView: View {
     let waveform: Waveform?
     let vectorscope: Vectorscope?
     let skinAnalysis: SkinAnalysis?
+    var chromaticity = ChromaticityScope()
+    var colorSample: ColorSample?
+    var saturation = SaturationScope()
     var isUpdating = false
     var setScopeMode: (ScopeMode) -> Void = { _ in }
     var clippingEnabled = false
@@ -466,14 +609,14 @@ struct ScopePanelView: View {
     var setFalseColorEnabled: (Bool) -> Void = { _ in }
     @AppStorage("scopeMode") private var mode = ScopeMode.histogram
     /// Dragged with the handle below the scope; remembered.
-    @AppStorage("scopeHeight") private var height = ScopePanelView.defaultHeight
+    @AppStorage("scopeHeight.compactInspector") private var height = ScopePanelView.defaultHeight
     /// The height while the handle is dragged, saved to `height` when it's let go.
     @State private var dragHeight: Double?
     /// Compact dock leaves room for adjustments; expanded is available for
     /// judging scope detail. The grabber still allows any intermediate size.
-    static let heights = 88.0...420.0
-    static let compactHeight = 120.0
-    static let expandedHeight = 240.0
+    static let heights = 72.0...360.0
+    static let compactHeight = 88.0
+    static let expandedHeight = 200.0
     static let defaultHeight = compactHeight
 
     var body: some View {
@@ -487,6 +630,9 @@ struct ScopePanelView: View {
                     case .waveform: WaveformView(waveform: waveform)
                     case .vectorscope: VectorscopeView(vectorscope: vectorscope, skinOnly: false)
                     case .skin: VectorscopeView(vectorscope: vectorscope, skinOnly: true, skinAnalysis: skinAnalysis)
+                    case .chromaticity: ChromaticityView(scope: chromaticity)
+                    case .saturation: SaturationScopeView(scope: histogram == nil ? nil : saturation)
+                    case .picker: ColorPickerScopeView(sample: colorSample)
                     }
                 }
             }
@@ -528,25 +674,21 @@ struct ScopePanelView: View {
                 Button {
                     setClippingEnabled(!clippingEnabled)
                 } label: {
-                    Label("Clip", systemImage: clippingEnabled ? "exclamationmark.triangle.fill" : "exclamationmark.triangle")
-                        .lineLimit(1).minimumScaleFactor(0.8)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(clippingEnabled ? Color.blue : Color.secondary)
+                    Image(systemName: clippingEnabled ? "exclamationmark.triangle.fill" : "exclamationmark.triangle")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(clippingEnabled ? Color.blue : Color.secondary)
                 }
                 .buttonStyle(.borderless)
-                .fixedSize(horizontal: true, vertical: false)
                 .accessibilityLabel("Clipping indicators")
                 .help("Toggle clipping colors on the photograph. Red marks clipped highlights; blue marks near-black or crushed shadows.")
                 Button {
                     setFalseColorEnabled(!falseColorEnabled)
                 } label: {
-                    Label("False Color", systemImage: "camera.filters")
-                        .lineLimit(1).minimumScaleFactor(0.8)
+                    Image(systemName: "camera.filters")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(falseColorEnabled ? Color.yellow : Color.secondary)
                 }
                 .buttonStyle(.borderless)
-                .fixedSize(horizontal: true, vertical: false)
                 .accessibilityLabel("False Color")
                 .help("Show a false-colour exposure map over the developed photograph.")
                 Spacer()
@@ -558,7 +700,7 @@ struct ScopePanelView: View {
                     .minimumScaleFactor(0.75)
         }
         .controlSize(.small)
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// A grabber under the scope: drag to resize, double-click for the default height.
@@ -613,6 +755,123 @@ private struct FalseColorLegend: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("False color exposure scale in IRE")
+    }
+}
+
+private struct ChromaticityView: View {
+    let scope: ChromaticityScope
+    private let spectralLocus: [(Double, Double)] = [
+        (0.175,0.005),(0.174,0.005),(0.161,0.016),(0.144,0.030),(0.124,0.058),
+        (0.091,0.133),(0.045,0.295),(0.008,0.538),(0.014,0.751),(0.074,0.835),
+        (0.155,0.806),(0.230,0.754),(0.302,0.692),(0.373,0.625),(0.444,0.555),
+        (0.512,0.487),(0.575,0.424),(0.627,0.373),(0.666,0.334),(0.692,0.308),
+        (0.710,0.290),(0.724,0.276),(0.735,0.265),(0.758,0.242),(0.735,0.265)
+    ]
+    private let planckian: [(Double, Double)] = [
+        (0.653,0.344),(0.582,0.391),(0.527,0.413),(0.477,0.414),(0.437,0.404),
+        (0.381,0.377),(0.345,0.352),(0.314,0.324),(0.281,0.288)
+    ]
+
+    var body: some View {
+        Canvas { context, size in
+            let plot = CGRect(x: 8, y: 5, width: max(1, size.width - 16), height: max(1, size.height - 10))
+            context.fill(Path(roundedRect: plot, cornerRadius: 5), with: .color(StudioStyle.plot))
+            func point(_ xy: (Double, Double)) -> CGPoint {
+                CGPoint(x: plot.minX + plot.width * xy.0 / 0.8,
+                        y: plot.maxY - plot.height * xy.1 / 0.9)
+            }
+            var grid = Path()
+            for x in stride(from: 0.2, through: 0.8, by: 0.2) {
+                let p = point((x, 0)); grid.move(to: CGPoint(x: p.x, y: plot.minY)); grid.addLine(to: CGPoint(x: p.x, y: plot.maxY))
+            }
+            for y in stride(from: 0.2, through: 0.8, by: 0.2) {
+                let p = point((0, y)); grid.move(to: CGPoint(x: plot.minX, y: p.y)); grid.addLine(to: CGPoint(x: plot.maxX, y: p.y))
+            }
+            context.stroke(grid, with: .color(Theme.line), lineWidth: 0.55)
+
+            var locus = Path()
+            for (index, xy) in spectralLocus.enumerated() {
+                let p = point(xy)
+                if index == 0 { locus.move(to: p) } else { locus.addLine(to: p) }
+            }
+            locus.closeSubpath()
+            context.fill(locus, with: .color(Color(red: 0.35, green: 0.24, blue: 0.08).opacity(0.22)))
+            context.stroke(locus, with: .color(Theme.dim.opacity(0.76)), lineWidth: 0.8)
+
+            func gamut(_ vertices: [(Double, Double)], color: Color, dash: [CGFloat] = []) {
+                var path = Path()
+                for (i, xy) in vertices.enumerated() { i == 0 ? path.move(to: point(xy)) : path.addLine(to: point(xy)) }
+                path.closeSubpath()
+                context.stroke(path, with: .color(color.opacity(0.85)), style: StrokeStyle(lineWidth: 0.9, dash: dash))
+            }
+            gamut([(0.64,0.33),(0.30,0.60),(0.15,0.06)], color: Theme.label)
+            gamut([(0.708,0.292),(0.170,0.797),(0.131,0.046)], color: Theme.accent, dash: [3,2])
+            var blackBody = Path()
+            for (i, xy) in planckian.enumerated() { i == 0 ? blackBody.move(to: point(xy)) : blackBody.addLine(to: point(xy)) }
+            context.stroke(blackBody, with: .color(Color(red: 0.40, green: 0.86, blue: 0.57)), style: StrokeStyle(lineWidth: 1, dash: [3,2]))
+
+            if scope.bins.count == scope.size * scope.size, let peak = scope.bins.max(), peak > 0 {
+                for y in 0..<scope.size { for x in 0..<scope.size {
+                    let count = scope.bins[y * scope.size + x]
+                    guard count > 0 else { continue }
+                    let xy = (Double(x) / Double(scope.size - 1) * 0.8, Double(y) / Double(scope.size - 1) * 0.9)
+                    let p = point(xy)
+                    let strength = min(0.78, 0.10 + log1p(Double(count)) / log1p(Double(peak)) * 0.65)
+                    let d = max(1.2, min(3.2, plot.width / CGFloat(scope.size) * 1.35))
+                    context.fill(Path(ellipseIn: CGRect(x: p.x-d/2, y: p.y-d/2, width: d, height: d)),
+                                 with: .color(Theme.accent.opacity(strength)))
+                }}
+            }
+            let d65 = point((0.3127,0.3290)), equalEnergy = point((1.0/3,1.0/3))
+            for (p, color) in [(d65, Theme.accent), (equalEnergy, Theme.warn)] {
+                var cross = Path(); cross.move(to: CGPoint(x:p.x-3,y:p.y)); cross.addLine(to: CGPoint(x:p.x+3,y:p.y))
+                cross.move(to: CGPoint(x:p.x,y:p.y-3)); cross.addLine(to: CGPoint(x:p.x,y:p.y+3))
+                context.stroke(cross, with: .color(color), lineWidth: 1.1)
+            }
+            context.draw(Text("D65").font(.system(size: 8, weight: .semibold, design: .monospaced)).foregroundColor(Theme.accent), at: CGPoint(x:d65.x+13,y:d65.y-6))
+            context.draw(Text("Rec.709  ·  Rec.2020  ·  Planckian locus").font(.system(size: 8, design: .monospaced)).foregroundColor(Theme.dim), at: CGPoint(x: plot.midX, y: plot.maxY-8))
+        }
+        .padding(5)
+        .background(StudioStyle.panel, in: RoundedRectangle(cornerRadius: StudioStyle.Radius.panel))
+        .overlay(RoundedRectangle(cornerRadius: StudioStyle.Radius.panel).strokeBorder(StudioStyle.outline, lineWidth: 0.8))
+        .accessibilityElement().accessibilityLabel("CIE 1931 xy chromaticity diagram")
+        .accessibilityValue("Developed image chromaticity distribution with Rec. 709 and Rec. 2020 gamuts and the Planckian locus")
+    }
+}
+
+private struct ColorPickerScopeView: View {
+    let sample: ColorSample?
+    private var swatchColor: Color {
+        guard let sample else { return StudioStyle.plot }
+        return Color(.sRGB, red: Double(sample.red) / 255, green: Double(sample.green) / 255,
+                     blue: Double(sample.blue) / 255, opacity: 1)
+    }
+    var body: some View {
+        HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 6).fill(swatchColor)
+                .frame(width: 54, height: 54).overlay(RoundedRectangle(cornerRadius: 6).stroke(Theme.line, lineWidth: 1))
+            sampleDetails
+            Spacer(minLength: 0)
+        }
+        .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+        .background(StudioStyle.panel, in: RoundedRectangle(cornerRadius: StudioStyle.Radius.panel))
+        .overlay(RoundedRectangle(cornerRadius: StudioStyle.Radius.panel).strokeBorder(StudioStyle.outline, lineWidth: 0.8))
+        .accessibilityElement(children: .combine).accessibilityLabel(sample.map { "Color sample \($0.hex), red \($0.red), green \($0.green), blue \($0.blue)" } ?? "Color picker. Click the photo to sample a color")
+    }
+
+    @ViewBuilder private var sampleDetails: some View {
+        if let sample {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(sample.hex).font(Theme.text(12, weight: 700)).foregroundStyle(Theme.label)
+                Text(String(format: "R %3d   G %3d   B %3d", sample.red, sample.green, sample.blue))
+                Text(String(format: "CIE xy   %.4f   %.4f", sample.xy.0, sample.xy.1))
+            }.font(Theme.text(10, weight: 500)).monospacedDigit()
+        } else {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Click the photo to sample a color").font(Theme.text(11, weight: 600)).foregroundStyle(Theme.label)
+                Text("Samples the developed image").font(Theme.text(10)).foregroundStyle(Theme.dim)
+            }
+        }
     }
 }
 

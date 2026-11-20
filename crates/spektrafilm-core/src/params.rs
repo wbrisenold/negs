@@ -170,6 +170,9 @@ pub struct ScannerParams {
     pub black_level: f32,
     #[serde(default = "default_unsharp")]
     pub unsharp_mask: [f32; 2],
+    /// Suppresses low-amplitude high-pass differences before sharpening.
+    #[serde(default)]
+    pub unsharp_threshold: f32,
 }
 
 impl Default for ScannerParams {
@@ -181,6 +184,7 @@ impl Default for ScannerParams {
             white_level: 0.98,
             black_level: 0.01,
             unsharp_mask: [0.7, 0.7],
+            unsharp_threshold: 0.0,
         }
     }
 }

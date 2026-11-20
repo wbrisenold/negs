@@ -208,6 +208,11 @@ pub fn decode_raw(
     preference: RawDecoderPreference,
 ) -> Result<DecodedRaw> {
     options.white_balance.validate()?;
+    // Camera-specific channel gains must be set before demosaicing. Apple RAW
+    // returns rendered RGB, so use Rawler for this mode on every platform.
+    if options.white_balance.mode == crate::RawWhiteBalanceMode::CameraPreset {
+        return RawlerDecoder.decode(path, options).map(|raw| DecodedRaw::new(raw, &RawlerDecoder));
+    }
     #[cfg(all(target_os = "macos", feature = "apple-raw"))]
     if preference == RawDecoderPreference::Auto {
         return decode_with_fallback(&AppleRawDecoder, &RawlerDecoder, path, options);

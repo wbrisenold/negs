@@ -10,6 +10,7 @@ APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 PYTHON="${PYTHON:-python3}"
 RELEASE_DIR="${RELEASE_DIR:-dist/releases}"
 MACOS_ARCHS="${MACOS_ARCHS:-arm64 x86_64}"
+CLEAN_BUILD_CACHE="${CLEAN_BUILD_CACHE:-1}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -288,3 +289,6 @@ cp "$stage/unpacked/package-report.json" "$DIST_DIR/package-report.json"
     shasum -a 256 "$release_name.zip" "$release_name.dmg" "$release_name-source.tar.gz" > SHA256SUMS
 )
 echo "Packaged: $repo_root/$RELEASE_DIR/$release_name.dmg"
+if [[ "$BUILD_TARGET_DIR" == "target/macos-app" && "$CLEAN_BUILD_CACHE" == 1 ]]; then
+    "$PYTHON" scripts/cleanup_storage.py --build-caches --apply
+fi

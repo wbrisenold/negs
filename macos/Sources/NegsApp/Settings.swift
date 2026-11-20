@@ -103,6 +103,9 @@ struct SettingsView: View {
     @AppStorage(ViewerSheet.key) private var sheet = ViewerSheet.darkroom
     @State private var thumbnailBytes: Int?
     @State private var emptyingThumbnails = false
+    @State private var openAIAPIKey = ""
+    @State private var openAIKeySaved = OpenAIImageInpainting.hasAPIKey
+    @State private var openAIKeyMessage = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -149,6 +152,12 @@ struct SettingsView: View {
                     .inkDisabled(model.papers.isEmpty)
             }
             HintText("A photo you haven’t edited opens with this film and paper, and its thumbnail shows them. Photos you’ve edited keep their own.")
+            ChoiceRow(title: "Spectral upsampling", items: [
+                .option("Arctic 2026 (Beta 04)", tag: "arctic2026beta04"),
+                .option("Hanatos 2025", tag: "hanatos2025"),
+                .option("Mallett 2019", tag: "mallett2019")
+            ], selection: model.newPhotoSpectralMethod) { model.newPhotoSpectralMethod = $0 }
+            HintText("Sets how RGB colours become film-exposure spectra for new photographs. Existing edited photos keep their chosen method.")
             TickRow(title: "Match to camera brightness", isOn: Binding(
                 get: { model.autoPlaceNewImages }, set: { model.autoPlaceNewImages = $0 }))
             HintText("New photographs start with Prep › Match camera brightness on: a RAW develops about as bright as the camera's own preview, a JPEG or TIFF as the file itself.")
@@ -235,6 +244,40 @@ struct SettingsView: View {
             HintText("The strip and grid show each photograph as developed; the least recently shown are removed first. Emptied, the open folder’s are developed again in the background.")
         }
         .task { thumbnailBytes = await model.thumbnailCacheSize() }
+        InkSection(title: "GPT Image erase") {
+            SecureField("OpenAI API key", text: $openAIAPIKey)
+                .textFieldStyle(.roundedBorder)
+                .textContentType(.password)
+                .privacySensitive()
+            ButtonRow {
+                FigureText(figure: openAIKeySaved ? "Saved in Keychain" : "No key saved",
+                           trail: openAIKeyMessage)
+            } button: {
+                HStack(spacing: 8) {
+                    Button("Save Key") {
+                        do {
+                            try OpenAIImageInpainting.saveAPIKey(openAIAPIKey)
+                            openAIAPIKey = ""
+                            openAIKeySaved = true
+                            openAIKeyMessage = ""
+                        } catch { openAIKeyMessage = error.localizedDescription }
+                    }
+                    .buttonStyle(OutlinedButtonStyle())
+                    .inkDisabled(openAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Remove") {
+                        do {
+                            try OpenAIImageInpainting.deleteAPIKey()
+                            openAIAPIKey = ""
+                            openAIKeySaved = false
+                            openAIKeyMessage = ""
+                        } catch { openAIKeyMessage = error.localizedDescription }
+                    }
+                    .buttonStyle(OutlinedButtonStyle())
+                    .inkDisabled(!openAIKeySaved)
+                }
+            }
+            HintText("The key stays in macOS Keychain. GPT Image sends a cropped image and mask to OpenAI only when selected and run. API billing is separate from ChatGPT.")
+        }
         InkSection(title: "App data") {
             ButtonRow {
                 EmptyView()

@@ -30,18 +30,18 @@ enum StudioStyle {
         static let caption = Font.system(size: 10)
     }
 
-    // Resolve-inspired graphite surfaces: consistent across macOS appearances,
-    // with blue reserved for selection and primary actions.
-    static let window = Color(red: 0.105, green: 0.108, blue: 0.112)
-    static let sidebar = Color(red: 0.082, green: 0.084, blue: 0.087)
-    static let panel = Color(red: 0.145, green: 0.148, blue: 0.152)
-    static let plot = Color(red: 0.045, green: 0.047, blue: 0.050)
-    static let subtle = Color.white.opacity(0.035)
-    static let outline = Color.white.opacity(0.085)
-    static let accent = Color(red: 0.18, green: 0.52, blue: 0.95)
-    static let positive = Color(red: 0.33, green: 0.72, blue: 0.46)
-    static let negative = Color(red: 0.88, green: 0.34, blue: 0.34)
-    static let warning = Color(red: 0.91, green: 0.63, blue: 0.24)
+    // Share the Omarchy graphite and amber tokens with the editor rather than
+    // letting the Library drift back to its older blue palette.
+    static let window = Theme.bg
+    static let sidebar = Theme.film
+    static let panel = Theme.panel
+    static let plot = Theme.film
+    static let subtle = Theme.line.opacity(0.35)
+    static let outline = Theme.line.opacity(0.9)
+    static let accent = Theme.accent
+    static let positive = Color(red: 0.42, green: 0.68, blue: 0.38)
+    static let negative = Theme.warn
+    static let warning = Theme.warn
 }
 
 extension View {
